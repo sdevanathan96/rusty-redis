@@ -14,7 +14,7 @@ async fn main() {
             Ok((mut stream, _)) => {
                 println!("new connection accepted");
                 tokio::spawn(async move {
-                    handle_client(stream, b"+PONG\r\n");
+                    handle_client(stream, b"+PONG\r\n").await;
                 });
             }
             Err(e) => {
