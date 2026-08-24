@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
-use std::net::{TcpListener, TcpStream};
-use std::io::{Read, Write};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, Duration};
 
 #[tokio::main]
@@ -11,7 +11,7 @@ async fn main() {
     loop{
         let stream = listener.accept().await;
         match stream {
-            Ok(stream) => {
+            Ok((mut stream, _)) => {
                 println!("new connection accepted");
                 tokio::spawn(async move {
                     handle_client(stream, b"+PONG\r\n");
@@ -27,12 +27,12 @@ async fn main() {
 async fn handle_client(mut stream: TcpStream, buffer: &[u8]) {
     let mut buf: [u8; 512] = [0; 512];
     loop {
-        let bytes_read = stream.read(&mut buf).await.expect("Failed to read from client");
+        let bytes_read = stream.read(&mut buf).await.unwrap();
 
         if bytes_read == 0 {
             return;
         }
 
-        stream.write_all(buffer).await.expect("Failed to write to client");
+        stream.write_all(buffer).await.unwrap();
     }
 }
