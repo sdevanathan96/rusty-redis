@@ -1,28 +1,38 @@
 #![allow(unused_imports)]
-use std::net::TcpListener;
-use std::io::Write;
-use std::io::Read;
+use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Write};
+use tokio::time::{sleep, Duration};
 
-fn main() {
+#[tokio::main]
+async fn main() {
 
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
-    
-    for stream in listener.incoming() {
+    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+
+    loop{
+        let stream = listener.accept().await;
         match stream {
-            Ok(mut stream) => {
-                let mut buffer = [0;512];
-                loop{
-                    let bytes_read = stream.read(&mut buffer).unwrap();
-                    if bytes_read == 0{
-                        break;
-                    }
-                    stream.write_all(b"+PONG\r\n").unwrap();
-                }
-                
+            Ok(stream) => {
+                println!("new connection accepted");
+                tokio::spawn(async move {
+                    handle_client(stream, b"+PONG\r\n");
+                });
             }
             Err(e) => {
                 println!("error: {}", e);
             }
         }
+    }
+}
+
+async fn handle_client(mut stream: TcpStream, buffer: &[u8]) {
+    let mut buf: [u8; 512] = [0; 512];
+    loop {
+        let bytes_read = stream.read(&mut buf).await.expect("Failed to read from client");
+
+        if bytes_read == 0 {
+            return;
+        }
+
+        stream.write_all(buffer).await.expect("Failed to write to client");
     }
 }
