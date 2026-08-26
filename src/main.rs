@@ -1,20 +1,24 @@
+use std::sync::Arc;
+
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use rusty_redis::resp;
 use rusty_redis::command::{Command, to_command, execute};
+use rusty_redis::db::Db;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:6379").await?;
     println!("listening on 127.0.0.1:6379");
-
+    let db = Arc::new(Db::new());
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 println!("new connection from {peer}");
+                let db = Arc::clone(&db);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream).await {
+                    if let Err(e) = handle_client(stream, db).await {
                         eprintln!("connection {peer} ended: {e}");
                     }
                 });
@@ -24,7 +28,7 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
-async fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
+async fn handle_client(mut stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
     let mut inbuf = BytesMut::with_capacity(4096);
     let mut outbuf = BytesMut::with_capacity(4096);
     loop {
@@ -33,7 +37,7 @@ async fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
                 Ok(Some((consumed, value))) => {
                     inbuf.advance(consumed);
                     let reply = match to_command(value) {
-                        Ok(cmd) => execute(cmd),
+                        Ok(cmd) => execute(cmd, &db),
                         Err(e) => resp::Value::Error(e.to_resp()),
                     };
                     resp::encode(&reply, &mut outbuf);

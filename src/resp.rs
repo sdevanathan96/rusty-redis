@@ -396,5 +396,4 @@ mod resp_parser_tests {
             assert_eq!(parse(&out), Ok(Some((out.len(), v))));
         }
     }
-
 }
