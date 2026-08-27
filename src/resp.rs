@@ -1,7 +1,7 @@
 // src/resp.rs
 use std::convert::From;
-use std::io;
-use tokio_util::codec::{Decoder, Encoder};
+// use std::io;
+// use tokio_util::codec::{Decoder, Encoder};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -33,7 +33,7 @@ impl RespError {
     pub fn to_resp(&self) -> Vec<u8> {
         match self {
             RespError::UnknownType(b) =>
-                format!("ERR Protocol error: unexpected type byte '{}'", *b as char).into_bytes(),
+                format!("ERR Protocol error: unexpected type byte 0x{b:02x}").into_bytes(),
             RespError::BadInteger =>
                 b"ERR Protocol error: invalid integer".to_vec(),
             RespError::BadLength(n) =>
@@ -235,12 +235,12 @@ pub fn encode<B: bytes::BufMut>(value: &Value, out: &mut B) {
         }
         Value::SimpleString(bytes) => {
             out.put_u8(b'+');
-            out.put_slice(bytes);
+            put_line_payload(out, bytes);
             out.put_slice(b"\r\n");
         }
         Value::Error(bytes) => {
             out.put_u8(b'-');
-            out.put_slice(bytes);
+            put_line_payload(out, bytes);
             out.put_slice(b"\r\n");
         }
         Value::NullBulkString => {
@@ -251,6 +251,19 @@ pub fn encode<B: bytes::BufMut>(value: &Value, out: &mut B) {
         }
     }
 }
+
+fn put_line_payload<B: bytes::BufMut>(out: &mut B, bytes: &[u8]) {
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\r' || b == b'\n' {
+            out.put_slice(&bytes[start..i]);
+            out.put_u8(b' ');
+            start = i + 1;
+        }
+    }
+    out.put_slice(&bytes[start..]);
+}
+
 
 #[cfg(test)]
 mod resp_parser_tests {
@@ -384,16 +397,46 @@ mod resp_parser_tests {
     fn encode_parse_round_trip() {
         let values = vec![
             Value::SimpleString(b"OK".to_vec()),
+            Value::SimpleString(vec![]),
+            Value::Error(b"ERR something went wrong".to_vec()),   // was missing
+            Value::Integer(0),
             Value::Integer(-42),
+            Value::Integer(i64::MAX),
+            Value::Integer(i64::MIN),
             Value::BulkString(vec![]),
-            Value::BulkString(b"a\r\nb".to_vec()),
+            Value::BulkString(b"a\r\nb".to_vec()),                // binary safe, must survive
+            Value::BulkString(vec![0, 255, 13, 10]),              // arbitrary bytes
             Value::NullBulkString,
+            Value::NullArray,                                     // was missing
+            Value::Array(vec![]),
             Value::Array(vec![Value::Integer(1), Value::NullBulkString]),
+            Value::Array(vec![                                    // nesting was missing
+                Value::Array(vec![Value::SimpleString(b"a".to_vec())]),
+                Value::Error(b"ERR nested".to_vec()),
+                Value::BulkString(b"x\r\ny".to_vec()),
+            ]),
         ];
         for v in values {
             let mut out = Vec::new();
             encode(&v, &mut out);
-            assert_eq!(parse(&out), Ok(Some((out.len(), v))));
+            assert_eq!(parse(&out), Ok(Some((out.len(), v.clone()))), "failed for {v:?}");
+        }
+    }
+
+    #[test]
+    fn crlf_in_a_line_payload_cannot_split_the_reply() {
+        let evil = Value::Error(b"ERR unknown command 'FOO\r\n+INJECTED".to_vec());
+        let mut out = Vec::new();
+        encode(&evil, &mut out);
+
+        let (consumed, parsed) = parse(&out).unwrap().unwrap();
+        assert_eq!(consumed, out.len(), "must encode to exactly one frame");
+        match parsed {
+            Value::Error(msg) => {
+                assert!(!msg.contains(&b'\r'));
+                assert!(!msg.contains(&b'\n'));
+            }
+            other => panic!("expected an error, got {other:?}"),
         }
     }
 }

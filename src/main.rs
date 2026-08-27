@@ -4,14 +4,16 @@ use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use rusty_redis::resp;
-use rusty_redis::command::{Command, to_command, execute};
+use rusty_redis::command::{to_command, execute};
 use rusty_redis::db::Db;
+use rusty_redis::db::SystemClock;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:6379").await?;
     println!("listening on 127.0.0.1:6379");
-    let db = Arc::new(Db::new());
+    let clock = Arc::new(SystemClock);
+    let db = Arc::new(Db::with_clock(clock));
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
