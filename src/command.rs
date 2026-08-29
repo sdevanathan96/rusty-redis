@@ -24,6 +24,14 @@ pub enum Command {
     },
     Del { keys: Vec<Vec<u8>> },
     Exists { keys: Vec<Vec<u8>> },
+    LPush {
+        key: Vec<u8>,
+        values: Vec<Vec<u8>>,
+    },
+    LPop { key: Vec<u8>, count: Option<usize> },
+    RPop { key: Vec<u8>, count: Option<usize> },
+    LLen { key: Vec<u8> },
+    LRange { key: Vec<u8>, start: i64, stop: i64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +45,7 @@ pub enum CommandError {
     Syntax,
     UnknownCommand(Vec<u8>),
     WrongType,
+    OutOfRange
 }
 
 impl From<WrongType> for CommandError {
@@ -65,6 +74,7 @@ impl CommandError {
                 format!("ERR unknown command '{}'", quote(name)).into_bytes()
             },
             CommandError::WrongType => b"WRONGTYPE Operation against a key holding the wrong kind of value".to_vec(),
+            CommandError::OutOfRange => b"ERR value is out of range, must be positive".to_vec(),
         }
     }
 }
@@ -155,6 +165,41 @@ pub fn to_command(v: Value) -> Result<Command, CommandError> {
             [] => Err(CommandError::WrongArity(name.clone())),
             keys => Ok(Command::Exists { keys: keys.to_vec() }),
         },
+        b"LPUSH" => match rest {
+            [key, first, more @ ..] => Ok(Command::LPush {
+                key: key.clone(),
+                values: std::iter::once(first).chain(more).cloned().collect(),
+            }),
+            _ => Err(CommandError::WrongArity(name.clone())),
+        },
+        b"LPOP" | b"RPOP" => {
+            let count = match rest.get(1) {
+                None => None,
+                Some(raw) => {
+                    let n = parse_i64(raw)?;
+                    if n < 0 {
+                        return Err(CommandError::OutOfRange);
+                    }
+                    Some(n as usize)
+                }
+            };
+            match rest {
+                [key] | [key, _] => Ok(Command::LPop { key: key.clone(), count }),
+                _ => Err(CommandError::WrongArity(name.clone())),
+            }
+        },
+        b"LLEN" => match rest {
+            [key] => Ok(Command::LLen { key: key.clone() }),
+            _ => Err(CommandError::WrongArity(name.clone())),
+        },
+        b"LRANGE" => match rest {
+            [key, start, stop] => Ok(Command::LRange { 
+                key: key.clone(),
+                start: parse_i64(start)?,
+                stop: parse_i64(stop)?
+            }),
+            _ => Err(CommandError::WrongArity(name.clone())),
+        },
         _ => Ok(Command::Unknown(name.clone())),
     }
 }
@@ -162,12 +207,18 @@ pub fn to_command(v: Value) -> Result<Command, CommandError> {
 /// Reads the argument following the option keyword at index `i`.
 fn expiry_arg(rest: &[Vec<u8>], i: usize, cmd_name: &[u8]) -> Result<i64, CommandError> {
     let raw = rest.get(i + 1).ok_or(CommandError::Syntax)?;
-    let text = std::str::from_utf8(raw).map_err(|_| CommandError::NotAnInteger)?;
-    let n: i64 = text.parse().map_err(|_| CommandError::NotAnInteger)?;
+    // let text = std::str::from_utf8(raw).map_err(|_| CommandError::NotAnInteger)?;
+    // let n: i64 = text.parse().map_err(|_| CommandError::NotAnInteger)?;
+    let n: i64 = parse_i64(raw)?;
     if n <= 0 {
         return Err(CommandError::InvalidExpiry(cmd_name.to_vec()));
     }
     Ok(n)
+}
+
+fn parse_i64(raw: &[u8]) -> Result<i64, CommandError> {
+    let text = std::str::from_utf8(raw).map_err(|_| CommandError::NotAnInteger)?;
+    text.parse().map_err(|_| CommandError::NotAnInteger)
 }
 
 pub fn execute(cmd: Command, db: &Db) -> Result<Value, CommandError> {
@@ -204,6 +255,35 @@ pub fn execute(cmd: Command, db: &Db) -> Result<Value, CommandError> {
             let n = keys.iter().filter(|k| db.exists(k)).count();
             Ok(Value::Integer(n as i64))
         }
+        Command::LPush { key, values } => Ok(Value::Integer(db.lpush(&key, values)? as i64)),
+        Command::LPop { key, count } => Ok(match (count, db.lpop(&key, count)?) {
+            (None, Some(v)) => match v.into_iter().next() {
+                Some(first) => Value::BulkString(first),
+                None => Value::NullBulkString,
+            },
+            (None, _) => Value::NullBulkString,
+            (Some(_), Some(v))  => Value::Array(v.into_iter().map(Value::BulkString).collect()),
+            (Some(_), None) => Value::NullArray,
+        }),
+
+        Command::RPop { key, count } => Ok(match (count, db.rpop(&key, count)?) {
+            (None, Some(v)) => match v.into_iter().next() {
+                Some(first) => Value::BulkString(first),
+                None => Value::NullBulkString,
+            },
+            (None, _) => Value::NullBulkString,
+            (Some(_), Some(v))  => Value::Array(v.into_iter().map(Value::BulkString).collect()),
+            (Some(_), None) => Value::NullArray,
+        }),
+        Command::LLen { key } => Ok(Value::Integer(db.llen(&key)? as i64)),
+        Command::LRange {key, start, stop} => {Ok(
+            Value::Array(
+                db.lrange(&key, start, stop)?
+                .into_iter()
+                .map(Value::BulkString)
+                .collect()
+            )
+        )},
     }
 }
 

@@ -155,6 +155,104 @@ impl Db {
         guard.contains_key(key)
     }
 
+    pub fn llen(&self, key: &[u8]) -> Result<usize, WrongType> {
+        let now = self.clock.now();
+        let mut guard = self.map.lock().unwrap();
+        reap_if_expired(&mut guard, key, now);
+        match guard.get(key) {
+            Some(entry) => match &entry.data {
+                Data::List(l) => Ok(l.len()),
+                _ => Err(WrongType),
+            },
+            None => Ok(0),
+        }
+    }
+
+    pub fn lrange(&self, key: &[u8], start: i64, stop: i64) -> Result<Vec<Vec<u8>>, WrongType> {
+        let now = self.clock.now();
+        let mut guard = self.map.lock().unwrap();
+        reap_if_expired(&mut guard, key, now);
+        match guard.get(key) {
+            Some(entry) => match &entry.data {
+                Data::List(l) => {
+                    let len = l.len();
+                    if let Some((from, to)) = resolve_range(len, start, stop) {
+                        Ok(l.range(from..to).cloned().collect())
+                    } else {
+                        Ok(Vec::new())
+                    }
+                },
+                _ => Err(WrongType),
+            },
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub fn lpush(&self, key: &[u8], values: Vec<Vec<u8>>) -> Result<usize, WrongType> {
+        let now = self.clock.now();
+        let mut guard = self.map.lock().unwrap();
+        reap_if_expired(&mut guard, key, now);
+
+        let entry = guard.entry(key.to_vec()).or_insert_with(|| Entry {
+            data: Data::List(VecDeque::new()),
+            expires_at: None,
+        });
+
+        match &mut entry.data {
+            Data::List(list) => {
+                for v in values {
+                    list.push_front(v);
+                }
+                Ok(list.len())
+            }
+            _ => Err(WrongType),
+        }
+    }
+
+    pub fn lpop(&self, key: &[u8], count: Option<usize>) -> Result<Option<Vec<Vec<u8>>>, WrongType> {
+        let now = self.clock.now();
+        let mut guard = self.map.lock().unwrap();
+        reap_if_expired(&mut guard, key, now);
+        let (popped, now_empty) = match guard.get_mut(key) {
+            None => return Ok(None),
+            Some(entry) => match &mut entry.data {
+                Data::List(l) => {
+                    let n = count.unwrap_or(1).min(l.len());
+                    let out: Vec<_> = l.drain(..n).collect();
+                    (out, l.is_empty())
+                }
+                _ => return Err(WrongType),
+            },
+        };
+        if now_empty {
+            guard.remove(key);
+        }
+        Ok(Some(popped))
+    }
+
+    pub fn rpop(&self, key: &[u8], count: Option<usize>) -> Result<Option<Vec<Vec<u8>>>, WrongType> {
+        let now = self.clock.now();
+        let mut guard = self.map.lock().unwrap();
+        reap_if_expired(&mut guard, key, now);
+        let (popped, now_empty) = match guard.get_mut(key) {
+            None => return Ok(None),
+            Some(entry) => match &mut entry.data {
+                Data::List(l) => {
+                    let n = count.unwrap_or(1).min(l.len());
+                    let start = l.len() - n;
+                    let mut out: Vec<_> = l.drain(start..).collect();
+                    out.reverse();
+                    (out, l.is_empty())
+                }
+                _ => return Err(WrongType),
+            },
+        };
+        if now_empty {
+            guard.remove(key);
+        }
+        Ok(Some(popped))
+    }
+
 }
 
 /// Removes the entry at `key` if its deadline has passed. Every accessor calls
@@ -164,6 +262,25 @@ fn reap_if_expired(map: &mut HashMap<Vec<u8>, Entry>, key: &[u8], now: Instant) 
     if expired {
         map.remove(key);
     }
+}
+
+/// Resolves LRANGE style indexes to a half open range into a list of `len`.
+/// Returns None when the range is empty.
+fn resolve_range(len: usize, start: i64, stop: i64) -> Option<(usize, usize)> {
+    let len = len as i64;
+
+    // negative counts from the end
+    let mut start = if start < 0 { len + start } else { start };
+    let mut stop  = if stop  < 0 { len + stop  } else { stop  };
+
+    // clamp, do not wrap
+    if start < 0 { start = 0; }
+    if stop >= len { stop = len - 1; }
+
+    if start > stop || start >= len || len == 0 {
+        return None;
+    }
+    Some((start as usize, stop as usize + 1))
 }
 
 impl Default for Db {
