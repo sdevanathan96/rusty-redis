@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,8 +14,10 @@ impl Clock for SystemClock {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrongType;
 struct Entry {
-    value: Vec<u8>,
+    data: Data,
     expires_at: Option<Instant>,
 }
 
@@ -28,12 +30,49 @@ impl Entry {
     }
 }
 
+// private: the storage
+#[derive(Debug, Clone)]
+enum Data {
+    String(Vec<u8>),
+    List(VecDeque<Vec<u8>>),
+}
+
+// public: the tag only
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataType { String, List }
+
+impl DataType {
+    pub fn as_bytes(&self) -> &'static [u8] {
+        match self {
+            DataType::String => b"string",
+            DataType::List => b"list",
+        }
+    }
+}
+
+impl Data {
+    fn kind(&self) -> DataType {
+        match self {
+            Data::String(_) => DataType::String,
+            Data::List(_) => DataType::List,
+        }
+    }
+}
+
 pub struct Db {
     map: Mutex<HashMap<Vec<u8>, Entry>>,
     clock: Arc<dyn Clock>,
 }
 
 impl Db {
+
+    pub fn type_of(&self, key: &[u8]) -> Option<DataType> {
+        let now = self.clock.now();
+        let mut guard = self.map.lock().unwrap();
+        reap_if_expired(&mut guard, key, now);
+        guard.get(key).map(|e| e.data.kind())
+    }
+
     pub fn new() -> Self {
         Db::with_clock(Arc::new(SystemClock))
     }
@@ -50,26 +89,24 @@ impl Db {
     pub fn set(&self, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration>) {
         let now = self.clock.now();
         let entry = Entry {
-            value,
+            data: Data::String(value),
             expires_at: ttl.map(|d| now + d),
         };
         self.map.lock().unwrap().insert(key, entry);
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongType>{
         let now = self.clock.now();
         let mut guard = self.map.lock().unwrap();
+        reap_if_expired(&mut guard, key, now);
 
-        let expired = match guard.get(key) {
-            None => return None,
-            Some(entry) => entry.is_expired(now),
-        };
-
-        if expired {
-            guard.remove(key);
-            return None;
+        match guard.get(key) {
+            Some(entry) => match &entry.data {
+                Data::String(v) => Ok(Some(v.clone())),
+                _ => Err(WrongType),
+            },
+            None => Ok(None),
         }
-        Some(guard.get(key).expect("present under the lock").value.clone())
     }
 
     pub fn delete(&self, key: &[u8]) -> bool {
@@ -90,6 +127,42 @@ impl Db {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn rpush(&self, key: &[u8], values: Vec<Vec<u8>>) -> Result<usize, WrongType> {
+        let now = self.clock.now();
+        let mut guard = self.map.lock().unwrap();
+        reap_if_expired(&mut guard, key, now);
+
+        let entry = guard.entry(key.to_vec()).or_insert_with(|| Entry {
+            data: Data::List(VecDeque::new()),
+            expires_at: None,
+        });
+
+        match &mut entry.data {
+            Data::List(list) => {
+                list.extend(values);
+                Ok(list.len())
+            }
+            _ => Err(WrongType),
+        }
+    }
+
+    pub fn exists(&self, key: &[u8]) -> bool {
+        let now = self.clock.now();
+        let mut guard = self.map.lock().unwrap();
+        reap_if_expired(&mut guard, key, now);
+        guard.contains_key(key)
+    }
+
+}
+
+/// Removes the entry at `key` if its deadline has passed. Every accessor calls
+/// this first, so a write path never appends to a stale value.
+fn reap_if_expired(map: &mut HashMap<Vec<u8>, Entry>, key: &[u8], now: Instant) {
+    let expired = map.get(key).is_some_and(|e| e.is_expired(now));
+    if expired {
+        map.remove(key);
     }
 }
 
@@ -145,8 +218,8 @@ mod tests {
     fn set_then_get() {
         let (_clock, db) = fixture();
         db.set(b"k".to_vec(), b"v".to_vec(), None);
-        assert_eq!(db.get(b"k"), Some(b"v".to_vec()));
-        assert_eq!(db.get(b"missing"), None);
+        assert_eq!(db.get(b"k"), Ok(Some(b"v".to_vec())));
+        assert_eq!(db.get(b"missing"), Ok(None));
     }
 
     #[test]
@@ -154,13 +227,13 @@ mod tests {
         let (clock, db) = fixture();
         db.set(b"k".to_vec(), b"v".to_vec(), Some(Duration::from_millis(100)));
 
-        assert_eq!(db.get(b"k"), Some(b"v".to_vec()));
+        assert_eq!(db.get(b"k"), Ok(Some(b"v".to_vec())));
 
         clock.advance(Duration::from_millis(99));
-        assert_eq!(db.get(b"k"), Some(b"v".to_vec()), "not yet expired");
+        assert_eq!(db.get(b"k"), Ok(Some(b"v".to_vec())), "not yet expired");
 
         clock.advance(Duration::from_millis(1));
-        assert_eq!(db.get(b"k"), None, "expired at the deadline, not after it");
+        assert_eq!(db.get(b"k"), Ok(None), "expired at the deadline, not after it");
     }
 
     #[test]
@@ -168,7 +241,7 @@ mod tests {
         let (clock, db) = fixture();
         db.set(b"k".to_vec(), b"v".to_vec(), None);
         clock.advance(Duration::from_secs(86_400 * 365));
-        assert_eq!(db.get(b"k"), Some(b"v".to_vec()));
+        assert_eq!(db.get(b"k"), Ok(Some(b"v".to_vec())));
     }
 
     #[test]
@@ -179,11 +252,11 @@ mod tests {
         assert_eq!(db.len(), 2);
 
         clock.advance(Duration::from_millis(99));
-        assert_eq!(db.get(b"b"), None);
+        assert_eq!(db.get(b"b"), Ok(None));
         assert_eq!(db.len(), 1, "get must remove, not just hide");
 
         clock.advance(Duration::from_millis(1));
-        assert_eq!(db.get(b"a"), None);
+        assert_eq!(db.get(b"a"), Ok(None));
         assert_eq!(db.len(), 0);
     }
 
@@ -202,6 +275,6 @@ mod tests {
         db.set(b"k".to_vec(), b"v1".to_vec(), Some(Duration::from_millis(10)));
         db.set(b"k".to_vec(), b"v2".to_vec(), None);
         clock.advance(Duration::from_secs(1));
-        assert_eq!(db.get(b"k"), Some(b"v2".to_vec()));
+        assert_eq!(db.get(b"k"), Ok(Some(b"v2".to_vec())));
     }
 }

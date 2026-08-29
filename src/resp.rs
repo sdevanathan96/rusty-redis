@@ -21,6 +21,7 @@ pub enum RespError {
     IOError(std::io::Error),
     BadLength(i64),
     BadTerminator,
+    TooDeep,
 }
 
 impl From<std::io::Error> for RespError {
@@ -42,6 +43,8 @@ impl RespError {
                 b"ERR Protocol error: expected CRLF".to_vec(),
             RespError::IOError(e) =>
                 format!("ERR IO error: {}", e).into_bytes(),
+            RespError::TooDeep =>
+                b"ERR Protocol error: nested arrays too deep".to_vec(),
         }
     }
 }
@@ -56,6 +59,7 @@ impl PartialEq for RespError {
             }
             (Self::BadLength(left), Self::BadLength(right)) => left == right,
             (Self::BadTerminator, Self::BadTerminator) => true,
+            (Self::TooDeep, Self::TooDeep) => true,
             _ => false,
         }
     }
@@ -64,25 +68,30 @@ impl PartialEq for RespError {
 #[derive(Default)]
 pub struct RespParser;
 
+const MAX_DEPTH: usize = 32;
+
 /// Returns:
 ///   Ok(Some((n, value))) - parsed a value occupying the first n bytes
 ///   Ok(None)             - incomplete, caller should read more bytes
 ///   Err(e)               - malformed, caller should close the connection
 pub fn parse(input: &[u8]) -> Result<Option<(usize, Value)>, RespError> {
-    parse_for(input, 0)
+    parse_for(input, 0, 0)
 }
 
 
-fn parse_for(input: &[u8], pos: usize) -> Result<Option<(usize, Value)>, RespError>{
+fn parse_for(input: &[u8], pos: usize, depth: usize) -> Result<Option<(usize, Value)>, RespError>{
     if pos >= input.len() {
         return Ok(None);
+    }
+    if depth > MAX_DEPTH {
+        return Err(RespError::TooDeep);
     }
     match input[pos] {
         b'+' => simple_string(input, pos + 1),
         b'-' => error(input, pos + 1),
         b':' => integer(input, pos + 1),
         b'$' => bulk_string(input, pos + 1),
-        b'*' => array(input, pos + 1),
+        b'*' => array(input, pos + 1, depth),
         // everything below is stage 6
         // b'_' => null(input, pos + 1),
         // b'#' => boolean(input, pos + 1),
@@ -176,7 +185,7 @@ fn integer(input: &[u8], pos: usize) -> Result<Option<(usize, Value)>, RespError
     Ok(Some((next_pos, Value::Integer(integer_val))))
 }
 
-fn array(input: &[u8], pos: usize) -> Result<Option<(usize, Value)>, RespError> {
+fn array(input: &[u8], pos: usize, depth: usize) -> Result<Option<(usize, Value)>, RespError> {
     let (len_bytes, data_start) = match line(input, pos)? {
         Some(v) => v,
         None => return Ok(None),
@@ -199,7 +208,7 @@ fn array(input: &[u8], pos: usize) -> Result<Option<(usize, Value)>, RespError> 
     }
     let mut values = Vec::with_capacity(len as usize);
     for _ in 0..len {
-        match parse_for(input, curr_pos)? {
+        match parse_for(input, curr_pos, depth + 1)? {
             Some((new_pos, value)) => {
                 curr_pos = new_pos;
                 values.push(value);
@@ -395,28 +404,7 @@ mod resp_parser_tests {
 
     #[test]
     fn encode_parse_round_trip() {
-        let values = vec![
-            Value::SimpleString(b"OK".to_vec()),
-            Value::SimpleString(vec![]),
-            Value::Error(b"ERR something went wrong".to_vec()),   // was missing
-            Value::Integer(0),
-            Value::Integer(-42),
-            Value::Integer(i64::MAX),
-            Value::Integer(i64::MIN),
-            Value::BulkString(vec![]),
-            Value::BulkString(b"a\r\nb".to_vec()),                // binary safe, must survive
-            Value::BulkString(vec![0, 255, 13, 10]),              // arbitrary bytes
-            Value::NullBulkString,
-            Value::NullArray,                                     // was missing
-            Value::Array(vec![]),
-            Value::Array(vec![Value::Integer(1), Value::NullBulkString]),
-            Value::Array(vec![                                    // nesting was missing
-                Value::Array(vec![Value::SimpleString(b"a".to_vec())]),
-                Value::Error(b"ERR nested".to_vec()),
-                Value::BulkString(b"x\r\ny".to_vec()),
-            ]),
-        ];
-        for v in values {
+        for v in round_trip_values() {
             let mut out = Vec::new();
             encode(&v, &mut out);
             assert_eq!(parse(&out), Ok(Some((out.len(), v.clone()))), "failed for {v:?}");
@@ -439,4 +427,51 @@ mod resp_parser_tests {
             other => panic!("expected an error, got {other:?}"),
         }
     }
+    #[test]
+    fn deep_nesting_is_rejected() {
+        let bomb = b"*1\r\n".repeat(100_000);
+        assert!(parse(&bomb).is_err());
+    }
+
+    fn assert_streams(bytes: &[u8], expected: Value) {
+        for n in 0..bytes.len() {
+            assert_eq!(parse(&bytes[..n]), Ok(None), "prefix of length {n} should be incomplete");
+        }
+        assert_eq!(parse(bytes), Ok(Some((bytes.len(), expected))));
+    }
+
+    fn round_trip_values() -> Vec<Value> {
+        let values = vec![
+            Value::SimpleString(b"OK".to_vec()),
+            Value::SimpleString(vec![]),
+            Value::Error(b"ERR something went wrong".to_vec()),   // was missing
+            Value::Integer(0),
+            Value::Integer(-42),
+            Value::Integer(i64::MAX),
+            Value::Integer(i64::MIN),
+            Value::BulkString(vec![]),
+            Value::BulkString(b"a\r\nb".to_vec()),                // binary safe, must survive
+            Value::BulkString(vec![0, 255, 13, 10]),              // arbitrary bytes
+            Value::NullBulkString,
+            Value::NullArray,                                     // was missing
+            Value::Array(vec![]),
+            Value::Array(vec![Value::Integer(1), Value::NullBulkString]),
+            Value::Array(vec![                                    // nesting was missing
+                Value::Array(vec![Value::SimpleString(b"a".to_vec())]),
+                Value::Error(b"ERR nested".to_vec()),
+                Value::BulkString(b"x\r\ny".to_vec()),
+            ]),
+        ];
+        values
+    }
+
+    #[test]
+    fn every_frame_streams_byte_by_byte() {
+        for v in round_trip_values() {
+            let mut out = Vec::new();
+            encode(&v, &mut out);
+            assert_streams(&out, v);
+        }
+    }
+
 }

@@ -1,4 +1,4 @@
-use crate::db::Db;
+use crate::db::{Db, WrongType};
 use crate::resp::Value;
 use std::time::Duration;
 
@@ -15,6 +15,15 @@ pub enum Command {
         expiry: Option<Duration>,
     },
     Unknown(Vec<u8>),
+    Type {
+        key: Vec<u8>,
+    },
+    RPush {
+        key: Vec<u8>,
+        values: Vec<Vec<u8>>,
+    },
+    Del { keys: Vec<Vec<u8>> },
+    Exists { keys: Vec<Vec<u8>> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +36,13 @@ pub enum CommandError {
     InvalidExpiry(Vec<u8>),
     Syntax,
     UnknownCommand(Vec<u8>),
+    WrongType,
+}
+
+impl From<WrongType> for CommandError {
+    fn from(_: WrongType) -> Self {
+        CommandError::WrongType
+    }
 }
 
 impl CommandError {
@@ -48,6 +64,7 @@ impl CommandError {
             CommandError::UnknownCommand(name) => {
                 format!("ERR unknown command '{}'", quote(name)).into_bytes()
             },
+            CommandError::WrongType => b"WRONGTYPE Operation against a key holding the wrong kind of value".to_vec(),
         }
     }
 }
@@ -119,7 +136,25 @@ pub fn to_command(v: Value) -> Result<Command, CommandError> {
 
             Ok(Command::Set { key, value, expiry })
         }
-
+        b"TYPE" => match rest {
+            [key] => Ok(Command::Type { key: key.clone() }),
+            _ => Err(CommandError::WrongArity(name.clone())),
+        },
+        b"RPUSH" => match rest {
+            [key, first, more @ ..] => Ok(Command::RPush {
+                key: key.clone(),
+                values: std::iter::once(first).chain(more).cloned().collect(),
+            }),
+            _ => Err(CommandError::WrongArity(name.clone())),
+        },
+        b"DEL" => match rest {
+            [] => Err(CommandError::WrongArity(name.clone())),
+            keys => Ok(Command::Del { keys: keys.to_vec() }),
+        },
+        b"EXISTS" => match rest {
+            [] => Err(CommandError::WrongArity(name.clone())),
+            keys => Ok(Command::Exists { keys: keys.to_vec() }),
+        },
         _ => Ok(Command::Unknown(name.clone())),
     }
 }
@@ -135,25 +170,40 @@ fn expiry_arg(rest: &[Vec<u8>], i: usize, cmd_name: &[u8]) -> Result<i64, Comman
     Ok(n)
 }
 
-pub fn execute(cmd: Command, db: &Db) -> Value {
+pub fn execute(cmd: Command, db: &Db) -> Result<Value, CommandError> {
     match cmd {
-        Command::Ping(None) => Value::SimpleString(b"PONG".to_vec()),
-        Command::Ping(Some(msg)) => Value::BulkString(msg),
+        Command::Ping(None) => Ok(Value::SimpleString(b"PONG".to_vec())),
+        Command::Ping(Some(msg)) => Ok(Value::BulkString(msg)),
 
-        Command::Echo(msg) => Value::BulkString(msg),
+        Command::Echo(msg) => Ok(Value::BulkString(msg)),
 
         Command::Set { key, value, expiry } => {
             db.set(key, value, expiry);
-            Value::SimpleString(b"OK".to_vec())
+            Ok(Value::SimpleString(b"OK".to_vec()))
         }
 
-        Command::Get { key } => match db.get(&key) {
+        Command::Get { key } => Ok(match db.get(&key)? {
             Some(v) => Value::BulkString(v),
             None => Value::NullBulkString,
-        },
+        }),
         Command::Unknown(name) => {
-            Value::Error(CommandError::UnknownCommand(name).to_resp())
+            Err(CommandError::UnknownCommand(name))
         },
+
+        Command::Type { key } => match db.type_of(&key) {
+            Some(t) => Ok(Value::SimpleString(t.as_bytes().to_vec())),
+            None => Ok(Value::SimpleString(b"none".to_vec())),
+        },
+
+        Command::RPush { key, values } => Ok(Value::Integer(db.rpush(&key, values)? as i64)),
+        Command::Del { keys } => {
+            let n = keys.iter().filter(|k| db.delete(k)).count();
+            Ok(Value::Integer(n as i64))
+        }
+        Command::Exists { keys } => {
+            let n = keys.iter().filter(|k| db.exists(k)).count();
+            Ok(Value::Integer(n as i64))
+        }
     }
 }
 
@@ -298,15 +348,15 @@ mod command_tests {
         let d = db();
         // bare PING is a simple string, PING <msg> is a bulk string
         assert_eq!(
-            execute(Command::Ping(None), &d),
+            execute(Command::Ping(None), &d).unwrap(),
             Value::SimpleString(b"PONG".to_vec())
         );
         assert_eq!(
-            execute(Command::Ping(Some(b"hi".to_vec())), &d),
+            execute(Command::Ping(Some(b"hi".to_vec())), &d).unwrap(),
             Value::BulkString(b"hi".to_vec())
         );
         assert_eq!(
-            execute(Command::Echo(b"hi".to_vec()), &d),
+            execute(Command::Echo(b"hi".to_vec()), &d).unwrap(),
             Value::BulkString(b"hi".to_vec())
         );
     }
@@ -315,15 +365,15 @@ mod command_tests {
     fn get_missing_key_is_null_bulk_string() {
         let d = db();
         let c = cmd(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n").unwrap();
-        assert_eq!(execute(c, &d), Value::NullBulkString);
+        assert_eq!(execute(c, &d).unwrap(), Value::NullBulkString);
     }
 
     #[test]
     fn set_then_get_round_trip_through_the_command_layer() {
         let d = db();
-        execute(cmd(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n").unwrap(), &d);
+        execute(cmd(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n").unwrap(), &d).unwrap();
         assert_eq!(
-            execute(cmd(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n").unwrap(), &d),
+            execute(cmd(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n").unwrap(), &d).unwrap(),
             Value::BulkString(b"v".to_vec())
         );
     }
@@ -333,7 +383,7 @@ mod command_tests {
     #[test]
     fn error_replies_have_exactly_one_sigil() {
         let d = db();
-        let reply = execute(Command::Unknown(b"FOO".to_vec()), &d);
+        let reply = execute(Command::Unknown(b"FOO".to_vec()), &d).unwrap();
         let mut out = Vec::new();
         encode(&reply, &mut out);
         assert_eq!(out[0], b'-', "error replies start with one dash");

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use rusty_redis::resp;
+use rusty_redis::resp::{self, Value};
 use rusty_redis::command::{to_command, execute};
 use rusty_redis::db::Db;
 use rusty_redis::db::SystemClock;
@@ -38,9 +38,9 @@ async fn handle_client(mut stream: TcpStream, db: Arc<Db>) -> std::io::Result<()
             match resp::parse(&inbuf) {
                 Ok(Some((consumed, value))) => {
                     inbuf.advance(consumed);
-                    let reply = match to_command(value) {
-                        Ok(cmd) => execute(cmd, &db),
-                        Err(e) => resp::Value::Error(e.to_resp()),
+                    let reply = match to_command(value).and_then(|cmd| execute(cmd, &db)) {
+                        Ok(v) => v,
+                        Err(e) => Value::Error(e.to_resp()),
                     };
                     resp::encode(&reply, &mut outbuf);
                 }
