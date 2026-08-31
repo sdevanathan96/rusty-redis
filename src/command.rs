@@ -1,6 +1,7 @@
-use crate::db::{Db, WrongType, End};
+use crate::db::{Db, WrongType, End, XaddError, IdSpec};
 use crate::resp::Value;
 use std::time::Duration;
+mod stream;
 mod generic;
 mod list;
 mod string;
@@ -28,6 +29,8 @@ pub enum Command {
     LRange { key: Vec<u8>, start: i64, stop: i64 },
     LMove { src: Vec<u8>, dst: Vec<u8>, from: End, to: End },
     BPop { keys: Vec<Vec<u8>>, timeout: Option<Duration>, from: End },
+    BLMove { src: Vec<u8>, dst: Vec<u8>, from: End, to: End , timeout: Option<Duration> },
+    XAdd { key: Vec<u8>, id: IdSpec, fields: Vec<(Vec<u8>, Vec<u8>)> },
     Unknown { name: Vec<u8>, args: Vec<Vec<u8>> },
 }
 
@@ -43,12 +46,60 @@ pub enum CommandError {
     WrongType,
     UnknownCommand { name: Vec<u8>, args: Vec<Vec<u8>> },
     TimeoutError,
-    NegativeTimeout
+    NegativeTimeout,
+    InvalidStreamId,
+    XaddIdZero,
+    XaddIdTooSmall,
 }
 
 impl From<WrongType> for CommandError {
     fn from(_: WrongType) -> Self {
         CommandError::WrongType
+    }
+}
+
+impl From<XaddError> for CommandError {
+    fn from(e: XaddError) -> Self {
+        match e {
+            XaddError::WrongType => CommandError::WrongType,
+            XaddError::IdIsZero => CommandError::XaddIdZero,
+            XaddError::IdTooSmall => CommandError::XaddIdTooSmall,
+        }
+    }
+}
+
+pub struct BlockSpec {
+    pub timeout: Option<Duration>,   // None means forever
+    pub on_timeout: Value,
+}
+
+impl Command {
+    /// Lists this command adds elements to. A parked waiter on one of these
+    /// keys may become satisfiable after this command runs.
+    /// ADD AN ARM when you add a command that pushes to a list.
+    pub fn feeds(&self) -> Vec<Vec<u8>> {
+        match self {
+            Command::Push { key, .. } => vec![key.clone()],
+            Command::LMove { dst, .. } => vec![dst.clone()],
+            Command::BLMove { dst, .. } => vec![dst.clone()],
+            _ => vec![],
+        }
+    }
+
+    /// Whether this command can park, and what to send if it times out.
+    /// ADD AN ARM when you add a blocking command.
+    pub fn blocking(&self) -> Option<BlockSpec> {
+        match self {
+            Command::BPop { timeout, .. } => Some(BlockSpec {
+                timeout: *timeout,
+                on_timeout: Value::NullArray,
+            }),
+            Command::BLMove { timeout, .. } => Some(BlockSpec {
+                timeout: *timeout,
+                on_timeout: Value::NullArray,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -87,6 +138,12 @@ impl CommandError {
             }
             CommandError::NegativeTimeout => { b"ERR timeout is negative".to_vec() }
             CommandError::TimeoutError => { b"ERR timeout is not a float or out of range".to_vec() }
+            CommandError::InvalidStreamId =>
+                b"ERR Invalid stream ID specified as stream command argument".to_vec(),
+            CommandError::XaddIdZero =>
+                b"ERR The ID specified in XADD must be greater than 0-0".to_vec(),
+            CommandError::XaddIdTooSmall =>
+                b"ERR The ID specified in XADD is equal or smaller than the target stream top item".to_vec(),
         }
     }
 }
@@ -125,7 +182,8 @@ pub fn to_command(v: Value) -> Result<Option<Command>, CommandError> {
     let upper = name.to_ascii_uppercase();
     let parsed = generic::try_parse(&upper, rest, name)
         .or_else(|| string::try_parse(&upper, rest, name))
-        .or_else(|| list::try_parse(&upper, rest, name));
+        .or_else(|| list::try_parse(&upper, rest, name))
+        .or_else(|| stream::try_parse(&upper, rest, name));
 
     let cmd = match parsed {
         Some(result) => result?,
@@ -173,14 +231,6 @@ fn parse_timeout(raw: &[u8]) -> Result<Option<Duration>, CommandError> {
     Ok(Some(Duration::from_secs_f64(seconds)))
 }
 
-pub fn touched_keys(cmd: &Command) -> Vec<Vec<u8>> {
-    match cmd {
-        Command::Push { key, .. } => vec![key.clone()],
-        Command::LMove { dst, .. } => vec![dst.clone()],
-        _ => vec![],
-    }
-}
-
 pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError>{
     match cmd {
         Command::Ping(msg) => Ok(Outcome::Reply(generic::ping(msg)?)), 
@@ -196,8 +246,9 @@ pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError>{
         Command::LRange { key, start, stop } => Ok(Outcome::Reply(list::lrange(&key, start, stop, db)?)),
         Command::LMove { src, dst, from, to } => Ok(Outcome::Reply(list::lmove(&src, &dst, from, to, db)?)),
         Command::Unknown { name, args } => Err(CommandError::UnknownCommand { name, args }),
-        Command::BPop { keys, timeout, from } => list::bpop(keys, from, timeout, db)
-
+        Command::BPop { keys, timeout, from } => list::bpop(keys, from, timeout, db),
+        Command::BLMove { src, dst, from, to, timeout } => list::blmove(src, dst, from, to, timeout, db),
+        Command::XAdd { key, id, fields } => stream::xadd(&key, id, fields, db),
     }
 }
 

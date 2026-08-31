@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::command::{touched_keys, Command, Outcome};
+use crate::command::{Command, Outcome};
 use crate::resp::Value;
 use crate::command::execute;
 use crate::db::Db;
@@ -28,7 +28,7 @@ pub async fn keyspace_task(mut db: Db, mut rx: mpsc::Receiver<Request>) {
     while let Some(req) = rx.recv().await {
         match req {
             Request::Run { cmd, reply, id } => {
-                let touched = touched_keys(&cmd);
+                let touched = cmd.feeds();
                 match execute(cmd, &mut db) {
                     Ok(Outcome::Reply(v)) => { let _ = reply.send(v); }
                     Ok(Outcome::Block { keys, retry }) => {
@@ -65,17 +65,17 @@ fn serve_waiters(
             continue;
         }
         if waiters[i].reply.is_closed() {
-            waiters.remove(i);          // client gave up; do not shift i
+            waiters.remove(i); // client gave up; do not shift i
             continue;
         }
 
         match execute(waiters[i].retry.clone(), db) {
             Ok(Outcome::Reply(v)) => {
-                fed.extend(touched_keys(&waiters[i].retry));
+                fed.extend(waiters[i].retry.feeds());
                 let w = waiters.remove(i).unwrap();
                 let _ = w.reply.send(v);
             }
-            Ok(Outcome::Block { .. }) => break,   // nothing left on this key
+            Ok(Outcome::Block { .. }) => break, // nothing left on this key
             Err(e) => {
                 let w = waiters.remove(i).unwrap();
                 let _ = w.reply.send(Value::Error(e.to_resp()));

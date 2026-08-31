@@ -62,6 +62,7 @@ BLOCK_PY=$(mktemp)
 
 cleanup() {
     rm -f "$BLOCK_PY"
+    rm -f "$BLOCK2_PY"
     [ "$OUR_REDIS" = 1 ] && redis-cli -p "$REAL" SHUTDOWN NOSAVE >/dev/null 2>&1
     return 0
 }
@@ -125,6 +126,71 @@ except socket.timeout:
     pass
 t.join()
 sys.stdout.write(repr(buf))
+PYEOF
+
+
+BLOCK2_PY=$(mktemp)
+# add to the cleanup trap: rm -f "$BLOCK2_PY"
+cat > "$BLOCK2_PY" <<'PYEOF'
+import socket, sys, threading, time
+
+port    = int(sys.argv[1])
+tag     = sys.argv[2]
+delay   = float(sys.argv[3])
+b1, b2  = sys.argv[4], sys.argv[5]
+trigger = sys.argv[6]
+
+def sub(s):
+    return s.replace("{K3}", tag + "c").replace("{K2}", tag + "b").replace("{K}", tag + "a")
+
+def frame(spec):
+    parts = [sub(p).encode() for p in spec.split("|")]
+    out = b"*%d\r\n" % len(parts)
+    for p in parts:
+        out += b"$%d\r\n%s\r\n" % (len(p), p)
+    return out
+
+def frames(spec):
+    return b"".join(frame(c) for c in spec.split(";"))
+
+def blocker(spec, out, idx):
+    s = socket.create_connection(("127.0.0.1", port))
+    s.sendall(frame(spec))
+    s.settimeout(delay + 3.0)
+    buf = b""
+    try:
+        while True:
+            c = s.recv(4096)
+            if not c:
+                break
+            buf += c
+    except socket.timeout:
+        pass
+    out[idx] = buf
+    s.close()
+
+out = [b"", b""]
+t1 = threading.Thread(target=blocker, args=(b1, out, 0))
+t1.start()
+time.sleep(0.3)                 # b1 must park before b2 arrives, for FIFO order
+t2 = threading.Thread(target=blocker, args=(b2, out, 1))
+t2.start()
+time.sleep(0.3)
+
+time.sleep(delay)
+s = socket.create_connection(("127.0.0.1", port))
+s.sendall(frames(trigger))
+s.settimeout(1.0)
+try:
+    while s.recv(4096):
+        pass
+except socket.timeout:
+    pass
+s.close()
+
+t1.join()
+t2.join()
+sys.stdout.write("first=%r second=%r" % (out[0], out[1]))
 PYEOF
 
 # ---------------------------------------------------------------- helpers
@@ -235,6 +301,18 @@ block_scenario() {
         "yours" "redis"
 }
 
+# Two connections block, then a third acts. Diffs both blocked clients' replies.
+#   $1 name  $2 delay  $3 first blocking cmd  $4 second blocking cmd  $5 trigger
+block2_scenario() {
+    local name="$1" delay="$2" b1="$3" b2="$4" trigger="$5"
+    skip_filtered "$name" && return
+    local tag="r${RUN}s${N}k"
+    report "$name" " ${DIM}(block2)${OFF}" \
+        "$(python3 "$BLOCK2_PY" "$MINE" "$tag" "$delay" "$b1" "$b2" "$trigger" 2>&1)" \
+        "$(python3 "$BLOCK2_PY" "$REAL" "$tag" "$delay" "$b1" "$b2" "$trigger" 2>&1)" \
+        "yours" "redis"
+}
+
 section() { printf '\n%s== %s%s\n' "$DIM" "$1" "$OFF"; }
 
 # ---------------------------------------------------------------- scenarios
@@ -338,6 +416,27 @@ scenario "lmove syntax and arity" \
     "RPUSH {K} a" "LMOVE {K} {K2} SIDEWAYS RIGHT" "LMOVE {K} {K2} LEFT" \
     "LMOVE {K} {K2} left right" "LRANGE {K2} 0 -1"
 
+
+section "streams"
+scenario "xadd explicit ids" \
+    "XADD {K} 0-0 f v" "XADD {K} 0-1 f v" "XADD {K} 5-5 f v" \
+    "XADD {K} 3-0 f v" "XADD {K} 5-5 f v" "XADD {K} 5-6 f v" "TYPE {K}"
+
+scenario "xadd bare millisecond is sequence zero" \
+    "XADD {K} 7 f v" "XADD {K} 7 f v" "XADD {K} 8 f v"
+
+scenario "xadd auto sequence" \
+    "XADD {K} 5-* f v" "XADD {K} 5-* f v" "XADD {K} 6-* f v" "XADD {K} 5-* f v"
+
+scenario "xadd malformed ids" \
+    "XADD {K} abc f v" "XADD {K} 5-abc f v" "XADD {K} -1 f v" "XADD {K} 5- f v"
+
+scenario "xadd arity" \
+    "XADD {K}" "XADD {K} 9-1" "XADD {K} 9-1 f"
+
+scenario "xadd wrongtype" \
+    "SET {K} str" "XADD {K} 1-1 f v" "GET {K}"
+
 section "blocking"
 # A push arrives while a client is parked. The reply must be [key, element].
 block_scenario "blpop woken by a later push" 0.5 \
@@ -373,6 +472,38 @@ block_scenario "element survives a push after the timeout" 2 \
 block_scenario "wrongtype while parked" 0.5 \
     "BLPOP|{K}|2" \
     "SET|{K}|str"
+
+block_scenario "blmove woken by a push to the source" 0.5 \
+    "BLMOVE|{K}|{K2}|LEFT|RIGHT|0" \
+    "RPUSH|{K}|x;LRANGE|{K2}|0|-1"
+
+# Timeout reply must be a null BULK STRING, not a null array.
+block_scenario "blmove times out with a null bulk string" 2.5 \
+    "BLMOVE|{K}|{K2}|LEFT|RIGHT|1" \
+    "PING"
+
+# Destination is a string. Does Redis block or error immediately?
+block_scenario "blmove with a wrongtype destination" 2.5 \
+    "BLMOVE|{K}|{K2}|LEFT|RIGHT|1" \
+    "SET|{K2}|str"
+
+# The cascade: one push satisfies a BLMOVE, whose push then satisfies a BLPOP.
+block2_scenario "blmove cascade wakes a waiter on the destination" 1 \
+    "BLMOVE|{K}|{K2}|LEFT|RIGHT|0" \
+    "BLPOP|{K2}|0" \
+    "RPUSH|{K}|x"
+
+# FIFO across two waiters on one key, one element each.
+block2_scenario "two waiters served in block order" 1 \
+    "BLPOP|{K}|0" \
+    "BLPOP|{K}|0" \
+    "RPUSH|{K}|a|b"
+
+# One element, two waiters. The second must stay parked and time out.
+block2_scenario "one element serves only the first waiter" 1 \
+    "BLPOP|{K}|0" \
+    "BLPOP|{K}|2" \
+    "RPUSH|{K}|only"
 
 section "protocol framing"
 raw_scenario "pipelined commands in one packet" \

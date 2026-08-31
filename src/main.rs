@@ -4,7 +4,7 @@ use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use rusty_redis::resp::{self, Value};
-use rusty_redis::command::{blocking_timeout, to_command, Blocking};
+use rusty_redis::command::{BlockSpec, to_command};
 use rusty_redis::db::Db;
 use rusty_redis::db::SystemClock;
 use rusty_redis::keyspace::{Request, keyspace_task};
@@ -60,26 +60,30 @@ async fn handle_client(
                         Err(e) => resp::encode(&Value::Error(e.to_resp()), &mut outbuf),
                         Ok(Some(cmd)) => {
                             let id = next_id(); // AtomicU64 fetch_add
-                            let deadline = blocking_timeout(&cmd);
+                            let deadline = cmd.blocking();
 
                             let (reply_tx, reply_rx) = oneshot::channel();
                             if tx.send(Request::Run { cmd, reply: reply_tx, id }).await.is_err() {
                                 return Ok(()); // keyspace task is gone
                             }
 
-                            match deadline {
-                                Blocking::Until(d) => match timeout(d, reply_rx).await {
-                                    Ok(Ok(v)) => resp::encode(&v, &mut outbuf),
-                                    Ok(Err(_)) => return Ok(()),         // task dropped the sender
-                                    Err(_) => {                          // elapsed
-                                        let _ = tx.send(Request::Unpark { id }).await;
-                                        resp::encode(&Value::NullArray, &mut outbuf);
+                            let received = match deadline {
+                                Some(BlockSpec { timeout: Some(d), on_timeout }) => {
+                                    match timeout(d, reply_rx).await {
+                                        Ok(inner) => inner,
+                                        Err(_) => {
+                                            let _ = tx.send(Request::Unpark { id }).await;
+                                            resp::encode(&on_timeout, &mut outbuf);
+                                            continue; // next frame in the drain loop
+                                        }
                                     }
-                                },
-                                _ => match reply_rx.await {              // non blocking, or block forever
-                                    Ok(v) => resp::encode(&v, &mut outbuf),
-                                    Err(_) => return Ok(()),
-                                },
+                                }
+                                _ => reply_rx.await, // forever, or not blocking
+                            };
+
+                            match received {
+                                Ok(v) => resp::encode(&v, &mut outbuf),
+                                Err(_) => return Ok(()),
                             }
                         }
                     }

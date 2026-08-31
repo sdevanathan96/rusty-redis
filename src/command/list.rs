@@ -21,6 +21,7 @@ pub(super) fn try_parse(
         b"LLEN"  => llen_command(rest, name),
         b"LRANGE" => lrange_command(rest, name),
         b"LMOVE"  => lmove_command(rest, name),
+        b"BLMOVE" => blmove_command(rest, name),
         _ => return None,          // not a list command
     })
 }
@@ -105,6 +106,19 @@ fn lmove_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError>
     }
 }
 
+fn blmove_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+    match rest {
+        [src, dst, from, to, timeout] => Ok(Command::BLMove {
+            src: src.clone(),
+            dst: dst.clone(),
+            from: parse_end(from)?,
+            to: parse_end(to)?,
+            timeout: parse_timeout(timeout)?,
+        }),
+        _ => return Err(CommandError::WrongArity(name.to_vec())),
+    }
+}
+
 pub(super) fn push(key: &Vec<u8>, values: Vec<Vec<u8>>, from: End, db: &mut Db) -> Result<Value, CommandError> {
     Ok(Value::Integer(db.push(&key, values, from)? as i64))
 }
@@ -162,6 +176,16 @@ pub(super) fn lmove(src: &Vec<u8>, dst: &Vec<u8>, from: End, to: End, db: &mut D
     })
 }
 
+
+pub(super) fn blmove(src: Vec<u8>, dst: Vec<u8>, from: End, to: End, timeout: Option<Duration>, db: &mut Db) -> Result<Outcome, CommandError> {
+    match db.lmove(&src, &dst, from, to)? {
+        Some(v) => Ok(Outcome::Reply(Value::BulkString(v))),
+        None => Ok(Outcome::Block {
+            keys: vec![src.clone()],
+            retry: Command::BLMove { src, dst, from, to, timeout },
+        }),
+    }
+}
 
 #[cfg(test)]
 mod list_tests {

@@ -1,12 +1,18 @@
+
+mod stream;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use crate::db::stream::{Stream};
+pub use crate::db::stream::{EntryId, XaddError, IdSpec};
 
 #[cfg(test)]
 use std::sync::Mutex;
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> Instant;
+    fn now_ms(&self) -> u64;
 }
 
 pub struct SystemClock;
@@ -14,6 +20,12 @@ pub struct SystemClock;
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
         Instant::now()
+    }
+    fn now_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before 1970")
+            .as_millis() as u64
     }
 }
 
@@ -38,17 +50,19 @@ impl Entry {
 enum Data {
     String(Vec<u8>),
     List(VecDeque<Vec<u8>>),
+    Stream(Stream),
 }
 
 // public: the tag only
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DataType { String, List }
+pub enum DataType { String, List, Stream }
 
 impl DataType {
     pub fn as_bytes(&self) -> &'static [u8] {
         match self {
             DataType::String => b"string",
             DataType::List => b"list",
+            DataType::Stream => b"stream",
         }
     }
 }
@@ -66,6 +80,7 @@ impl Data {
         match self {
             Data::String(_) => DataType::String,
             Data::List(_) => DataType::List,
+            Data::Stream(_) => DataType::Stream,
         }
     }
 }
@@ -196,7 +211,12 @@ impl Db {
         match self.map.get(src) {
             None => return Ok(None),
             Some(entry) => match &entry.data {
-                Data::List(_) => {}
+                Data::List(l) => {
+                    match l.is_empty() {
+                        true => return Ok(None),
+                        false => {}
+                    }
+                }
                 _ => return Err(WrongType),
             }
         }
@@ -218,6 +238,33 @@ impl Db {
 
         push_to(&mut self.map, dst, vec![popped.clone()], to)?;
         Ok(Some(popped))
+    }
+
+
+    pub fn xadd(&mut self, key: &[u8], spec: IdSpec, fields: Vec<(Vec<u8>, Vec<u8>)>) -> Result<EntryId, XaddError> {
+        // reap_if_expired
+        // get or create Data::Stream
+        // resolve IdSpec::Auto using self.clock
+        // delegate to Stream::append or append_auto_seq
+        let now = self.clock.now();
+        reap_if_expired(&mut self.map, key, now);
+        let now_ms = self.clock.now_ms();
+
+        let entry = self.map.entry(key.to_vec()).or_insert_with(|| Entry {
+            data: Data::Stream(Stream::default()),
+            expires_at: None,
+        });
+
+        let stream = match &mut entry.data {
+            Data::Stream(s) => s,
+            _ => return Err(XaddError::WrongType),
+        };
+
+        match spec {
+            IdSpec::Explicit(id) => stream.append(id, fields),
+            IdSpec::AutoSeq(ms) => stream.append_auto_seq(ms, fields),
+            IdSpec::Auto => stream.append_auto(now_ms, fields),
+        }
     }
 }
 
@@ -318,16 +365,22 @@ impl Default for Db {
 #[cfg(test)]
 pub struct TestClock {
     now: Mutex<Instant>,
+    base_ms: Mutex<u64>,
 }
 
 #[cfg(test)]
 impl TestClock {
     pub fn new() -> Self {
-        TestClock { now: Mutex::new(Instant::now()) }
+        TestClock { now: Mutex::new(Instant::now()), base_ms: Mutex::new(0) }
     }
     pub fn advance(&self, d: Duration) {
         *self.now.lock().unwrap() += d;
     }
+    
+    pub fn advance_ms(&self, d: u64) {
+        *self.base_ms.lock().unwrap() += d;
+    }
+
 }
 
 #[cfg(test)]
@@ -335,6 +388,7 @@ impl Clock for TestClock {
     fn now(&self) -> Instant {
         *self.now.lock().unwrap()
     }
+    fn now_ms(&self) -> u64 { *self.base_ms.lock().unwrap() }
 }
 
 #[cfg(test)]
