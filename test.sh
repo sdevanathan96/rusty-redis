@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+#
+# Differential test harness for the Redis clone.
+#
+# Runs each scenario against your server AND a real redis-server, then diffs.
+# Real Redis is the oracle, so nothing here hardcodes an expected reply and
+# nothing goes stale when your memory of the spec is wrong.
+#
+#   ./test.sh              run everything
+#   ./test.sh list         run only scenarios whose name matches "list"
+#   STRICT=1 ./test.sh     also run the known deliberate divergences
+#   MINE=6379 REAL=6380 ./test.sh
+#
+# Requires: redis-cli, redis-server, nc, python3
+
+set -uo pipefail
+
+MINE=${MINE:-6379}
+REAL=${REAL:-6380}
+FILTER=${1:-}
+RUN=$$          # unique per invocation, so keys never collide between runs
+
+PASS=0
+FAIL=0
+SKIP=0
+N=0
+FAILED_NAMES=()
+
+RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
+[ -t 1 ] || { RED=""; GRN=""; YEL=""; DIM=""; OFF=""; }
+
+# ---------------------------------------------------------------- setup
+
+need() { command -v "$1" >/dev/null || { echo "missing: $1"; exit 1; }; }
+need redis-cli
+need nc
+need python3
+
+alive() { redis-cli -p "$1" PING >/dev/null 2>&1; }
+
+if ! alive "$MINE"; then
+    echo "${RED}Your server is not answering on port $MINE.${OFF}"
+    echo "Start it with:  cargo run"
+    exit 1
+fi
+
+OUR_REDIS=0
+if alive "$REAL"; then
+    # Wipe the oracle. Stale keys from a previous run make YOUR server look
+    # broken across every scenario that touches the same key names.
+    redis-cli -p "$REAL" FLUSHALL >/dev/null
+else
+    need redis-server
+    echo "${DIM}starting reference redis-server on $REAL${OFF}"
+    redis-server --port "$REAL" --save '' --appendonly no --daemonize yes >/dev/null
+    OUR_REDIS=1
+    for _ in $(seq 20); do alive "$REAL" && break; sleep 0.1; done
+    alive "$REAL" || { echo "${RED}reference server failed to start${OFF}"; exit 1; }
+fi
+
+BLOCK_PY=$(mktemp)
+
+cleanup() {
+    rm -f "$BLOCK_PY"
+    [ "$OUR_REDIS" = 1 ] && redis-cli -p "$REAL" SHUTDOWN NOSAVE >/dev/null 2>&1
+    return 0
+}
+trap cleanup EXIT
+
+# Driver for two-connection scenarios. Lives in a temp file rather than a
+# heredoc inside a function, because nesting quotes that deep is how the
+# previous version silently lost half its code.
+cat > "$BLOCK_PY" <<'PYEOF'
+import socket, sys, threading, time
+
+port      = int(sys.argv[1])
+tag       = sys.argv[2]
+delay     = float(sys.argv[3])
+blocking  = sys.argv[4]
+meanwhile = sys.argv[5]
+
+def sub(s):
+    return s.replace("{K3}", tag + "c").replace("{K2}", tag + "b").replace("{K}", tag + "a")
+
+def frame(spec):
+    """One RESP array from a pipe-separated argument list. Lengths are computed
+    from the substituted bytes, so a placeholder can never disagree with its
+    length prefix."""
+    parts = [sub(p).encode() for p in spec.split("|")]
+    out = b"*%d\r\n" % len(parts)
+    for p in parts:
+        out += b"$%d\r\n%s\r\n" % (len(p), p)
+    return out
+
+def frames(spec):
+    return b"".join(frame(c) for c in spec.split(";"))
+
+blocked = socket.create_connection(("127.0.0.1", port))
+blocked.sendall(frame(blocking))
+
+def other():
+    time.sleep(delay)
+    s = socket.create_connection(("127.0.0.1", port))
+    s.sendall(frames(meanwhile))
+    s.settimeout(1.0)
+    try:
+        while s.recv(4096):
+            pass
+    except socket.timeout:
+        pass
+    s.close()
+
+t = threading.Thread(target=other)
+t.start()
+
+blocked.settimeout(delay + 3.0)
+buf = b""
+try:
+    while True:
+        c = blocked.recv(4096)
+        if not c:
+            break
+        buf += c
+except socket.timeout:
+    pass
+t.join()
+sys.stdout.write(repr(buf))
+PYEOF
+
+# ---------------------------------------------------------------- helpers
+
+skip_filtered() {
+    N=$((N + 1))
+    if [ -n "$FILTER" ] && [[ "$1" != *"$FILTER"* ]]; then
+        SKIP=$((SKIP + 1)); return 0
+    fi
+    return 1
+}
+
+report() {
+    local name="$1" kind="$2" a="$3" b="$4" label_a="$5" label_b="$6"
+    if [ "$a" = "$b" ] && [ -n "$a" ]; then
+        PASS=$((PASS + 1))
+        printf '%s  PASS%s  %s%s\n' "$GRN" "$OFF" "$name" "$kind"
+    else
+        FAIL=$((FAIL + 1)); FAILED_NAMES+=("$name")
+        printf '%s  FAIL%s  %s%s\n' "$RED" "$OFF" "$name" "$kind"
+        if [ -z "$a" ] && [ -z "$b" ]; then
+            printf '        both sides produced NO OUTPUT (harness bug, not a diff)\n'
+        else
+            diff --label "$label_a" --label "$label_b" -u \
+                 <(printf '%s' "$a") <(printf '%s' "$b") | sed 's/^/        /'
+        fi
+    fi
+}
+
+# Runs a command sequence against one port. {K}, {K2}, {K3} become per-scenario
+# unique key names. "SLEEP n" is a pseudo command.
+run_seq() {
+    local port="$1" tag="$2"; shift 2
+    local cmd out=""
+    for cmd in "$@"; do
+        if [[ "$cmd" == SLEEP\ * ]]; then
+            sleep "${cmd#SLEEP }"
+            continue
+        fi
+        cmd=${cmd//\{K3\}/${tag}c}
+        cmd=${cmd//\{K2\}/${tag}b}
+        cmd=${cmd//\{K\}/${tag}a}
+        out+="> $cmd"$'\n'
+        # --no-raw keeps null-vs-empty and bulk-vs-array distinguishable
+        out+="$(redis-cli -p "$port" --no-raw $cmd 2>&1)"$'\n'
+    done
+    printf '%s' "$out"
+}
+
+scenario() {
+    local name="$1"; shift
+    skip_filtered "$name" && return
+    local tag="r${RUN}s${N}k"
+    report "$name" "" \
+        "$(run_seq "$MINE" "$tag" "$@")" \
+        "$(run_seq "$REAL" "$tag" "$@")" \
+        "yours (:$MINE)" "redis (:$REAL)"
+}
+
+# Sends raw bytes to both servers and diffs the reply bytes, for framing
+# behaviour that redis-cli hides. $2 is a python bytes literal.
+raw_scenario() {
+    local name="$1" payload="$2"
+    skip_filtered "$name" && return
+    local a b
+    a=$(python3 -c "import sys;sys.stdout.buffer.write($payload)" | nc -w 1 127.0.0.1 "$MINE" | xxd)
+    b=$(python3 -c "import sys;sys.stdout.buffer.write($payload)" | nc -w 1 127.0.0.1 "$REAL" | xxd)
+    report "$name" " ${DIM}(raw)${OFF}" "$a" "$b" "yours" "redis"
+}
+
+# Two writes with a pause between them, so one command spans two reads.
+split_scenario() {
+    local name="$1" first="$2" second="$3"
+    skip_filtered "$name" && return
+    local script='
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+s.sendall('"$first"')
+time.sleep(0.4)
+s.sendall('"$second"')
+s.settimeout(1.5)
+buf = b""
+try:
+    while True:
+        c = s.recv(4096)
+        if not c: break
+        buf += c
+except socket.timeout:
+    pass
+sys.stdout.write(repr(buf))
+'
+    report "$name" " ${DIM}(split)${OFF}" \
+        "$(python3 -c "$script" "$MINE" 2>&1)" \
+        "$(python3 -c "$script" "$REAL" 2>&1)" \
+        "yours" "redis"
+}
+
+# One connection issues a blocking command; a second acts after $2 seconds.
+# Commands are pipe-separated argument lists, semicolon-separated for several.
+#   $1 name  $2 delay  $3 blocking command  $4 what the other connection does
+block_scenario() {
+    local name="$1" delay="$2" blocking="$3" meanwhile="$4"
+    skip_filtered "$name" && return
+    local tag="r${RUN}s${N}k"
+    report "$name" " ${DIM}(block)${OFF}" \
+        "$(python3 "$BLOCK_PY" "$MINE" "$tag" "$delay" "$blocking" "$meanwhile" 2>&1)" \
+        "$(python3 "$BLOCK_PY" "$REAL" "$tag" "$delay" "$blocking" "$meanwhile" 2>&1)" \
+        "yours" "redis"
+}
+
+section() { printf '\n%s== %s%s\n' "$DIM" "$1" "$OFF"; }
+
+# ---------------------------------------------------------------- scenarios
+
+section "basics"
+scenario "ping and echo" \
+    "PING" "ping" "PiNg" "PING hello" "ECHO hi" "ECHO" "ECHO a b"
+
+scenario "unknown command" "NOSUCHCOMMAND" "NOSUCHCOMMAND arg" "NOSUCHCOMMAND a b"
+
+section "strings"
+scenario "set and get" \
+    "SET {K} hello" "GET {K}" "GET nosuchkey_{K}" "SET {K} world" "GET {K}"
+
+scenario "type" \
+    "SET {K} v" "RPUSH {K2} a" "TYPE {K}" "TYPE {K2}" "TYPE {K3}"
+
+scenario "wrongtype both directions" \
+    "SET {K} v" "RPUSH {K2} a" \
+    "GET {K2}" "RPUSH {K} x" "LLEN {K}" "LRANGE {K} 0 -1" "LPOP {K}"
+
+scenario "set clears an existing ttl" \
+    "SET {K} v1 PX 50" "SET {K} v2" "SLEEP 0.3" "GET {K}"
+
+section "expiry"
+scenario "px expires" \
+    "SET {K} v PX 100" "GET {K}" "SLEEP 0.5" "GET {K}" "EXISTS {K}"
+
+scenario "ex is seconds not millis" \
+    "SET {K} v EX 1" "GET {K}" "SLEEP 0.3" "GET {K}"
+
+scenario "no ttl never expires" \
+    "SET {K} v" "SLEEP 0.5" "GET {K}"
+
+scenario "expiry option errors" \
+    "SET {K} v PX" "SET {K} v PX abc" "SET {K} v PX 0" "SET {K} v PX -1" \
+    "SET {K} v ZZ 5" "SET {K} v EX 0" "SET {K} v PX 100 EX 5"
+
+scenario "write path reaps an expired key" \
+    "SET {K} v PX 50" "SLEEP 0.3" "RPUSH {K} a" "TYPE {K}" "LRANGE {K} 0 -1"
+
+section "lists"
+scenario "rpush accumulates" \
+    "RPUSH {K} a" "RPUSH {K} b c" "RPUSH {K} d e f" "LLEN {K}" "LRANGE {K} 0 -1" \
+    "RPUSH {K}"
+
+scenario "lpush reverses argument order" \
+    "LPUSH {K} a b c" "LRANGE {K} 0 -1" "RPUSH {K} d" "LRANGE {K} 0 -1"
+
+scenario "llen on missing key" "LLEN {K}" "LLEN nosuch_{K}"
+
+scenario "lrange indexes" \
+    "RPUSH {K} a b c d e" \
+    "LRANGE {K} 0 -1" "LRANGE {K} 0 2" "LRANGE {K} -3 -1" "LRANGE {K} -100 100" \
+    "LRANGE {K} 3 1" "LRANGE {K} 5 10" "LRANGE {K} -1 -5" "LRANGE {K} 0 0" \
+    "LRANGE {K} -2 2" "LRANGE nosuch_{K} 0 -1" "LRANGE {K} abc 2"
+
+scenario "lpop bare vs count" \
+    "RPUSH {K} a b c d" \
+    "LPOP {K}" "LPOP {K} 1" "LPOP {K} 0" "LPOP {K} 10" \
+    "LPOP {K}" "LPOP nosuch_{K}" "LPOP nosuch_{K} 2"
+
+scenario "rpop returns in pop order" \
+    "RPUSH {K} a b c" "RPOP {K} 2" "LRANGE {K} 0 -1"
+
+scenario "pop count errors" \
+    "RPUSH {K} a" "LPOP {K} -1" "LPOP {K} abc" "LPOP {K} 1 2"
+
+scenario "emptying a list deletes the key (lpop)" \
+    "RPUSH {K} a" "LPOP {K}" "EXISTS {K}" "TYPE {K}"
+
+scenario "emptying a list deletes the key (rpop)" \
+    "RPUSH {K} a" "RPOP {K}" "EXISTS {K}" "TYPE {K}"
+
+scenario "emptying a list deletes the key (count)" \
+    "RPUSH {K} a b" "LPOP {K} 5" "EXISTS {K}" "TYPE {K}"
+
+section "lmove"
+scenario "lmove basics" \
+    "RPUSH {K} a b c" "LMOVE {K} {K2} LEFT RIGHT" \
+    "LRANGE {K} 0 -1" "LRANGE {K2} 0 -1" \
+    "LMOVE {K} {K2} RIGHT LEFT" "LRANGE {K} 0 -1" "LRANGE {K2} 0 -1"
+
+scenario "lmove missing source creates nothing" \
+    "LMOVE nosuch_{K} {K2} LEFT RIGHT" "EXISTS {K2}"
+
+scenario "lmove wrongtype leaves source intact" \
+    "RPUSH {K} a b" "SET {K2} str" \
+    "LMOVE {K} {K2} LEFT RIGHT" "LRANGE {K} 0 -1" \
+    "LMOVE {K2} {K} LEFT RIGHT" "LRANGE {K} 0 -1"
+
+scenario "lmove same key rotates" \
+    "RPUSH {K} a b c" \
+    "LMOVE {K} {K} LEFT RIGHT" "LRANGE {K} 0 -1" \
+    "LMOVE {K} {K} RIGHT LEFT" "LRANGE {K} 0 -1"
+
+scenario "lmove single element same key" \
+    "RPUSH {K} a" "LMOVE {K} {K} LEFT RIGHT" "LRANGE {K} 0 -1" "EXISTS {K}"
+
+scenario "lmove syntax and arity" \
+    "RPUSH {K} a" "LMOVE {K} {K2} SIDEWAYS RIGHT" "LMOVE {K} {K2} LEFT" \
+    "LMOVE {K} {K2} left right" "LRANGE {K2} 0 -1"
+
+section "blocking"
+# A push arrives while a client is parked. The reply must be [key, element].
+block_scenario "blpop woken by a later push" 0.5 \
+    "BLPOP|{K}|0" \
+    "RPUSH|{K}|a"
+
+block_scenario "brpop takes from the tail" 0.5 \
+    "BRPOP|{K}|0" \
+    "RPUSH|{K}|a|b"
+
+# Nothing arrives. The reply must be the null ARRAY, *-1, not $-1.
+block_scenario "blpop times out with a null array" 2.5 \
+    "BLPOP|{K}|1" \
+    "PING"
+
+# The list already has data, so this must not block at all.
+block_scenario "blpop returns immediately when data exists" 1.5 \
+    "BLPOP|{K}|0" \
+    "PING"
+
+# Multiple keys: the first non-empty one wins, and the reply names it.
+block_scenario "blpop scans past an empty key" 0.5 \
+    "BLPOP|{K}|{K2}|0" \
+    "RPUSH|{K2}|x"
+
+# The element must survive a push that lands after the client gave up.
+# This is the data-loss case that is_closed() exists to prevent.
+block_scenario "element survives a push after the timeout" 2 \
+    "BLPOP|{K}|1" \
+    "RPUSH|{K}|a;LRANGE|{K}|0|-1"
+
+# A waiter blocked on a key that becomes a string gets WRONGTYPE, not silence.
+block_scenario "wrongtype while parked" 0.5 \
+    "BLPOP|{K}|2" \
+    "SET|{K}|str"
+
+section "protocol framing"
+raw_scenario "pipelined commands in one packet" \
+    "b'*1\r\n\$4\r\nPING\r\n*1\r\n\$4\r\nping\r\n*1\r\n\$4\r\nPiNg\r\n'"
+
+raw_scenario "empty array" \
+    "b'*0\r\n'"
+
+split_scenario "command split across two reads" \
+    "b'*1\r\n\$4\r\nPI'" "b'NG\r\n'"
+
+split_scenario "bulk payload split mid value" \
+    "b'*3\r\n\$3\r\nSET\r\n\$5\r\nsplit\r\n\$5\r\nab'" "b'cde\r\n'"
+
+# Deliberate divergences from real Redis, documented rather than fixed:
+#   - no inline command support: Redis parses input not starting with '*' as a
+#     space-separated inline command, and skips 2 bytes after a bulk payload
+#     without checking they are CRLF. We are stricter on the second.
+#   - error messages escape CR and LF rather than substituting spaces.
+#   - "expected a bulk string" rather than "expected '$', got ':'".
+# STRICT=1 ./test.sh to see the diffs.
+if [ "${STRICT:-0}" = 1 ]; then
+    section "known divergences"
+    raw_scenario "protocol error closes the connection" "b'X\r\n'"
+    raw_scenario "bad bulk length is a protocol error" "b'*1\r\n\$1\r\nab\r\n'"
+    raw_scenario "non bulk string element" "b'*1\r\n:5\r\n'"
+    raw_scenario "crlf in a command name cannot split the reply" \
+        "b'*1\r\n\$14\r\nFOO\r\n+INJECTED\r\n'"
+fi
+
+# ---------------------------------------------------------------- summary
+
+printf '\n'
+if [ "$FAIL" -eq 0 ]; then
+    printf '%s%d passed%s' "$GRN" "$PASS" "$OFF"
+else
+    printf '%s%d passed, %d failed%s' "$RED" "$PASS" "$FAIL" "$OFF"
+fi
+[ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"
+printf '\n'
+
+if [ "$FAIL" -gt 0 ]; then
+    printf '\nfailed:\n'
+    for n in "${FAILED_NAMES[@]}"; do printf '  %s\n' "$n"; done
+    printf '\n%sA diff is not automatically a bug: some scenarios use commands you\n' "$DIM"
+    printf 'have not implemented yet. Read both sides before changing anything.%s\n' "$OFF"
+    exit 1
+fi

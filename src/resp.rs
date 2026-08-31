@@ -3,7 +3,7 @@ use std::convert::From;
 // use std::io;
 // use tokio_util::codec::{Decoder, Encoder};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     SimpleString(Vec<u8>),
     Error(Vec<u8>),

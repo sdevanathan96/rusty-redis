@@ -1,6 +1,9 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use std::sync::Mutex;
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> Instant;
@@ -50,6 +53,14 @@ impl DataType {
     }
 }
 
+/// Which end of a list an operation acts on. Shared by push, pop, and LMOVE,
+/// which takes two of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum End {
+    Left,
+    Right,
+}
+
 impl Data {
     fn kind(&self) -> DataType {
         match self {
@@ -60,17 +71,16 @@ impl Data {
 }
 
 pub struct Db {
-    map: Mutex<HashMap<Vec<u8>, Entry>>,
+    map: HashMap<Vec<u8>, Entry>,
     clock: Arc<dyn Clock>,
 }
 
 impl Db {
 
-    pub fn type_of(&self, key: &[u8]) -> Option<DataType> {
+    pub fn type_of(&mut self, key: &[u8]) -> Option<DataType> {
         let now = self.clock.now();
-        let mut guard = self.map.lock().unwrap();
-        reap_if_expired(&mut guard, key, now);
-        guard.get(key).map(|e| e.data.kind())
+        reap_if_expired(&mut self.map, key, now);
+        self.map.get(key).map(|e| e.data.kind())
     }
 
     pub fn new() -> Self {
@@ -79,28 +89,27 @@ impl Db {
 
     pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         Db {
-            map: Mutex::new(HashMap::new()),
+            map: HashMap::new(),
             clock,
         }
     }
 
     /// ttl is relative. The absolute deadline is computed here, once, because
     /// this is the only layer that owns a clock.
-    pub fn set(&self, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration>) {
+    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration>) {
         let now = self.clock.now();
         let entry = Entry {
             data: Data::String(value),
             expires_at: ttl.map(|d| now + d),
         };
-        self.map.lock().unwrap().insert(key, entry);
+        self.map.insert(key, entry);
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongType>{
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongType>{
         let now = self.clock.now();
-        let mut guard = self.map.lock().unwrap();
-        reap_if_expired(&mut guard, key, now);
+        reap_if_expired(&mut self.map, key, now);
 
-        match guard.get(key) {
+        match self.map.get(key) {
             Some(entry) => match &entry.data {
                 Data::String(v) => Ok(Some(v.clone())),
                 _ => Err(WrongType),
@@ -109,11 +118,10 @@ impl Db {
         }
     }
 
-    pub fn delete(&self, key: &[u8]) -> bool {
+    pub fn delete(&mut self, key: &[u8]) -> bool {
         let now = self.clock.now();
-        let mut guard = self.map.lock().unwrap();
         // An expired entry counts as absent, so removing it returns false.
-        match guard.remove(key) {
+        match self.map.remove(key) {
             Some(entry) => !entry.is_expired(now),
             None => false,
         }
@@ -122,44 +130,23 @@ impl Db {
     /// Counts entries still in the map, including ones past their deadline that
     /// have not been lazily reaped. Debug and test use only.
     pub fn len(&self) -> usize {
-        self.map.lock().unwrap().len()
+        self.map.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub fn rpush(&self, key: &[u8], values: Vec<Vec<u8>>) -> Result<usize, WrongType> {
+    pub fn exists(&mut self, key: &[u8]) -> bool {
         let now = self.clock.now();
-        let mut guard = self.map.lock().unwrap();
-        reap_if_expired(&mut guard, key, now);
-
-        let entry = guard.entry(key.to_vec()).or_insert_with(|| Entry {
-            data: Data::List(VecDeque::new()),
-            expires_at: None,
-        });
-
-        match &mut entry.data {
-            Data::List(list) => {
-                list.extend(values);
-                Ok(list.len())
-            }
-            _ => Err(WrongType),
-        }
+        reap_if_expired(&mut self.map, key, now);
+        self.map.contains_key(key)
     }
 
-    pub fn exists(&self, key: &[u8]) -> bool {
+    pub fn llen(&mut self, key: &[u8]) -> Result<usize, WrongType> {
         let now = self.clock.now();
-        let mut guard = self.map.lock().unwrap();
-        reap_if_expired(&mut guard, key, now);
-        guard.contains_key(key)
-    }
-
-    pub fn llen(&self, key: &[u8]) -> Result<usize, WrongType> {
-        let now = self.clock.now();
-        let mut guard = self.map.lock().unwrap();
-        reap_if_expired(&mut guard, key, now);
-        match guard.get(key) {
+        reap_if_expired(&mut self.map, key, now);
+        match self.map.get(key) {
             Some(entry) => match &entry.data {
                 Data::List(l) => Ok(l.len()),
                 _ => Err(WrongType),
@@ -168,11 +155,10 @@ impl Db {
         }
     }
 
-    pub fn lrange(&self, key: &[u8], start: i64, stop: i64) -> Result<Vec<Vec<u8>>, WrongType> {
+    pub fn lrange(&mut self, key: &[u8], start: i64, stop: i64) -> Result<Vec<Vec<u8>>, WrongType> {
         let now = self.clock.now();
-        let mut guard = self.map.lock().unwrap();
-        reap_if_expired(&mut guard, key, now);
-        match guard.get(key) {
+        reap_if_expired(&mut self.map, key, now);
+        match self.map.get(key) {
             Some(entry) => match &entry.data {
                 Data::List(l) => {
                     let len = l.len();
@@ -188,71 +174,51 @@ impl Db {
         }
     }
 
-    pub fn lpush(&self, key: &[u8], values: Vec<Vec<u8>>) -> Result<usize, WrongType> {
+
+    pub fn push(&mut self, key: &[u8], values: Vec<Vec<u8>>, end: End) -> Result<usize, WrongType> {
         let now = self.clock.now();
-        let mut guard = self.map.lock().unwrap();
-        reap_if_expired(&mut guard, key, now);
+        reap_if_expired(&mut self.map, key, now);
+        push_to(&mut self.map, key, values, end)
+    }
 
-        let entry = guard.entry(key.to_vec()).or_insert_with(|| Entry {
-            data: Data::List(VecDeque::new()),
-            expires_at: None,
-        });
+    pub fn pop(&mut self, key: &[u8], count: Option<usize>, end: End) -> Result<Option<Vec<Vec<u8>>>, WrongType>{
+        let now = self.clock.now();
+        reap_if_expired(&mut self.map, key, now);
+        pop_from(&mut self.map, key, count.unwrap_or(1), end)
+    }
 
-        match &mut entry.data {
-            Data::List(list) => {
-                for v in values {
-                    list.push_front(v);
-                }
-                Ok(list.len())
+
+    pub fn lmove(&mut self, src: &[u8], dst: &[u8], from: End, to: End) -> Result<Option<Vec<u8>>, WrongType> {
+        let now = self.clock.now();
+        reap_if_expired(&mut self.map, src, now);
+        reap_if_expired(&mut self.map, dst, now);
+
+        match self.map.get(src) {
+            None => return Ok(None),
+            Some(entry) => match &entry.data {
+                Data::List(_) => {}
+                _ => return Err(WrongType),
             }
-            _ => Err(WrongType),
         }
-    }
-
-    pub fn lpop(&self, key: &[u8], count: Option<usize>) -> Result<Option<Vec<Vec<u8>>>, WrongType> {
-        let now = self.clock.now();
-        let mut guard = self.map.lock().unwrap();
-        reap_if_expired(&mut guard, key, now);
-        let (popped, now_empty) = match guard.get_mut(key) {
-            None => return Ok(None),
-            Some(entry) => match &mut entry.data {
-                Data::List(l) => {
-                    let n = count.unwrap_or(1).min(l.len());
-                    let out: Vec<_> = l.drain(..n).collect();
-                    (out, l.is_empty())
-                }
+        match self.map.get(dst) {
+            None => {},
+            Some(entry) => match &entry.data {
+                Data::List(_) => {}
                 _ => return Err(WrongType),
+            }
+        }
+
+        let popped = match pop_from(&mut self.map, src, 1, from)? {
+            None => return Ok(None),
+            Some(v) => match v.into_iter().next() {
+                None => return Ok(None),
+                Some(value) => value,
             },
         };
-        if now_empty {
-            guard.remove(key);
-        }
+
+        push_to(&mut self.map, dst, vec![popped.clone()], to)?;
         Ok(Some(popped))
     }
-
-    pub fn rpop(&self, key: &[u8], count: Option<usize>) -> Result<Option<Vec<Vec<u8>>>, WrongType> {
-        let now = self.clock.now();
-        let mut guard = self.map.lock().unwrap();
-        reap_if_expired(&mut guard, key, now);
-        let (popped, now_empty) = match guard.get_mut(key) {
-            None => return Ok(None),
-            Some(entry) => match &mut entry.data {
-                Data::List(l) => {
-                    let n = count.unwrap_or(1).min(l.len());
-                    let start = l.len() - n;
-                    let mut out: Vec<_> = l.drain(start..).collect();
-                    out.reverse();
-                    (out, l.is_empty())
-                }
-                _ => return Err(WrongType),
-            },
-        };
-        if now_empty {
-            guard.remove(key);
-        }
-        Ok(Some(popped))
-    }
-
 }
 
 /// Removes the entry at `key` if its deadline has passed. Every accessor calls
@@ -281,6 +247,66 @@ fn resolve_range(len: usize, start: i64, stop: i64) -> Option<(usize, usize)> {
         return None;
     }
     Some((start as usize, stop as usize + 1))
+}
+
+fn pop_from(
+    map: &mut HashMap<Vec<u8>, Entry>,
+    key: &[u8],
+    count: usize,
+    end: End,
+) -> Result<Option<Vec<Vec<u8>>>, WrongType> {
+    let (popped, now_empty) = match map.get_mut(key) {
+        None => return Ok(None),
+        Some(entry) => match &mut entry.data {
+            Data::List(l) => {
+                let n = count.min(l.len());
+                let out: Vec<_> = match end {
+                    End::Left => l.drain(..n).collect(),
+                    End::Right => {
+                        let start = l.len() - n;
+                        let mut tail: Vec<_> = l.drain(start..).collect();
+                        tail.reverse();
+                        tail
+                    }
+                };
+                (out, l.is_empty())
+            }
+            _ => return Err(WrongType),
+        },
+    };
+
+    if now_empty {
+        map.remove(key);
+    }
+    Ok(Some(popped))
+}
+
+fn push_to(
+    map: &mut HashMap<Vec<u8>, Entry>,
+    key: &[u8],
+    values: Vec<Vec<u8>>,
+    end: End,
+) -> Result<usize, WrongType> {
+    let entry = map.entry(key.to_vec()).or_insert_with(|| Entry {
+        data: Data::List(VecDeque::new()),
+        expires_at: None,
+    });
+
+    match &mut entry.data {
+        Data::List(l) => {
+            match end {
+                End::Right => l.extend(values),
+                // LPUSH inserts one at a time at the head, so arguments end up reversed
+                End::Left => {
+                    for v in values {
+                        l.push_front(v);
+                    }
+                }
+            }
+            Ok(l.len())
+        }
+        _ => Err(WrongType),
+    }
 }
 
 impl Default for Db {
@@ -333,7 +359,7 @@ mod tests {
 
     #[test]
     fn set_then_get() {
-        let (_clock, db) = fixture();
+        let (_clock, mut db) = fixture();
         db.set(b"k".to_vec(), b"v".to_vec(), None);
         assert_eq!(db.get(b"k"), Ok(Some(b"v".to_vec())));
         assert_eq!(db.get(b"missing"), Ok(None));
@@ -341,7 +367,7 @@ mod tests {
 
     #[test]
     fn key_expires_exactly_at_deadline() {
-        let (clock, db) = fixture();
+        let (clock, mut db) = fixture();
         db.set(b"k".to_vec(), b"v".to_vec(), Some(Duration::from_millis(100)));
 
         assert_eq!(db.get(b"k"), Ok(Some(b"v".to_vec())));
@@ -355,7 +381,7 @@ mod tests {
 
     #[test]
     fn no_expiry_never_expires() {
-        let (clock, db) = fixture();
+        let (clock, mut db) = fixture();
         db.set(b"k".to_vec(), b"v".to_vec(), None);
         clock.advance(Duration::from_secs(86_400 * 365));
         assert_eq!(db.get(b"k"), Ok(Some(b"v".to_vec())));
@@ -363,7 +389,7 @@ mod tests {
 
     #[test]
     fn get_reaps_the_expired_entry() {
-        let (clock, db) = fixture();
+        let (clock, mut db) = fixture();
         db.set(b"a".to_vec(), b"v".to_vec(), Some(Duration::from_millis(100)));
         db.set(b"b".to_vec(), b"v".to_vec(), Some(Duration::from_millis(50)));
         assert_eq!(db.len(), 2);
@@ -379,7 +405,7 @@ mod tests {
 
     #[test]
     fn delete_reports_false_for_expired_key() {
-        let (clock, db) = fixture();
+        let (clock, mut db) = fixture();
         db.set(b"k".to_vec(), b"v".to_vec(), Some(Duration::from_millis(10)));
         clock.advance(Duration::from_millis(10));
         assert!(!db.delete(b"k"), "expired key counts as absent");
@@ -388,7 +414,7 @@ mod tests {
 
     #[test]
     fn overwriting_clears_the_old_ttl() {
-        let (clock, db) = fixture();
+        let (clock, mut db) = fixture();
         db.set(b"k".to_vec(), b"v1".to_vec(), Some(Duration::from_millis(10)));
         db.set(b"k".to_vec(), b"v2".to_vec(), None);
         clock.advance(Duration::from_secs(1));

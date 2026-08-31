@@ -1,0 +1,221 @@
+use std::time::Duration;
+
+use super::{parse_end, parse_i64, parse_timeout, Command, CommandError, End};
+use crate::command::Outcome;
+use crate::db::Db;
+use crate::resp::Value;
+
+
+pub(super) fn try_parse(
+    upper: &[u8],
+    rest: &[Vec<u8>],
+    name: &[u8],
+) -> Option<Result<Command, CommandError>> {
+    Some(match upper {
+        b"RPUSH" => push_command(rest, name, End::Right),
+        b"LPUSH" => push_command(rest, name, End::Left),
+        b"LPOP"  => pop_command(rest, name, End::Left),
+        b"RPOP"  => pop_command(rest, name, End::Right),
+        b"BLPOP" => bpop_command(rest, name, End::Left),
+        b"BRPOP" => bpop_command(rest, name, End::Right),
+        b"LLEN"  => llen_command(rest, name),
+        b"LRANGE" => lrange_command(rest, name),
+        b"LMOVE"  => lmove_command(rest, name),
+        _ => return None,          // not a list command
+    })
+}
+
+
+fn push_command(rest: &[Vec<u8>], name: &[u8], from: End) -> Result<Command, CommandError> {
+    match rest {
+        [key, first, more @ ..] => Ok(Command::Push {
+            key: key.clone(),
+            values: std::iter::once(first).chain(more).cloned().collect(),
+            from,
+        }),
+        _ => Err(CommandError::WrongArity(name.to_vec())),
+    }
+}
+
+fn pop_command(rest: &[Vec<u8>], name: &[u8], from: End) -> Result<Command, CommandError> {
+    // Arity first, so `LPOP k abc extra` reports WrongArity rather than a parse
+    // error on an argument that should not be there at all.
+    let (key, raw_count) = match rest {
+        [key] => (key, None),
+        [key, c] => (key, Some(c)),
+        _ => return Err(CommandError::WrongArity(name.to_vec())),
+    };
+
+    let count = match raw_count {
+        None => None,
+        Some(raw) => {
+            // Redis uses one message for both a non numeric count and a
+            // negative one, unlike the expiry arguments above.
+            let n = parse_i64(raw).map_err(|_| CommandError::OutOfRange)?;
+            if n < 0 {
+                return Err(CommandError::OutOfRange);
+            }
+            Some(n as usize)
+        }
+    };
+
+    Ok(Command::Pop { key: key.clone(), count, from })
+}
+
+fn bpop_command(rest: &[Vec<u8>], name: &[u8], from: End) -> Result<Command, CommandError> {
+    match rest {
+        [keys @ .., timeout] if !keys.is_empty() => Ok(Command::BPop {
+            keys: keys.to_vec(),
+            from: from,
+            timeout: parse_timeout(timeout)?,
+        }),
+        _ => return Err(CommandError::WrongArity(name.to_vec())),
+    }
+}
+
+
+fn llen_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+    match rest {
+        [key] => Ok(Command::LLen { key: key.clone() }),
+        _ => return Err(CommandError::WrongArity(name.to_vec())),
+    }
+}
+
+
+fn lrange_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+    match rest {
+        [key, start, stop] => Ok(Command::LRange {
+            key: key.clone(),
+            start: parse_i64(start)?,
+            stop: parse_i64(stop)?,
+        }),
+        _ => return Err(CommandError::WrongArity(name.to_vec())),
+    }
+}
+
+fn lmove_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+    match rest {
+        [src, dst, from, to] => Ok(Command::LMove {
+            src: src.clone(),
+            dst: dst.clone(),
+            from: parse_end(from)?,
+            to: parse_end(to)?,
+        }),
+        _ => return Err(CommandError::WrongArity(name.to_vec())),
+    }
+}
+
+pub(super) fn push(key: &Vec<u8>, values: Vec<Vec<u8>>, from: End, db: &mut Db) -> Result<Value, CommandError> {
+    Ok(Value::Integer(db.push(&key, values, from)? as i64))
+}
+pub(super) fn pop(key: &Vec<u8>, count: Option<usize>, from: End, db: &mut Db) -> Result<Value, CommandError> {
+    let popped = db.pop(&key, count, from)?;
+    Ok(match (count, popped) {
+        (None, Some(v)) => v
+            .into_iter()
+            .next()
+            .map_or(Value::NullBulkString, Value::BulkString),
+        (None, None) => Value::NullBulkString,
+        (Some(_), Some(v)) => Value::Array(v.into_iter().map(Value::BulkString).collect()),
+        (Some(_), None) => Value::NullArray,
+    })
+}
+
+pub(super) fn bpop(
+    keys: Vec<Vec<u8>>,
+    from: End,
+    timeout: Option<Duration>,
+    db: &mut Db,
+) -> Result<Outcome, CommandError> {
+    for key in &keys {
+        if let Some(v) = db.pop(key, None, from)? {
+            if let Some(elem) = v.into_iter().next() {
+                return Ok(Outcome::Reply(Value::Array(vec![
+                    Value::BulkString(key.clone()),
+                    Value::BulkString(elem),
+                ])));
+            }
+        }
+    }
+
+    Ok(Outcome::Block {
+        keys: keys.clone(),
+        retry: Command::BPop { keys, from, timeout },
+    })
+}
+
+pub(super) fn llen(key: &Vec<u8>, db: &mut Db) -> Result<Value, CommandError> {
+    Ok(Value::Integer(db.llen(&key)? as i64))
+}
+pub(super) fn lrange(key: &Vec<u8>, start: i64, stop: i64, db: &mut Db) -> Result<Value, CommandError> {
+    Ok(Value::Array(
+        db.lrange(&key, start, stop)?
+            .into_iter()
+            .map(Value::BulkString)
+            .collect(),
+    ))
+}
+pub(super) fn lmove(src: &Vec<u8>, dst: &Vec<u8>, from: End, to: End, db: &mut Db) -> Result<Value, CommandError> {
+    Ok(match db.lmove(&src, &dst, from, to)? {
+        Some(v) => Value::BulkString(v),
+        None => Value::NullBulkString,
+    })
+}
+
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+    use super::super::test_support::{cmd, cmd_ok};
+
+
+    /// Unlike the expiry arguments, a pop count uses one message for both a
+    /// non numeric value and a negative one.
+    #[test]
+    fn pop_count_errors_use_out_of_range() {
+        assert!(matches!(
+            cmd(b"*3\r\n$4\r\nLPOP\r\n$1\r\nk\r\n$3\r\nabc\r\n"),
+            Err(CommandError::OutOfRange)
+        ));
+        assert!(matches!(
+            cmd(b"*3\r\n$4\r\nLPOP\r\n$1\r\nk\r\n$2\r\n-1\r\n"),
+            Err(CommandError::OutOfRange)
+        ));
+        // arity is checked before the count is parsed
+        assert!(matches!(
+            cmd(b"*4\r\n$4\r\nLPOP\r\n$1\r\nk\r\n$3\r\nabc\r\n$1\r\nx\r\n"),
+            Err(CommandError::WrongArity(_))
+        ));
+    }
+
+    #[test]
+    fn bare_pop_and_pop_one_are_different_commands() {
+        // `LPOP k` replies with a bulk string, `LPOP k 1` with an array.
+        match cmd_ok(b"*2\r\n$4\r\nLPOP\r\n$1\r\nk\r\n") {
+            Command::Pop { count, .. } => assert_eq!(count, None),
+            other => panic!("{other:?}"),
+        }
+        match cmd_ok(b"*3\r\n$4\r\nLPOP\r\n$1\r\nk\r\n$1\r\n1\r\n") {
+            Command::Pop { count, .. } => assert_eq!(count, Some(1)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn lmove_directions_are_case_insensitive() {
+        assert_eq!(
+            cmd_ok(b"*5\r\n$5\r\nlmove\r\n$1\r\na\r\n$1\r\nb\r\n$4\r\nleft\r\n$5\r\nright\r\n"),
+            Command::LMove {
+                src: b"a".to_vec(),
+                dst: b"b".to_vec(),
+                from: End::Left,
+                to: End::Right,
+            }
+        );
+        assert!(matches!(
+            cmd(b"*5\r\n$5\r\nLMOVE\r\n$1\r\na\r\n$1\r\nb\r\n$8\r\nSIDEWAYS\r\n$5\r\nRIGHT\r\n"),
+            Err(CommandError::Syntax)
+        ));
+    }
+}
+
