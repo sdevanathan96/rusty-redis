@@ -266,6 +266,31 @@ impl Db {
             IdSpec::Auto => stream.append_auto(now_ms, fields),
         }
     }
+
+    pub fn xlen(&mut self, key: &[u8]) -> Result<usize, XaddError> {
+        let now = self.clock.now();
+        reap_if_expired(&mut self.map, key, now);
+        match self.map.get(key) {
+            Some(entry) => match &entry.data {
+                Data::Stream(l) => Ok(l.len()),
+                _ => Err(XaddError::WrongType),
+            },
+            None => Ok(0),
+        }
+    }
+
+    pub fn xrange(&mut self, key: &[u8], start: EntryId, end: EntryId, count: Option<usize>)
+    -> Result<Option<Vec<(EntryId, Vec<(Vec<u8>, Vec<u8>)>)>>, WrongType> {
+        let now = self.clock.now();
+        reap_if_expired(&mut self.map, key, now);
+        match self.map.get(key) {
+            Some(entry) => match &entry.data {
+                Data::Stream(s) => Ok(Some(s.range(start, end, count).to_vec())),
+                _ => Err(WrongType),
+            },
+            None => Ok(None),
+        }
+    }
 }
 
 /// Removes the entry at `key` if its deadline has passed. Every accessor calls

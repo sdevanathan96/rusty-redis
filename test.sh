@@ -437,6 +437,32 @@ scenario "xadd arity" \
 scenario "xadd wrongtype" \
     "SET {K} str" "XADD {K} 1-1 f v" "GET {K}"
 
+
+scenario "xrange bounds" \
+    "XADD {K} 5-0 a 1" "XADD {K} 5-1 b 2" "XADD {K} 6-0 c 3" \
+    "XRANGE {K} - +" "XRANGE {K} 5 5" "XRANGE {K} 6 6" \
+    "XRANGE {K} 5-1 6" "XRANGE {K} 5-0 5-0" \
+    "XRANGE {K} 9 10" "XRANGE {K} 6 5" "XRANGE nosuch_{K} - +"
+
+scenario "xrange count" \
+    "XADD {K} 1-0 a 1" "XADD {K} 2-0 b 2" "XADD {K} 3-0 c 3" \
+    "XRANGE {K} - + COUNT 2" "XRANGE {K} - + COUNT 0" \
+    "XRANGE {K} - + COUNT -1" "XRANGE {K} - + COUNT 99" \
+    "XRANGE {K} - + count 2"
+
+scenario "xrange syntax errors" \
+    "XADD {K} 1-0 a 1" \
+    "XRANGE {K}" "XRANGE {K} -" "XRANGE {K} - + BADKW" \
+    "XRANGE {K} - + BADKW 2" "XRANGE {K} - + COUNT" "XRANGE {K} - + COUNT abc" \
+    "XRANGE {K} abc +" "XRANGE {K} - abc"
+
+scenario "xrange preserves field order and duplicates" \
+    "XADD {K} 1-1 b 2 a 1 b 3" "XRANGE {K} - +"
+
+scenario "xrange wrongtype" \
+    "SET {K} str" "XRANGE {K} - +"
+
+
 section "blocking"
 # A push arrives while a client is parked. The reply must be [key, element].
 block_scenario "blpop woken by a later push" 0.5 \

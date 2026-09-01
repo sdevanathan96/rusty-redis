@@ -71,6 +71,26 @@ impl Stream {
         let ms = clock_ms.max(self.last_id.ms);
         self.append_auto_seq(ms, fields)
     }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn range(&self, start: EntryId, end: EntryId, count: Option<usize>) -> &[(EntryId, Vec<(Vec<u8>, Vec<u8>)>)] {
+        let lo = match self.entries.binary_search_by_key(&start, |(id, _)| *id) {
+            Ok(i) => i, // exact match
+            Err(i) => i, // not present, i is the insertion point, which is the lower bound
+        };
+        let hi = match self.entries.binary_search_by_key(&end, |(id, _)| *id) {
+            Ok(i) => i + 1,
+            Err(i) => i,
+        };
+        let slice = &self.entries[lo..hi];
+        match count {
+            Some(n) => &slice[..n.min(slice.len())],
+            None => slice,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

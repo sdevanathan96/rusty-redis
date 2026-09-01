@@ -1,4 +1,4 @@
-use crate::db::{Db, WrongType, End, XaddError, IdSpec};
+use crate::db::{Db, End, EntryId, IdSpec, WrongType, XaddError};
 use crate::resp::Value;
 use std::time::Duration;
 mod stream;
@@ -31,6 +31,8 @@ pub enum Command {
     BPop { keys: Vec<Vec<u8>>, timeout: Option<Duration>, from: End },
     BLMove { src: Vec<u8>, dst: Vec<u8>, from: End, to: End , timeout: Option<Duration> },
     XAdd { key: Vec<u8>, id: IdSpec, fields: Vec<(Vec<u8>, Vec<u8>)> },
+    XLen { key: Vec<u8> },
+    XRange {key: Vec<u8>, start: EntryId, stop: EntryId, count: Option<i64> },
     Unknown { name: Vec<u8>, args: Vec<Vec<u8>> },
 }
 
@@ -211,6 +213,11 @@ fn parse_i64(raw: &[u8]) -> Result<i64, CommandError> {
     text.parse().map_err(|_| CommandError::NotAnInteger)
 }
 
+// fn parse_u64(raw: &[u8]) -> Result<u64, CommandError> {
+//     let text = std::str::from_utf8(raw).map_err(|_| CommandError::InvalidStreamId)?;
+//     text.parse().map_err(|_| CommandError::InvalidStreamId)
+// }
+
 fn parse_end(raw: &[u8]) -> Result<End, CommandError> {
     match raw.to_ascii_uppercase().as_slice() {
         b"LEFT" => Ok(End::Left),
@@ -245,10 +252,12 @@ pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError>{
         Command::LLen { key } => Ok(Outcome::Reply(list::llen(&key, db)?)),
         Command::LRange { key, start, stop } => Ok(Outcome::Reply(list::lrange(&key, start, stop, db)?)),
         Command::LMove { src, dst, from, to } => Ok(Outcome::Reply(list::lmove(&src, &dst, from, to, db)?)),
-        Command::Unknown { name, args } => Err(CommandError::UnknownCommand { name, args }),
         Command::BPop { keys, timeout, from } => list::bpop(keys, from, timeout, db),
         Command::BLMove { src, dst, from, to, timeout } => list::blmove(src, dst, from, to, timeout, db),
         Command::XAdd { key, id, fields } => stream::xadd(&key, id, fields, db),
+        Command::XLen { key } => stream::xlen(&key, db),
+        Command::XRange { key, start, stop, count } => stream::xrange(&key, start, stop, count, db),
+        Command::Unknown { name, args } => Err(CommandError::UnknownCommand { name, args }),
     }
 }
 
