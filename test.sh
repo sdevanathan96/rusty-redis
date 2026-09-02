@@ -531,6 +531,16 @@ block2_scenario "one element serves only the first waiter" 1 \
     "BLPOP|{K}|2" \
     "RPUSH|{K}|only"
 
+block2_scenario "xread serves waiters with different ids" 1 \
+    "XREAD|BLOCK|0|STREAMS|{K}|9-9" \
+    "XREAD|BLOCK|0|STREAMS|{K}|0-0" \
+    "XADD|{K}|5-0|f|v"
+
+block2_scenario "xread fans out to all waiters" 1 \
+    "XREAD|BLOCK|0|STREAMS|{K}|0-0" \
+    "XREAD|BLOCK|0|STREAMS|{K}|0-0" \
+    "XADD|{K}|5-0|f|v"
+
 section "protocol framing"
 raw_scenario "pipelined commands in one packet" \
     "b'*1\r\n\$4\r\nPING\r\n*1\r\n\$4\r\nping\r\n*1\r\n\$4\r\nPiNg\r\n'"

@@ -1,4 +1,4 @@
-use crate::db::{Db, End, EntryId, IdSpec, WrongType, XaddError};
+use crate::db::{Db, End, EntryId, IdSpec, ReadFrom, WrongType, XaddError};
 use crate::resp::Value;
 use std::time::Duration;
 mod stream;
@@ -12,6 +12,7 @@ pub enum Outcome {
     Block { keys: Vec<Vec<u8>>, retry: Command },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Blocking { No, Forever, Until(Duration) }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -33,6 +34,7 @@ pub enum Command {
     XAdd { key: Vec<u8>, id: IdSpec, fields: Vec<(Vec<u8>, Vec<u8>)> },
     XLen { key: Vec<u8> },
     XRange {key: Vec<u8>, start: EntryId, stop: EntryId, count: Option<i64> },
+    XRead {count: Option<i64>, timeout: Blocking, streams: Vec<(Vec<u8>, ReadFrom)>},
     Unknown { name: Vec<u8>, args: Vec<Vec<u8>> },
 }
 
@@ -48,10 +50,12 @@ pub enum CommandError {
     WrongType,
     UnknownCommand { name: Vec<u8>, args: Vec<Vec<u8>> },
     TimeoutError,
+    MTimeoutError,
     NegativeTimeout,
     InvalidStreamId,
     XaddIdZero,
     XaddIdTooSmall,
+    UnbalancedXread
 }
 
 impl From<WrongType> for CommandError {
@@ -84,6 +88,7 @@ impl Command {
             Command::Push { key, .. } => vec![key.clone()],
             Command::LMove { dst, .. } => vec![dst.clone()],
             Command::BLMove { dst, .. } => vec![dst.clone()],
+            Command::XAdd { key, .. } => vec![key.clone()],
             _ => vec![],
         }
     }
@@ -100,6 +105,11 @@ impl Command {
                 timeout: *timeout,
                 on_timeout: Value::NullArray,
             }),
+            Command::XRead { timeout, .. } => match timeout {
+                Blocking::No => None,
+                Blocking::Forever => Some(BlockSpec { timeout: None, on_timeout: Value::NullArray }),
+                Blocking::Until(d) => Some(BlockSpec { timeout: Some(*d), on_timeout: Value::NullArray }),
+            },
             _ => None,
         }
     }
@@ -140,12 +150,15 @@ impl CommandError {
             }
             CommandError::NegativeTimeout => { b"ERR timeout is negative".to_vec() }
             CommandError::TimeoutError => { b"ERR timeout is not a float or out of range".to_vec() }
+            CommandError::MTimeoutError => { b"ERR timeout is not an integer or out of range".to_vec() }
             CommandError::InvalidStreamId =>
                 b"ERR Invalid stream ID specified as stream command argument".to_vec(),
             CommandError::XaddIdZero =>
                 b"ERR The ID specified in XADD must be greater than 0-0".to_vec(),
             CommandError::XaddIdTooSmall =>
                 b"ERR The ID specified in XADD is equal or smaller than the target stream top item".to_vec(),
+            CommandError::UnbalancedXread => 
+                b"ERR Unbalanced 'xread' list of streams: for each stream key an ID, '+', or '$' must be specified.".to_vec()
         }
     }
 }
@@ -238,6 +251,19 @@ fn parse_timeout(raw: &[u8]) -> Result<Option<Duration>, CommandError> {
     Ok(Some(Duration::from_secs_f64(seconds)))
 }
 
+fn parse_block(raw: &[u8]) -> Result<Blocking, CommandError> {
+    let text = std::str::from_utf8(raw).map_err(|_| CommandError::MTimeoutError)?;
+    let millis: i64 = text.parse().map_err(|_| CommandError::MTimeoutError)?;
+    if millis < 0 {
+        return Err(CommandError::NegativeTimeout);
+    }
+    Ok(if millis == 0 {
+        Blocking::Forever
+    } else {
+        Blocking::Until(Duration::from_millis(millis as u64))
+    })
+}
+
 pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError>{
     match cmd {
         Command::Ping(msg) => Ok(Outcome::Reply(generic::ping(msg)?)), 
@@ -257,17 +283,18 @@ pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError>{
         Command::XAdd { key, id, fields } => stream::xadd(&key, id, fields, db),
         Command::XLen { key } => stream::xlen(&key, db),
         Command::XRange { key, start, stop, count } => stream::xrange(&key, start, stop, count, db),
+        Command::XRead { count, timeout, streams } => stream::xread(count, timeout, streams, db),
         Command::Unknown { name, args } => Err(CommandError::UnknownCommand { name, args }),
     }
 }
 
-pub fn blocking_timeout(cmd: &Command) -> Blocking {
-    match cmd {
-        Command::BPop { timeout: Some(d), .. } => Blocking::Until(*d),
-        Command::BPop { timeout: None, .. } => Blocking::Forever,
-        _ => Blocking::No,
-    }
-}
+// pub fn blocking_timeout(cmd: &Command) -> Blocking {
+//     match cmd {
+//         Command::BPop { timeout: Some(d), .. } => Blocking::Until(*d),
+//         Command::BPop { timeout: None, .. } => Blocking::Forever,
+//         _ => Blocking::No,
+//     }
+// }
 
 /// Renders client supplied bytes for an error message. Escapes so the message
 /// reads clearly, truncates so a huge argument cannot fill the reply.

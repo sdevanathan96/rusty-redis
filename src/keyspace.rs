@@ -75,7 +75,7 @@ fn serve_waiters(
                 let w = waiters.remove(i).unwrap();
                 let _ = w.reply.send(v);
             }
-            Ok(Outcome::Block { .. }) => break, // nothing left on this key
+            Ok(Outcome::Block { .. }) => {i+=1;},
             Err(e) => {
                 let w = waiters.remove(i).unwrap();
                 let _ = w.reply.send(Value::Error(e.to_resp()));

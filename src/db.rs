@@ -4,8 +4,9 @@ mod stream;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::u64;
 use crate::db::stream::{Stream};
-pub use crate::db::stream::{EntryId, XaddError, IdSpec};
+pub use crate::db::stream::{EntryId, XaddError, IdSpec, ReadFrom, StreamEntry};
 
 #[cfg(test)]
 use std::sync::Mutex;
@@ -280,7 +281,7 @@ impl Db {
     }
 
     pub fn xrange(&mut self, key: &[u8], start: EntryId, end: EntryId, count: Option<usize>)
-    -> Result<Option<Vec<(EntryId, Vec<(Vec<u8>, Vec<u8>)>)>>, WrongType> {
+    -> Result<Option<Vec<StreamEntry>>, WrongType> {
         let now = self.clock.now();
         reap_if_expired(&mut self.map, key, now);
         match self.map.get(key) {
@@ -289,6 +290,52 @@ impl Db {
                 _ => Err(WrongType),
             },
             None => Ok(None),
+        }
+    }
+
+    // pub fn xread(&mut self, count: Option<i64>, key: Vec<u8>, id: ReadFrom) -> Result<Option<Vec<(EntryId, Vec<(Vec<u8>, Vec<u8>)>)>>, WrongType> {
+        
+    // }
+    pub fn stream_last_id(&mut self, key: &[u8]) -> Result<EntryId, WrongType> {
+        let now = self.clock.now();
+        reap_if_expired(&mut self.map, key, now);
+        match self.map.get(key) {
+            None => Ok(EntryId { ms: 0, seq: 0 }),
+            Some(entry) => match &entry.data {
+                Data::Stream(s) => Ok(s.last_id()),
+                _ => Err(WrongType),
+            },
+        }
+    }
+
+    pub fn xlast(&mut self, key: &[u8])
+    -> Result<Option<Vec<StreamEntry>>, WrongType>
+    {
+        let now = self.clock.now();
+        reap_if_expired(&mut self.map, key, now);
+        match self.map.get(key) {
+            None => Ok(None),
+            Some(entry) => match &entry.data {
+                Data::Stream(s) => Ok(Some(match s.last_entry() {
+                    None => Vec::new(),
+                    Some(e) => vec![e.clone()],
+                })),
+                _ => Err(WrongType),
+            },
+        }
+    }
+
+    pub fn xrange_after(&mut self, key: &[u8], after: EntryId, count: Option<usize>)
+    -> Result<Option<Vec<StreamEntry>>, WrongType>
+    {
+        let now = self.clock.now();
+        reap_if_expired(&mut self.map, key, now);
+        match self.map.get(key) {
+            None => Ok(None),
+            Some(entry) => match &entry.data {
+                Data::Stream(s) => Ok(Some(s.range_after(after, count).to_vec())),
+                _ => Err(WrongType),
+            },
         }
     }
 }

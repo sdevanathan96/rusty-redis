@@ -10,7 +10,13 @@ impl std::fmt::Display for EntryId {
         write!(f, "{}-{}", self.ms, self.seq)
     }
 }
-
+pub type StreamEntry = (EntryId, Vec<(Vec<u8>, Vec<u8>)>);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReadFrom {
+    Id(EntryId),
+    Latest,
+    Last
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XaddError {
@@ -76,7 +82,7 @@ impl Stream {
         self.entries.len()
     }
 
-    pub fn range(&self, start: EntryId, end: EntryId, count: Option<usize>) -> &[(EntryId, Vec<(Vec<u8>, Vec<u8>)>)] {
+    pub fn range(&self, start: EntryId, end: EntryId, count: Option<usize>) -> &[StreamEntry] {
         let lo = match self.entries.binary_search_by_key(&start, |(id, _)| *id) {
             Ok(i) => i, // exact match
             Err(i) => i, // not present, i is the insertion point, which is the lower bound
@@ -89,6 +95,27 @@ impl Stream {
         match count {
             Some(n) => &slice[..n.min(slice.len())],
             None => slice,
+        }
+    }
+
+    pub(super) fn range_after(&self, after: EntryId, count: Option<usize>)
+    -> &[StreamEntry] {
+        let lo = self.entries.partition_point(|(id, _)| *id <= after);
+        let slice = &self.entries[lo..];
+        match count {
+            Some(n) => &slice[..n.min(slice.len())],
+            None => slice,
+        }
+    }
+
+    pub(super) fn last_id(&self) -> EntryId {
+        self.last_id
+    }
+
+    pub(super) fn last_entry(&self) -> Option<&StreamEntry> {
+        match self.len() {
+            0 => None,
+            _ => self.entries.last()
         }
     }
 }
