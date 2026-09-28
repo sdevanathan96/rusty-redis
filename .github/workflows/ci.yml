@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+
+    # The oracle for test.sh. Pinned to the version used locally, because
+    # error replies are compared byte for byte and they change between releases.
+    services:
+      redis:
+        image: redis:8.10.1
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Unit tests
+        run: cargo test --locked
+
+      - name: Install test.sh dependencies
+        run: sudo apt-get update && sudo apt-get install -y redis-tools netcat-openbsd xxd
+
+      - name: Differential tests against Redis
+        run: |
+          ./target/release/rusty-redis > server.log 2>&1 &
+          for _ in $(seq 50); do redis-cli -p 6379 PING > /dev/null 2>&1 && break; sleep 0.1; done
+          ./test.sh
+
+      - name: Server log
+        if: failure()
+        run: cat server.log || true

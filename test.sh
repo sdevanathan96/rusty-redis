@@ -637,8 +637,10 @@ section "protocol framing"
 raw_scenario "pipelined commands in one packet" \
     "b'*1\r\n\$4\r\nPING\r\n*1\r\n\$4\r\nping\r\n*1\r\n\$4\r\nPiNg\r\n'"
 
+# An empty array gets no reply at all, so follow it with a PING: otherwise both
+# sides are empty and the harness cannot tell a pass from a dead connection.
 raw_scenario "empty array" \
-    "b'*0\r\n'"
+    "b'*0\r\n*1\r\n\$4\r\nPING\r\n'"
 
 split_scenario "command split across two reads" \
     "b'*1\r\n\$4\r\nPI'" "b'NG\r\n'"
