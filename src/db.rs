@@ -33,6 +33,11 @@ impl Clock for SystemClock {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WrongType;
+
+/// The expiry deadline does not fit in Redis's i64 of milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidExpireTime;
+
 struct Entry {
     data: Data,
     expires_at: Option<Instant>,
@@ -156,39 +161,40 @@ impl Db {
     }
 
     /// ttl is relative. The absolute deadline is computed here, once, because
-    /// this is the only layer that owns a clock.
-    pub fn set(&mut self, key: Bytes, value: Bytes, ttl: Option<Duration>) {
+    /// this is the only layer that owns a clock. Fails, writing nothing, if
+    /// that deadline overflows.
+    pub fn set(&mut self, key: Bytes, value: Bytes, ttl: Option<Duration>) -> Result<(), InvalidExpireTime> {
         let now = self.clock.now();
         let now_ms = self.clock.now_ms();
-        let entry = Entry {
-            data: Data::String(value),
-            // Two separate hazards here.
-            //
-            // First, `now + d` panics: Instant's Add impl is
-            // `checked_add(..).expect(..)`, and this runs inside the keyspace
-            // task, where a panic takes down every connection in the process.
-            //
-            // Second, and this is what the harness caught: Redis computes the
-            // deadline as `mstime() + ms` in a signed 64 bit integer with no
-            // overflow check, so `SET k v PX 9223372036854775807` wraps to a
-            // moment in the past. The command replies OK, the key is written,
-            // and the very next read finds it already expired. Duration and
-            // Instant have far more headroom than an i64 of milliseconds, so
-            // without reproducing that boundary the key would instead live for
-            // 292 million years. Folding an unrepresentable deadline to "never
-            // expires" was the wrong direction; it folds to "already expired".
-            //
-            // The boundary depends on the current wall clock, exactly as it
-            // does in Redis, so it cannot be pinned to a constant.
-            expires_at: ttl.map(|d| {
-                if now_ms as i128 + d.as_millis() as i128 > i64::MAX as i128 {
-                    now // is_expired is `now >= deadline`, so this is already dead
-                } else {
-                    now.checked_add(d).unwrap_or(now)
-                }
-            }),
+        // Two separate hazards here.
+        //
+        // First, `now + d` panics: Instant's Add impl is
+        // `checked_add(..).expect(..)`, and this runs inside the keyspace
+        // task, where a panic takes down every connection in the process.
+        //
+        // Second, Redis computes the deadline as `mstime() + ms` in a signed
+        // 64 bit integer and replies "invalid expire time" when the sum
+        // overflows. Duration and Instant have far more headroom than an i64
+        // of milliseconds, so that boundary has to be reproduced by hand.
+        //
+        // Redis detects the overflow with `if (ms <= 0)` after the addition,
+        // which relies on signed wraparound, undefined behaviour in C. Some
+        // builds (Homebrew on macOS, at least) compile the check out: they
+        // reply OK and store a deadline in the past, so the next read finds
+        // the key gone. The Linux build keeps the check, and that is what this
+        // matches.
+        //
+        // The boundary depends on the current wall clock, exactly as it
+        // does in Redis, so it cannot be pinned to a constant.
+        let expires_at = match ttl {
+            Some(d) if now_ms as i128 + d.as_millis() as i128 > i64::MAX as i128 => {
+                return Err(InvalidExpireTime);
+            }
+            Some(d) => Some(now.checked_add(d).unwrap_or(now)),
+            None => None,
         };
-        self.map.insert(key, entry);
+        self.map.insert(key, Entry { data: Data::String(value), expires_at });
+        Ok(())
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Bytes>, WrongType>{
@@ -507,7 +513,7 @@ impl Clock for TestClock {
 mod tests {
     use bytes::Bytes;
 
-use super::{Clock, Db, TestClock};
+use super::{Clock, Db, InvalidExpireTime, TestClock};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -528,7 +534,7 @@ use super::{Clock, Db, TestClock};
     #[test]
     fn set_then_get() {
         let (_clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None);
+        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None).unwrap();
         assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))));
         assert_eq!(db.get(b"missing"), Ok(None));
     }
@@ -536,7 +542,7 @@ use super::{Clock, Db, TestClock};
     #[test]
     fn key_expires_exactly_at_deadline() {
         let (clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), Some(Duration::from_millis(100)));
+        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), Some(Duration::from_millis(100))).unwrap();
 
         assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))));
 
@@ -550,7 +556,7 @@ use super::{Clock, Db, TestClock};
     #[test]
     fn no_expiry_never_expires() {
         let (clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None);
+        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None).unwrap();
         clock.advance(Duration::from_secs(86_400 * 365));
         assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))));
     }
@@ -558,8 +564,8 @@ use super::{Clock, Db, TestClock};
     #[test]
     fn get_reaps_the_expired_entry() {
         let (clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"a"), Bytes::from_static(b"v"), Some(Duration::from_millis(100)));
-        db.set(Bytes::from_static(b"b"), Bytes::from_static(b"v"), Some(Duration::from_millis(50)));
+        db.set(Bytes::from_static(b"a"), Bytes::from_static(b"v"), Some(Duration::from_millis(100))).unwrap();
+        db.set(Bytes::from_static(b"b"), Bytes::from_static(b"v"), Some(Duration::from_millis(50))).unwrap();
         assert_eq!(db.len(), 2);
 
         clock.advance(Duration::from_millis(99));
@@ -574,7 +580,7 @@ use super::{Clock, Db, TestClock};
     #[test]
     fn delete_reports_false_for_expired_key() {
         let (clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), Some(Duration::from_millis(10)));
+        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), Some(Duration::from_millis(10))).unwrap();
         clock.advance(Duration::from_millis(10));
         assert!(!db.delete(b"k"), "expired key counts as absent");
         assert_eq!(db.len(), 0, "but it is still removed");
@@ -583,28 +589,29 @@ use super::{Clock, Db, TestClock};
     #[test]
     fn overwriting_clears_the_old_ttl() {
         let (clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v1"), Some(Duration::from_millis(10)));
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v2"), None);
+        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v1"), Some(Duration::from_millis(10))).unwrap();
+        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v2"), None).unwrap();
         clock.advance(Duration::from_secs(1));
         assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v2"))));
     }
 
 
     #[test]
-    fn px_that_overflows_the_redis_deadline_expires_immediately() {
-        // Redis replies OK and writes the key, then the next read finds it
-        // gone, because mstime() + i64::MAX wraps into the past.
+    fn px_that_overflows_the_redis_deadline_is_rejected() {
+        // Redis replies "invalid expire time" because mstime() + i64::MAX
+        // overflows, and it bails out before touching the key.
         let clock = Arc::new(TestClock::new());
         let mut db = Db::with_clock(clock.clone());
+        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"old"), None).unwrap();
 
-        db.set(
+        let result = db.set(
             Bytes::from_static(b"k"),
             Bytes::from_static(b"v"),
             Some(Duration::from_millis(i64::MAX as u64)),
         );
 
-        assert_eq!(db.get(b"k"), Ok(None), "should already be expired");
-        assert!(!db.exists(b"k"), "and reaped on the way out");
+        assert_eq!(result, Err(InvalidExpireTime));
+        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"old"))), "existing value untouched");
     }
 
     #[test]
@@ -620,7 +627,8 @@ use super::{Clock, Db, TestClock};
             Bytes::from_static(b"k"),
             Bytes::from_static(b"v"),
             Some(Duration::from_millis(just_under)),
-        );
+        )
+        .unwrap();
 
         assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))));
     }

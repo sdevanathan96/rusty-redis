@@ -64,7 +64,8 @@ pub(super) fn get(key: &Bytes, db: &mut Db) -> Result<Value, CommandError> {
 }
 
 pub(super) fn set(key: Bytes, value: Bytes, expiry: Option<Duration>, db: &mut Db) -> Result<Value, CommandError> {
-    db.set(key, value, expiry);
+    db.set(key, value, expiry)
+        .map_err(|_| CommandError::InvalidExpiry(Bytes::from_static(b"set")))?;
     Ok(Value::SimpleString(Bytes::from_static(b"OK")))
 }
 

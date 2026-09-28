@@ -301,9 +301,11 @@ pub enum ExpiryUnit {
 /// The largest `EX` argument Redis accepts, from its own check
 /// `milliseconds > LLONG_MAX / 1000`.
 ///
-/// VERIFY on 6380 before trusting this, both of:
+/// VERIFY on 6380 before trusting this:
 ///   SET k v EX 9223372036854775807   (expected: invalid expire time)
-///   SET k v PX 9223372036854775807   (expected: OK, no upper bound on PX)
+///
+/// PX gets no bound here. Its limit is i64::MAX minus the wall clock, which
+/// only `Db::set` can see.
 const MAX_EXPIRE_SECS: i64 = i64::MAX / 1000;
 
 /// Reads the argument following an expiry keyword at index `i` and converts it
@@ -331,9 +333,8 @@ fn expiry_arg(
             }
             Ok(Duration::from_secs(n as u64))
         }
-        // No bound here on purpose: PX i64::MAX is roughly 292 million years,
-        // which `Duration` holds fine. Whether it survives being added to an
-        // `Instant` is `Db::set`'s problem, and it handles it with checked_add.
+        // No bound here on purpose: the real limit depends on the wall clock,
+        // so `Db::set` enforces it.
         ExpiryUnit::Millis => Ok(Duration::from_millis(n as u64)),
     }
 }

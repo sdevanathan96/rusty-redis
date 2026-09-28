@@ -654,9 +654,23 @@ section "argument bounds and panic bait"
 
 scenario "expiry argument overflow" \
     "SET {K} v EX 9223372036854775807" "GET {K}" \
-    "SET {K} v PX 9223372036854775807" "GET {K}" \
     "SET {K} v EX 9223372036854776" \
     "SET {K} v EX 9223372036854775808"
+
+# Redis rejects a deadline past i64::MAX with an overflow check that relies on
+# signed wraparound, undefined behaviour in C. Some builds (Homebrew on macOS,
+# at least) compile it out and reply OK with a key that is already expired, so
+# the oracle is only trusted here if it still rejects the argument.
+if [ "$(redis-cli -p "$REAL" SET "r${RUN}probe" v PX 9223372036854775807)" = OK ]; then
+    skip_filtered "px deadline overflow" || {
+        SKIP=$((SKIP + 1))
+        printf '%s  SKIP%s  px deadline overflow %s(this redis-server has no overflow check)%s\n' \
+            "$YEL" "$OFF" "$DIM" "$OFF"
+    }
+else
+    scenario "px deadline overflow" \
+        "SET {K} v PX 9223372036854775807" "GET {K}"
+fi
 
 scenario "blpop timeout argument edges" \
     "RPUSH {K} a b c d e f g" \
