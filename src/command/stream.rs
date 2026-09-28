@@ -1,26 +1,30 @@
-use crate::{command::{Blocking, Command, CommandError, Outcome, parse_block, parse_i64}, db::{Db, EntryId, IdSpec, ReadFrom, StreamEntry}, resp::Value};
+use bytes::Bytes;
+
+use crate::{command::{Blocking, Command, CommandError, Outcome, lenient_u64, parse_block, parse_i64}, db::{Db, EntryId, IdSpec, ReadFrom, StreamEntry}, resp::Value};
 
 fn parse_xadd_id(raw: &[u8]) -> Result<IdSpec, CommandError> {
     if raw == b"*" {
         return Ok(IdSpec::Auto);
     }
-
     let text = std::str::from_utf8(raw).map_err(|_| CommandError::InvalidStreamId)?;
 
     match text.split_once('-') {
-        None => {
-            // bare millisecond: sequence is zero
-            let ms = text.parse().map_err(|_| CommandError::InvalidStreamId)?;
-            Ok(IdSpec::Explicit(EntryId { ms, seq: 0 }))
-        }
-        Some((ms, "*")) => {
-            let ms = ms.parse().map_err(|_| CommandError::InvalidStreamId)?;
-            Ok(IdSpec::AutoSeq(ms))
-        }
+        None => Ok(IdSpec::Explicit(EntryId { ms: lenient_u64(text)?, seq: 0 })),
+        Some((ms, "*")) => Ok(IdSpec::AutoSeq(lenient_u64(ms)?)),
         Some((ms, seq)) => Ok(IdSpec::Explicit(EntryId {
-            ms: ms.parse().map_err(|_| CommandError::InvalidStreamId)?,
-            seq: seq.parse().map_err(|_| CommandError::InvalidStreamId)?,
+            ms: lenient_u64(ms)?,
+            seq: lenient_u64(seq)?,
         })),
+    }
+}
+
+/// `default_seq` is what a bare millisecond gets: 0 for a start bound,
+/// u64::MAX for an end bound, so `XRANGE k 5 5` spans all of millisecond 5.
+fn parse_bound(raw: &[u8], default_seq: u64) -> Result<EntryId, CommandError> {
+    let text = std::str::from_utf8(raw).map_err(|_| CommandError::InvalidStreamId)?;
+    match text.split_once('-') {
+        None => Ok(EntryId { ms: lenient_u64(text)?, seq: default_seq }),
+        Some((ms, seq)) => Ok(EntryId { ms: lenient_u64(ms)?, seq: lenient_u64(seq)? }),
     }
 }
 
@@ -38,22 +42,6 @@ fn parse_range_end(raw: &[u8]) -> Result<EntryId, CommandError> {
     parse_bound(raw, u64::MAX)
 }
 
-/// `default_seq` is what a bare millisecond gets: 0 for a start bound,
-/// u64::MAX for an end bound, so `XRANGE k 5 5` spans all of millisecond 5.
-fn parse_bound(raw: &[u8], default_seq: u64) -> Result<EntryId, CommandError> {
-    let text = std::str::from_utf8(raw).map_err(|_| CommandError::InvalidStreamId)?;
-    match text.split_once('-') {
-        None => Ok(EntryId {
-            ms: text.parse().map_err(|_| CommandError::InvalidStreamId)?,
-            seq: default_seq,
-        }),
-        Some((ms, seq)) => Ok(EntryId {
-            ms: ms.parse().map_err(|_| CommandError::InvalidStreamId)?,
-            seq: seq.parse().map_err(|_| CommandError::InvalidStreamId)?,
-        }),
-    }
-}
-
 fn parse_xrange_count(raw: &[u8]) -> Result<i64, CommandError> {
     parse_i64(raw)
 }
@@ -66,17 +54,17 @@ fn parse_read_from(raw: &[u8]) -> Result<ReadFrom, CommandError> {
     }    // reuse XRANGE's helper
 }
 
-fn arg_after(args: &[Vec<u8>], i: usize) -> Result<&Vec<u8>, CommandError> {
+fn arg_after(args: &[Bytes], i: usize) -> Result<&Bytes, CommandError> {
     args.get(i + 1).ok_or(CommandError::Syntax)
 }
 /// Field/value pairs from a flat argument list. At least one pair, and the
 /// count must be even.
 fn parse_fields(
-    args: &[Vec<u8>],
-    name: &[u8],
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CommandError> {
+    args: &[Bytes],
+    name: &Bytes,
+) -> Result<Vec<(Bytes, Bytes)>, CommandError> {
     if args.is_empty() || args.len() % 2 != 0 {
-        return Err(CommandError::WrongArity(name.to_vec()));
+        return Err(CommandError::WrongArity(name.clone()));
     }
     Ok(args
         .chunks(2)
@@ -84,122 +72,123 @@ fn parse_fields(
         .collect())
 }
 
-fn parse_xresp(entries: Vec<(EntryId, Vec<(Vec<u8>, Vec<u8>)>)>) -> Value {
+fn xentries_to_value(entries: &[StreamEntry]) -> Value {
     Value::Array(entries
-    .into_iter()
-    .map(|(id, fields)| {
-        let mut flat = Vec::with_capacity(fields.len() * 2);
-        for (f, v) in fields {
-            flat.push(Value::BulkString(f));
-            flat.push(Value::BulkString(v));
-        }
-        Value::Array(vec![
-            Value::BulkString(id.to_bytes()),
-            Value::Array(flat),
-        ])
-    })
-    .collect())
+        .iter()
+        .map(|e| {
+            let mut flat = Vec::with_capacity(e.fields.len() * 2);
+            for (f, v) in &e.fields {
+                flat.push(Value::BulkString(f.clone()));
+                flat.push(Value::BulkString(v.clone()));
+            }
+            Value::Array(vec![
+                Value::BulkString(e.id.to_bytes()),
+                Value::Array(flat),
+            ])
+        })
+        .collect())
 }
 
-fn build_xread_reply(out: Vec<(Vec<u8>, Vec<(EntryId, Vec<(Vec<u8>, Vec<u8>)>)>)>) -> Value {
+fn build_xread_reply(out: Vec<(Bytes, Value)>) -> Value {
     Value::Array(
         out.into_iter()
-            .map(|(key, entries)| {
-                Value::Array(vec![
-                    Value::BulkString(key),
-                    parse_xresp(entries),
-                ])
-            })
+            .map(|(key, entries)| Value::Array(vec![Value::BulkString(key), entries]))
             .collect(),
     )
 }
-
 pub(super) fn try_parse(
     upper: &[u8],
-    rest: &[Vec<u8>],
-    name: &[u8],
+    rest: &[Bytes],
+    name: &Bytes,
 ) -> Option<Result<Command, CommandError>> {
     Some(match upper {
         b"XADD" => xadd_command(rest, name),
         b"XLEN" => xlen_command(rest, name),
         b"XRANGE" => xrange_command(rest, name),
-        b"XREAD" => xread_command(rest),
-        _ => return None,          // not a list command
+        b"XREAD" => xread_command(rest, name),
+        b"XDEL" => xdel_command(rest, name),
+        // b"XTRIM" => xtrim_command(rest, name),   // not written yet
+        _ => return None,          // not a Stream command
     })
 }
 
 
-fn xadd_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+fn xadd_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
+    if rest.len() < 4 {
+        return Err(CommandError::WrongArity(name.clone()));
+    }
     match rest {
-        [key, id, fields @ ..] => Ok(Command::XAdd {
-            key: key.clone(),
-            id: parse_xadd_id(id)?,
-            fields: parse_fields(fields, name)?,
-        }),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        [key, id, fields @ ..] => {
+            let id = parse_xadd_id(id)?;
+            let fields = parse_fields(fields, name)?;
+            if let IdSpec::Explicit(EntryId { ms: 0, seq: 0 }) = id {
+                return Err(CommandError::XaddIdZero);
+            }
+            Ok(Command::XAdd { key: key.clone(), id, fields })
+        },
+        _ => return Err(CommandError::WrongArity(name.clone())),
     }
 }
 
-fn xlen_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+fn xlen_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [key] => Ok(Command::XLen { key: key.clone() }),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     }
 }
 
-fn xrange_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+fn xrange_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
 
     let (key, start, end, tail) = match rest {
         [key, start, end, tail @ ..] => (key, start, end, tail),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     };
-
+    let start = parse_range_start(start)?;
+    let stop = parse_range_end(end)?;
     let mut count = None;
     let mut i = 0;
     while i < tail.len() {
         match tail[i].to_ascii_uppercase().as_slice() {
             b"COUNT" => {
-                let raw = tail.get(i + 1).ok_or(CommandError::Syntax)?;
-                count = Some(parse_xrange_count(raw)?);
+                count = Some(parse_xrange_count(arg_after(tail, i)?)?);
                 i += 2;
             }
             _ => return Err(CommandError::Syntax),
         }
     }
-    Ok(Command::XRange { 
-        key: key.clone(),
-        start: parse_range_start(start)?,
-        stop: parse_range_end(end)?,
-        count: count 
-    })
+    Ok(Command::XRange { key: key.clone(), start, stop, count })
 }
 
-fn xread_command(rest: &[Vec<u8>]) -> Result<Command, CommandError> {
+fn xread_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
 
     // STREAMS is the last option, so everything before it is flags and
     // everything after is N keys followed by N ids.
-    let pos = rest
-        .iter()
-        .position(|a| a.eq_ignore_ascii_case(b"STREAMS"))
-        .ok_or(CommandError::Syntax)?;
-    let (opts, tail) = (&rest[..pos], &rest[pos + 1..]);
-
+    if rest.len() < 3 {
+        return Err(CommandError::WrongArity(name.clone()));
+    }
     let mut count = None;
     let mut block = Blocking::No;
     let mut i = 0;
-    while i < opts.len() {
-        match opts[i].to_ascii_uppercase().as_slice() {
+    let streams_at = loop {
+        if i >= rest.len() {
+            // ran out of arguments without ever seeing STREAMS
+            return Err(CommandError::WrongArity(name.clone()));
+        }
+        match rest[i].to_ascii_uppercase().as_slice() {
+            b"STREAMS" => break i,
             b"COUNT" => {
-                count = Some(parse_i64(arg_after(opts, i)?)?);
+                count = Some(parse_i64(arg_after(rest, i)?)?);
                 i += 2;
             }
             b"BLOCK" => {
-                block = parse_block(arg_after(opts, i)?)?;
+                block = parse_block(arg_after(rest, i)?)?;
                 i += 2;
             }
             _ => return Err(CommandError::Syntax),
         }
-    }
+    };
+
+    let tail = &rest[streams_at + 1..];
 
     if tail.is_empty() || tail.len() % 2 != 0 {
         return Err(CommandError::UnbalancedXread);
@@ -214,43 +203,58 @@ fn xread_command(rest: &[Vec<u8>]) -> Result<Command, CommandError> {
     Ok(Command::XRead { count, timeout: block, streams })
 }
 
-pub(super) fn xadd(key: &Vec<u8>, id: IdSpec, fields: Vec<(Vec<u8>, Vec<u8>)>, db: &mut Db) -> Result<Outcome, CommandError> {
+fn xdel_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
+    match rest {
+        // Redis arity for XDEL is -3: name, key, and at least one id. Without
+        // the guard, `[key, ids @ ..]` also matches a bare `XDEL k` and replies :0.
+        [key, ids @ ..] if !ids.is_empty() => Ok(Command::XDel {
+            key: key.clone(),
+            ids: ids
+            .iter()
+            .map(|id| parse_bound(id, 0))
+            .collect::<Result<_, CommandError>>()?,
+        }),
+        _ => return Err(CommandError::WrongArity(name.clone())),
+    }
+}
+
+pub(super) fn xadd(key: Bytes, id: IdSpec, fields: Vec<(Bytes, Bytes)>, db: &mut Db) -> Result<Outcome, CommandError> {
     Ok(Outcome::Reply(Value::BulkString(db.xadd(key, id, fields)?.to_bytes())))
 }
 
-pub(super) fn xlen(key: &Vec<u8>, db: &mut Db) -> Result<Outcome, CommandError> {
-    Ok(Outcome::Reply(Value::Integer(db.xlen(&key)? as i64)))
+pub(super) fn xlen(key: &[u8], db: &mut Db) -> Result<Outcome, CommandError> {
+    Ok(Outcome::Reply(Value::Integer(db.xlen(key)? as i64)))
 }
 
-pub(super) fn xrange(key: &Vec<u8>, start: EntryId, end: EntryId, count: Option<i64>, db: &mut Db) -> Result<Outcome, CommandError> {
+pub(super) fn xrange(key: &[u8], start: EntryId, end: EntryId, count: Option<i64>, db: &mut Db) -> Result<Outcome, CommandError> {
     let limit = count.map(|n| if n <= 0 { 0 } else { n as usize });
-    match db.xrange(&key, start, end, limit)? {
+    match db.xrange(key, start, end, limit)? {
         None => Ok(Outcome::Reply(Value::Array(vec![]))),                    // key missing
         Some(_) if count.is_some_and(|n| n <= 0) => Ok(Outcome::Reply(Value::NullArray)),
-        Some(entries) => Ok(Outcome::Reply(parse_xresp(entries))),
+        Some(entries) => Ok(Outcome::Reply(xentries_to_value(entries))),
     }
 }
 
 pub(super) fn xread(
     count: Option<i64>,
-    timeout: super::Blocking,
-    streams: Vec<(Vec<u8>, ReadFrom)>,
+    timeout: Blocking,
+    streams: Vec<(Bytes, ReadFrom)>,
     db: &mut Db,
 ) -> Result<Outcome, CommandError> {
-    let limit = count.map(|n| if n <= 0 { 0 } else { n as usize });
+    let limit = match count {
+        Some(n) if n > 0 => Some(n as usize),
+        _ => None,                              // absent, zero, or negative: no limit
+    };
 
-    let mut out: Vec<(Vec<u8>, Vec<StreamEntry>)> = Vec::new();
+    let mut out: Vec<(Bytes, Value)> = Vec::new();
     for (key, from) in &streams {
         let entries = match *from {
             ReadFrom::Last => db.xlast(key)?,
             ReadFrom::Id(id) => db.xrange_after(key, id, limit)?,
-            ReadFrom::Latest => {
-                let last = db.stream_last_id(key)?;
-                db.xrange_after(key, last, limit)?
-            }
+            ReadFrom::Latest => None,   // `$` means added after this call, so nothing yet
         };
         match entries {
-            Some(e) if !e.is_empty() => out.push((key.clone(), e)),
+            Some(e) if !e.is_empty() => out.push((key.clone(), xentries_to_value(e))),
             _ => {}
         }
     }
@@ -262,7 +266,7 @@ pub(super) fn xread(
         return Ok(Outcome::Reply(Value::NullArray));
     }
 
-    let resolved: Vec<(Vec<u8>, ReadFrom)> = streams
+    let resolved: Vec<(Bytes, ReadFrom)> = streams
         .into_iter()
         .map(|(k, from)| {
             let from = match from {
@@ -277,6 +281,10 @@ pub(super) fn xread(
 
     Ok(Outcome::Block {
         keys,
-        retry: Command::XRead { count: count, timeout: timeout, streams: resolved },
+        retry: Command::XRead { count, timeout, streams: resolved },
     })
+}
+
+pub(super) fn xdel(key: &[u8], ids: &[EntryId], db: &mut Db) -> Result<Outcome, CommandError> {
+    Ok(Outcome::Reply(Value::Integer(db.xdel(key, ids)? as i64)))
 }

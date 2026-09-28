@@ -29,6 +29,13 @@ FAILED_NAMES=()
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
 [ -t 1 ] || { RED=""; GRN=""; YEL=""; DIM=""; OFF=""; }
 
+TIMEOUT_BIN=$(command -v gtimeout || command -v timeout || true)
+if [ -z "$TIMEOUT_BIN" ]; then
+    echo "need coreutils timeout (brew install coreutils): without it a blocking" >&2
+    echo "command stalls the suite instead of failing it" >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------- setup
 
 need() { command -v "$1" >/dev/null || { echo "missing: $1"; exit 1; }; }
@@ -77,8 +84,9 @@ import socket, sys, threading, time
 port      = int(sys.argv[1])
 tag       = sys.argv[2]
 delay     = float(sys.argv[3])
-blocking  = sys.argv[4]
-meanwhile = sys.argv[5]
+setup     = sys.argv[4]          # new, "" for none
+blocking  = sys.argv[5]
+meanwhile = sys.argv[6]
 
 def sub(s):
     return s.replace("{K3}", tag + "c").replace("{K2}", tag + "b").replace("{K}", tag + "a")
@@ -95,6 +103,17 @@ def frame(spec):
 
 def frames(spec):
     return b"".join(frame(c) for c in spec.split(";"))
+
+if setup:
+    s = socket.create_connection(("127.0.0.1", port))
+    s.sendall(frames(setup))
+    s.settimeout(1.0)
+    try:
+        while s.recv(4096):
+            pass
+    except socket.timeout:
+        pass
+    s.close()
 
 blocked = socket.create_connection(("127.0.0.1", port))
 blocked.sendall(frame(blocking))
@@ -235,7 +254,10 @@ run_seq() {
         cmd=${cmd//\{K\}/${tag}a}
         out+="> $cmd"$'\n'
         # --no-raw keeps null-vs-empty and bulk-vs-array distinguishable
-        out+="$(redis-cli -p "$port" --no-raw $cmd 2>&1)"$'\n'
+        local reply status
+        reply=$("$TIMEOUT_BIN" 5 redis-cli -p "$port" --no-raw $cmd 2>&1); status=$?
+        [ "$status" -eq 124 ] && reply="<NO REPLY WITHIN 5s on :$port>"
+        out+="$reply"$'\n'
     done
     printf '%s' "$out"
 }
@@ -290,14 +312,14 @@ sys.stdout.write(repr(buf))
 
 # One connection issues a blocking command; a second acts after $2 seconds.
 # Commands are pipe-separated argument lists, semicolon-separated for several.
-#   $1 name  $2 delay  $3 blocking command  $4 what the other connection does
+#   $1 name  $2 delay  $3 setup (or "")  $4 blocking cmd  $5 what the other conn does
 block_scenario() {
-    local name="$1" delay="$2" blocking="$3" meanwhile="$4"
+    local name="$1" delay="$2" setup="$3" blocking="$4" meanwhile="$5"
     skip_filtered "$name" && return
     local tag="r${RUN}s${N}k"
     report "$name" " ${DIM}(block)${OFF}" \
-        "$(python3 "$BLOCK_PY" "$MINE" "$tag" "$delay" "$blocking" "$meanwhile" 2>&1)" \
-        "$(python3 "$BLOCK_PY" "$REAL" "$tag" "$delay" "$blocking" "$meanwhile" 2>&1)" \
+        "$(python3 "$BLOCK_PY" "$MINE" "$tag" "$delay" "$setup" "$blocking" "$meanwhile" 2>&1)" \
+        "$(python3 "$BLOCK_PY" "$REAL" "$tag" "$delay" "$setup" "$blocking" "$meanwhile" 2>&1)" \
         "yours" "redis"
 }
 
@@ -463,53 +485,106 @@ scenario "xrange wrongtype" \
     "SET {K} str" "XRANGE {K} - +"
 
 
+scenario "xread single stream" \
+    "XADD {K} 1-0 a 1" "XADD {K} 2-0 b 2" "XADD {K} 3-0 c 3" \
+    "XREAD STREAMS {K} 0" "XREAD STREAMS {K} 1-0" "XREAD STREAMS {K} 3-0" \
+    "XREAD STREAMS {K} 9-9" "XREAD STREAMS nosuch_{K} 0"
+
+scenario "xread ids are exclusive" \
+    "XADD {K} 5-0 f v" "XREAD STREAMS {K} 5-0" "XREAD STREAMS {K} 4-0" \
+    "XREAD STREAMS {K} 5" "XREAD STREAMS {K} 4"
+
+scenario "xread multiple streams" \
+    "XADD {K} 1-0 a 1" "XADD {K2} 5-0 b 2" \
+    "XREAD STREAMS {K} {K2} 0 0" \
+    "XREAD STREAMS {K} {K2} 9-9 0" \
+    "XREAD STREAMS {K} {K2} 9-9 9-9" \
+    "XREAD STREAMS {K} nosuch_{K} 0 0"
+
+scenario "xread count" \
+    "XADD {K} 1-0 a 1" "XADD {K} 2-0 b 2" "XADD {K} 3-0 c 3" \
+    "XREAD COUNT 2 STREAMS {K} 0" "XREAD COUNT 0 STREAMS {K} 0" \
+    "XREAD COUNT -1 STREAMS {K} 0" "XREAD COUNT 99 STREAMS {K} 0"
+
+scenario "xread option order is interchangeable" \
+    "XADD {K} 1-0 a 1" \
+    "XREAD COUNT 1 BLOCK 10 STREAMS {K} 0" \
+    "XREAD BLOCK 10 COUNT 1 STREAMS {K} 0"
+
+scenario "xread plus returns the last entry" \
+    "XADD {K} 1-0 a 1" "XADD {K} 2-0 b 2" \
+    "XREAD STREAMS {K} +" "XREAD COUNT 5 STREAMS {K} +" \
+    "XREAD STREAMS nosuch_{K} +"
+
+scenario "xread count ignored for plus but not for others" \
+    "XADD {K} 1-0 a 1" "XADD {K} 2-0 b 2" \
+    "XADD {K2} 1-0 c 1" "XADD {K2} 2-0 d 2" \
+    "XREAD COUNT 1 STREAMS {K} {K2} 0 +"
+
+scenario "xread dollar without block returns nil" \
+    "XADD {K} 1-0 a 1" "XREAD STREAMS {K} \$"
+
+scenario "xread syntax errors" \
+    "XADD {K} 1-0 a 1" \
+    "XREAD" "XREAD STREAMS" "XREAD STREAMS {K}" "XREAD STREAMS {K} {K2} 0" \
+    "XREAD {K} 0" "XREAD BADKW STREAMS {K} 0" \
+    "XREAD COUNT STREAMS {K} 0" "XREAD BLOCK abc STREAMS {K} 0" \
+    "XREAD BLOCK -1 STREAMS {K} 0" "XREAD COUNT abc STREAMS {K} 0"
+
+scenario "xread wrongtype" \
+    "SET {K} str" "XREAD STREAMS {K} 0" "XREAD STREAMS {K} +"
+
+scenario "xread same stream twice" \
+    "XADD {K} 1-0 a 1" "XADD {K} 2-0 b 2" \
+    "XREAD STREAMS {K} {K} 0 1-0"
+
 section "blocking"
 # A push arrives while a client is parked. The reply must be [key, element].
-block_scenario "blpop woken by a later push" 0.5 \
+block_scenario "blpop woken by a later push" 0.5 "" \
     "BLPOP|{K}|0" \
     "RPUSH|{K}|a"
 
-block_scenario "brpop takes from the tail" 0.5 \
+block_scenario "brpop takes from the tail" 0.5 "" \
     "BRPOP|{K}|0" \
     "RPUSH|{K}|a|b"
 
 # Nothing arrives. The reply must be the null ARRAY, *-1, not $-1.
-block_scenario "blpop times out with a null array" 2.5 \
+block_scenario "blpop times out with a null array" 2.5 "" \
     "BLPOP|{K}|1" \
     "PING"
 
 # The list already has data, so this must not block at all.
-block_scenario "blpop returns immediately when data exists" 1.5 \
+block_scenario "blpop returns immediately when data exists" 1.5 "" \
     "BLPOP|{K}|0" \
     "PING"
 
 # Multiple keys: the first non-empty one wins, and the reply names it.
-block_scenario "blpop scans past an empty key" 0.5 \
+block_scenario "blpop scans past an empty key" 0.5 "" \
     "BLPOP|{K}|{K2}|0" \
     "RPUSH|{K2}|x"
 
 # The element must survive a push that lands after the client gave up.
 # This is the data-loss case that is_closed() exists to prevent.
-block_scenario "element survives a push after the timeout" 2 \
+block_scenario "element survives a push after the timeout" 2 "" \
     "BLPOP|{K}|1" \
     "RPUSH|{K}|a;LRANGE|{K}|0|-1"
 
 # A waiter blocked on a key that becomes a string gets WRONGTYPE, not silence.
-block_scenario "wrongtype while parked" 0.5 \
+block_scenario "wrongtype while parked" 0.5 "" \
     "BLPOP|{K}|2" \
     "SET|{K}|str"
 
-block_scenario "blmove woken by a push to the source" 0.5 \
+block_scenario "blmove woken by a push to the source" 0.5 "" \
     "BLMOVE|{K}|{K2}|LEFT|RIGHT|0" \
     "RPUSH|{K}|x;LRANGE|{K2}|0|-1"
 
 # Timeout reply must be a null BULK STRING, not a null array.
-block_scenario "blmove times out with a null bulk string" 2.5 \
+block_scenario "blmove times out with a null bulk string" 2.5 "" \
     "BLMOVE|{K}|{K2}|LEFT|RIGHT|1" \
     "PING"
 
 # Destination is a string. Does Redis block or error immediately?
-block_scenario "blmove with a wrongtype destination" 2.5 \
+block_scenario "blmove with a wrongtype destination" 2.5 "" \
     "BLMOVE|{K}|{K2}|LEFT|RIGHT|1" \
     "SET|{K2}|str"
 
@@ -536,6 +611,23 @@ block2_scenario "xread serves waiters with different ids" 1 \
     "XREAD|BLOCK|0|STREAMS|{K}|0-0" \
     "XADD|{K}|5-0|f|v"
 
+block_scenario "xread blocks then wakes on xadd" 0.5 "" \
+    "XREAD|BLOCK|0|STREAMS|{K}|0" \
+    "XADD|{K}|5-0|f|v"
+
+block_scenario "xread times out with a null array" 2.5 "" \
+    "XREAD|BLOCK|1000|STREAMS|{K}|0" \
+    "PING"
+
+block_scenario "xread blocks on one of several streams" 0.5 "" \
+    "XREAD|BLOCK|0|STREAMS|{K}|{K2}|0|0" \
+    "XADD|{K2}|5-0|f|v"
+
+block_scenario "xread dollar skips pre-existing entries" 0.5 \
+    "XADD|{K}|1-0|old|1" \
+    "XREAD|BLOCK|0|STREAMS|{K}|\$" \
+    "XADD|{K}|5-0|new|2"
+
 block2_scenario "xread fans out to all waiters" 1 \
     "XREAD|BLOCK|0|STREAMS|{K}|0-0" \
     "XREAD|BLOCK|0|STREAMS|{K}|0-0" \
@@ -553,6 +645,57 @@ split_scenario "command split across two reads" \
 
 split_scenario "bulk payload split mid value" \
     "b'*3\r\n\$3\r\nSET\r\n\$5\r\nsplit\r\n\$5\r\nab'" "b'cde\r\n'"
+
+section "argument bounds and panic bait"
+# Each of these reached a panicking std constructor before the fix. A missing
+# reply on the MINE side of a diff means the task died rather than answered.
+
+scenario "expiry argument overflow" \
+    "SET {K} v EX 9223372036854775807" "GET {K}" \
+    "SET {K} v PX 9223372036854775807" "GET {K}" \
+    "SET {K} v EX 9223372036854776" \
+    "SET {K} v EX 9223372036854775808"
+
+scenario "blpop timeout argument edges" \
+    "RPUSH {K} a b c d e f g" \
+    "BLPOP {K} nan" "BLPOP {K} inf" "BLPOP {K} -inf" \
+    "BLPOP {K} 1e300" "BLPOP {K} -1" "BLPOP {K} abc" "BLPOP {K} -0" \
+    "LRANGE {K} 0 -1"
+
+scenario "xread block argument edges" \
+    "XREAD BLOCK 9223372036854775807 STREAMS {K} 0" \
+    "XREAD BLOCK 9223372036854775808 STREAMS {K} 0" \
+    "XREAD BLOCK 1.5 STREAMS {K} 0"
+
+section "creation and arity ordering"
+
+scenario "xadd id zero creates nothing" \
+    "XADD {K} 0-0 f v" "EXISTS {K}" "TYPE {K}" "XLEN {K}"
+
+scenario "xdel arity and semantics" \
+    "XADD {K} 1-1 f v" "XDEL {K}" "XDEL {K} 1-1" "XDEL {K} 1-1" \
+    "XDEL {K} 9-9" "EXISTS {K}" "TYPE {K}" "XLEN {K}" "XDEL nosuch_{K} 1-1"
+
+scenario "xadd arity is checked before the id" \
+    "XADD {K} abc" "XADD {K} abc f" "XADD {K} 1-1 f"
+
+scenario "xrange reports a bad id before a bad count" \
+    "XADD {K} 1-0 a 1" \
+    "XRANGE {K} badid badid COUNT abc" "XRANGE {K} badid + COUNT 1"
+
+section "strict integer parsing"
+# Redis parses integer arguments with string2ll, which rejects a leading plus
+# and leading zeros. Rust's FromStr accepts both. Every diff here is one bug.
+
+scenario "leading plus and zeros in integer arguments" \
+    "SET {K} v EX +10" "SET {K} v EX 010" "SET {K} v PX 010" \
+    "RPUSH {K2} a b c" "LPOP {K2} +1" "LPOP {K2} 01" \
+    "LRANGE {K2} +0 -1"
+
+scenario "leading plus and zeros in stream ids" \
+    "XADD {K} +5-1 f v" "XADD {K} 05-1 f v" "XADD {K} 5-01 f v" \
+    "XRANGE {K} +5 +6" \
+    "XREAD COUNT 010 STREAMS {K} 0" "XREAD BLOCK 010 STREAMS {K} 0"
 
 # Deliberate divergences from real Redis, documented rather than fixed:
 #   - no inline command support: Redis parses input not starting with '*' as a

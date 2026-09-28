@@ -1,14 +1,16 @@
 use std::time::Duration;
 
-use super::{expiry_arg, Command, CommandError};
+use bytes::Bytes;
+
+use super::{expiry_arg, Command, CommandError, ExpiryUnit};
 use crate::db::Db;
 use crate::resp::Value;
 
 
 pub(super) fn try_parse(
     upper: &[u8],
-    rest: &[Vec<u8>],
-    name: &[u8],
+    rest: &[Bytes],
+    name: &Bytes,
 ) -> Option<Result<Command, CommandError>> {
     Some(match upper {
         b"GET" => get_command(rest, name),
@@ -17,16 +19,16 @@ pub(super) fn try_parse(
     })
 }
 
-fn get_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError>{
+fn get_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>{
     match rest {
         [key] => Ok(Command::Get { key: key.clone() }),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     }
 }
-fn set_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError>{
+fn set_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>{
     let (key, value) = match rest {
         [k, v, ..] => (k.clone(), v.clone()),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     };
 
     let mut expiry: Option<Duration> = None;
@@ -37,14 +39,14 @@ fn set_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError>{
                 if expiry.is_some() {
                     return Err(CommandError::Syntax); // conflicting expiry options
                 }
-                expiry = Some(Duration::from_millis(expiry_arg(rest, i, name)? as u64));
+                expiry = Some(expiry_arg(rest, i, name, ExpiryUnit::Millis)?);
                 i += 2;
             }
             b"EX" => {
                 if expiry.is_some() {
                     return Err(CommandError::Syntax);
                 }
-                expiry = Some(Duration::from_secs(expiry_arg(rest, i, name)? as u64));
+                expiry = Some(expiry_arg(rest, i, name, ExpiryUnit::Seconds)?);
                 i += 2;
             }
             _ => return Err(CommandError::Syntax),
@@ -54,16 +56,16 @@ fn set_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError>{
     Ok(Command::Set { key, value, expiry })
 }
 
-pub(super) fn get(key: &Vec<u8>, db: &mut Db) -> Result<Value, CommandError> {
-    Ok(match db.get(&key)? {
+pub(super) fn get(key: &Bytes, db: &mut Db) -> Result<Value, CommandError> {
+    Ok(match db.get(key)? {
         Some(v) => Value::BulkString(v),
         None => Value::NullBulkString,
     })
 }
 
-pub(super) fn set(key: Vec<u8>, value: Vec<u8>, expiry: Option<Duration>, db: &mut Db) -> Result<Value, CommandError> {
+pub(super) fn set(key: Bytes, value: Bytes, expiry: Option<Duration>, db: &mut Db) -> Result<Value, CommandError> {
     db.set(key, value, expiry);
-    Ok(Value::SimpleString(b"OK".to_vec()))
+    Ok(Value::SimpleString(Bytes::from_static(b"OK")))
 }
 
 #[cfg(test)]
@@ -76,8 +78,8 @@ mod string_tests {
         assert_eq!(
             cmd_ok(b"*5\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\npx\r\n$3\r\n100\r\n"),
             Command::Set {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
                 expiry: Some(Duration::from_millis(100)),
             }
         );
@@ -103,8 +105,8 @@ mod string_tests {
         assert_eq!(
             cmd_ok(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"),
             Command::Set {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
                 expiry: None,
             }
         );

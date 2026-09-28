@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bytes::{Buf, BytesMut};
+use bytes::{BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use rusty_redis::resp::{self, Value};
@@ -25,8 +25,26 @@ async fn main() -> std::io::Result<()> {
 
     let db = Db::with_clock(Arc::new(SystemClock));
     let (tx, rx) = mpsc::channel::<Request>(64);
-    tokio::spawn(keyspace_task(db, rx));    // db moves in, main never sees it again
+    let keyspace = tokio::spawn(keyspace_task(db, rx));  // db moves in, main never sees it again
 
+    // The keyspace task owns the only copy of Db, so if it ever returns, every
+    // connection is already doomed: tx.send starts failing and each connection
+    // task quietly closes its socket while the listener keeps accepting new
+    // ones. That silent zombie state is worse than either working or dying, so
+    // whichever of these two finishes first ends the process.
+    tokio::select! {
+        result = keyspace => {
+            match result {
+                Ok(()) => eprintln!("keyspace task exited: every sender was dropped"),
+                Err(e) => eprintln!("keyspace task died: {e}"),
+            }
+            std::process::exit(1)
+        }
+        result = accept_loop(listener, tx) => result,
+    }
+}
+
+async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<Request>) -> std::io::Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
@@ -43,6 +61,10 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
+/// Flush the reply buffer once it passes this, instead of only at the end of
+/// the drain loop.
+const OUTBUF_FLUSH_AT: usize = 64 * 1024;
+
 async fn handle_client(
     mut stream: TcpStream,
     tx: mpsc::Sender<Request>,
@@ -53,14 +75,27 @@ async fn handle_client(
     loop {
         loop {
             match resp::parse(&inbuf) {
-                Ok(Some((consumed, value))) => {
-                    inbuf.advance(consumed);
+                Ok(Some((consumed, frame))) => {
+                    let owned = inbuf.split_to(consumed).freeze();
+                    let value = frame.into_value(&owned);
                     match to_command(value) {
                         Ok(None) => {} // no reply at all
                         Err(e) => resp::encode(&Value::Error(e.to_resp()), &mut outbuf),
                         Ok(Some(cmd)) => {
                             let id = next_id(); // AtomicU64 fetch_add
-                            let deadline = cmd.blocking();
+                            let deadline = cmd.meta().blocks;
+
+                            // Anything already encoded belongs to commands that
+                            // came before this one in the same packet, and they
+                            // are not waiting on it. Real Redis writes those
+                            // replies out and leaves the client blocked, so a
+                            // pipelined `PING` then `BLPOP k 0` gets its +PONG
+                            // immediately. Flushing here rather than after the
+                            // drain loop is what reproduces that.
+                            if deadline.is_some() && !outbuf.is_empty() {
+                                stream.write_all(&outbuf).await?;
+                                outbuf.clear();
+                            }
 
                             let (reply_tx, reply_rx) = oneshot::channel();
                             if tx.send(Request::Run { cmd, reply: reply_tx, id }).await.is_err() {
@@ -86,6 +121,15 @@ async fn handle_client(
                                 Err(_) => return Ok(()),
                             }
                         }
+                    }
+
+                    // A deep pipeline of large replies would otherwise grow
+                    // outbuf without limit, since the only flush is after the
+                    // drain loop empties. Redis bounds this with
+                    // client-output-buffer-limit; this is the crude version.
+                    if outbuf.len() >= OUTBUF_FLUSH_AT {
+                        stream.write_all(&outbuf).await?;
+                        outbuf.clear();
                     }
                 }
                 Ok(None) => break,

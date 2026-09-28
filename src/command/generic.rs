@@ -1,11 +1,13 @@
+use bytes::Bytes;
+
 use super::{Command, CommandError};
 use crate::db::Db;
 use crate::resp::Value;
 
 pub(super) fn try_parse(
     upper: &[u8],
-    rest: &[Vec<u8>],
-    name: &[u8],
+    rest: &[Bytes],
+    name: &Bytes,
 ) -> Option<Result<Command, CommandError>> {
     Some(match upper {
         b"PING" => ping_command(rest, name),
@@ -17,68 +19,78 @@ pub(super) fn try_parse(
     })
 }
 
-fn ping_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+fn ping_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [] => Ok(Command::Ping(None)),
         [msg] => Ok(Command::Ping(Some(msg.clone()))),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     }
 }
 
-fn echo_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+fn echo_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [msg] => Ok(Command::Echo(msg.clone())),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     }
 }
 
-fn type_of_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+fn type_of_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [key] => Ok(Command::Type { key: key.clone() }),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     }
 }
 
-fn del_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+fn del_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
-        [] => return Err(CommandError::WrongArity(name.to_vec())),
+        [] => return Err(CommandError::WrongArity(name.clone())),
         keys => Ok(Command::Del { keys: keys.to_vec() }),
     }
 }
 
-fn exists_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+fn exists_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
-        [] => return Err(CommandError::WrongArity(name.to_vec())),
+        [] => return Err(CommandError::WrongArity(name.clone())),
         keys => Ok(Command::Exists { keys: keys.to_vec() }),
     }
 }
 
-pub(super) fn ping(msg: Option<Vec<u8>>) -> Result<Value, CommandError> {
+pub(super) fn ping(msg: Option<Bytes>) -> Result<Value, CommandError> {
     match msg {
-        None => Ok(Value::SimpleString(b"PONG".to_vec())),
-        Some(v) => Ok(Value::BulkString(v)),
+        None => Ok(Value::SimpleString(Bytes::from_static(b"PONG"))),
+        Some(v) => Ok(Value::BulkString(Bytes::from(v))),
     }
 }
 
-pub(super) fn echo(msg: Vec<u8>) -> Result<Value, CommandError> {
+pub(super) fn echo(msg: Bytes) -> Result<Value, CommandError> {
     Ok(Value::BulkString(msg))
 }
 
-pub(super) fn type_of(key: &Vec<u8>, db: &mut Db) -> Result<Value, CommandError> {
-    Ok(Value::SimpleString(match db.type_of(&key) {
+pub(super) fn type_of(key: &Bytes, db: &mut Db) -> Result<Value, CommandError> {
+    Ok(Value::SimpleString(Bytes::from(match db.type_of(&key) {
         Some(t) => t.as_bytes().to_vec(),
         None => b"none".to_vec(),
-    }))
+    })))
 }
 
-pub(super) fn del(keys: &Vec<Vec<u8>>, db: &mut Db) -> Result<Value, CommandError> {
-    let n = keys.iter().filter(|k| db.delete(k)).count();
-    Ok(Value::Integer(n as i64))
+pub(super) fn del(keys: Vec<Bytes>, db: &mut Db) -> Result<Value, CommandError> {
+    let mut n = 0i64;
+    for k in &keys {
+        if db.delete(k) {
+            n += 1;
+        }
+    }
+    Ok(Value::Integer(n))
 }
 
-pub(super) fn exists(keys: &Vec<Vec<u8>>, db: &mut Db) -> Result<Value, CommandError> {
-    let n = keys.iter().filter(|k| db.exists(k)).count();
-    Ok(Value::Integer(n as i64))
+pub(super) fn exists(keys: Vec<Bytes>, db: &mut Db) -> Result<Value, CommandError> {
+    let mut n = 0i64;
+    for k in &keys {
+        if db.exists(k) {
+            n += 1;
+        }
+    }
+    Ok(Value::Integer(n))
 }
 
 
@@ -92,22 +104,22 @@ mod generic_tests {
         // bare PING is a simple string, PING <msg> is a bulk string
         assert_eq!(
             ping(None).unwrap(),
-            Value::SimpleString(b"PONG".to_vec())
+            Value::SimpleString(Bytes::from_static(b"PONG"))
         );
         assert_eq!(
-            ping(Some(b"his".to_vec())).unwrap(),
-            Value::BulkString(b"his".to_vec())
+            ping(Some(Bytes::from_static(b"his"))).unwrap(),
+            Value::BulkString(Bytes::from_static(b"his"))
         );
         assert_eq!(
-            echo(b"hi".to_vec()).unwrap(),
-            Value::BulkString(b"hi".to_vec())
+            echo(Bytes::from_static(b"hi")).unwrap(),
+            Value::BulkString(Bytes::from_static(b"hi"))
         );
     }
 
     #[test]
     fn command_ping_echo_works() {
         assert_eq!(cmd_ok(b"*1\r\n$4\r\nPING\r\n"), Command::Ping(None));
-        assert_eq!(cmd_ok(b"*2\r\n$4\r\nping\r\n$2\r\nhi\r\n"), Command::Ping(Some(b"hi".to_vec())));
-        assert_eq!(cmd_ok(b"*2\r\n$4\r\nECHO\r\n$4\r\necho\r\n"), Command::Echo(b"echo".to_vec()));
+        assert_eq!(cmd_ok(b"*2\r\n$4\r\nping\r\n$2\r\nhi\r\n"), Command::Ping(Some(Bytes::from_static(b"hi"))));
+        assert_eq!(cmd_ok(b"*2\r\n$4\r\nECHO\r\n$4\r\necho\r\n"), Command::Echo(Bytes::from_static(b"echo")));
     }
 }

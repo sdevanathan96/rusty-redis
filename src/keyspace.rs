@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::command::{Command, Outcome};
@@ -19,7 +20,7 @@ pub enum Request {
 struct Waiter {
     id: u64,
     reply: oneshot::Sender<Value>,
-    keys: Vec<Vec<u8>>,
+    keys: Vec<Bytes>,
     retry: Command,
 }
 
@@ -28,7 +29,7 @@ pub async fn keyspace_task(mut db: Db, mut rx: mpsc::Receiver<Request>) {
     while let Some(req) = rx.recv().await {
         match req {
             Request::Run { cmd, reply, id } => {
-                let touched = cmd.feeds();
+                let touched = cmd.meta().feeds;
                 match execute(cmd, &mut db) {
                     Ok(Outcome::Reply(v)) => { let _ = reply.send(v); }
                     Ok(Outcome::Block { keys, retry }) => {
@@ -36,11 +37,14 @@ pub async fn keyspace_task(mut db: Db, mut rx: mpsc::Receiver<Request>) {
                     }
                     Err(e) => { let _ = reply.send(Value::Error(e.to_resp())); }
                 }
-                let mut pending: VecDeque<Vec<u8>> = touched.into();
-                let mut rounds = 0;
+                // The cascade terminates on its own. Every serve removes one
+                // waiter, no waiter is added while a cascade is running, and a
+                // key is only queued by a serve, so the number of pops is
+                // bounded by one plus the total keys fed. A round counter could
+                // therefore never prevent a live lock, only silently abandon
+                // parked clients once a fan out got large enough.
+                let mut pending: VecDeque<Bytes> = touched.into();
                 while let Some(key) = pending.pop_front() {
-                    rounds += 1;
-                    if rounds > 1000 { break; }
                     pending.extend(serve_waiters(&mut db, &mut waiters, &key));
                 }
             }
@@ -54,13 +58,13 @@ pub async fn keyspace_task(mut db: Db, mut rx: mpsc::Receiver<Request>) {
 fn serve_waiters(
     db: &mut Db,
     waiters: &mut VecDeque<Waiter>,
-    key: &[u8],
-) -> Vec<Vec<u8>> {
+    key: &Bytes,
+) -> Vec<Bytes> {
     let mut fed = Vec::new();
     let mut i = 0;
 
     while i < waiters.len() {
-        if !waiters[i].keys.iter().any(|k| k == key) {
+        if !waiters[i].keys.iter().any(|k| &k[..] == key) {
             i += 1;
             continue;
         }
@@ -71,7 +75,7 @@ fn serve_waiters(
 
         match execute(waiters[i].retry.clone(), db) {
             Ok(Outcome::Reply(v)) => {
-                fed.extend(waiters[i].retry.feeds());
+                fed.extend(waiters[i].retry.meta().feeds);
                 let w = waiters.remove(i).unwrap();
                 let _ = w.reply.send(v);
             }

@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use bytes::Bytes;
+
 use super::{parse_end, parse_i64, parse_timeout, Command, CommandError, End};
 use crate::command::Outcome;
 use crate::db::Db;
@@ -8,8 +10,8 @@ use crate::resp::Value;
 
 pub(super) fn try_parse(
     upper: &[u8],
-    rest: &[Vec<u8>],
-    name: &[u8],
+    rest: &[Bytes],
+    name: &Bytes,
 ) -> Option<Result<Command, CommandError>> {
     Some(match upper {
         b"RPUSH" => push_command(rest, name, End::Right),
@@ -27,24 +29,24 @@ pub(super) fn try_parse(
 }
 
 
-fn push_command(rest: &[Vec<u8>], name: &[u8], from: End) -> Result<Command, CommandError> {
+fn push_command(rest: &[Bytes], name: &Bytes, from: End) -> Result<Command, CommandError> {
     match rest {
         [key, first, more @ ..] => Ok(Command::Push {
             key: key.clone(),
             values: std::iter::once(first).chain(more).cloned().collect(),
             from,
         }),
-        _ => Err(CommandError::WrongArity(name.to_vec())),
+        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 
-fn pop_command(rest: &[Vec<u8>], name: &[u8], from: End) -> Result<Command, CommandError> {
+fn pop_command(rest: &[Bytes], name: &Bytes, from: End) -> Result<Command, CommandError> {
     // Arity first, so `LPOP k abc extra` reports WrongArity rather than a parse
     // error on an argument that should not be there at all.
     let (key, raw_count) = match rest {
         [key] => (key, None),
         [key, c] => (key, Some(c)),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     };
 
     let count = match raw_count {
@@ -63,38 +65,38 @@ fn pop_command(rest: &[Vec<u8>], name: &[u8], from: End) -> Result<Command, Comm
     Ok(Command::Pop { key: key.clone(), count, from })
 }
 
-fn bpop_command(rest: &[Vec<u8>], name: &[u8], from: End) -> Result<Command, CommandError> {
+fn bpop_command(rest: &[Bytes], name: &Bytes, from: End) -> Result<Command, CommandError> {
     match rest {
         [keys @ .., timeout] if !keys.is_empty() => Ok(Command::BPop {
             keys: keys.to_vec(),
             from: from,
             timeout: parse_timeout(timeout)?,
         }),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     }
 }
 
 
-fn llen_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+fn llen_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [key] => Ok(Command::LLen { key: key.clone() }),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     }
 }
 
 
-fn lrange_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+fn lrange_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [key, start, stop] => Ok(Command::LRange {
             key: key.clone(),
             start: parse_i64(start)?,
             stop: parse_i64(stop)?,
         }),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     }
 }
 
-fn lmove_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+fn lmove_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [src, dst, from, to] => Ok(Command::LMove {
             src: src.clone(),
@@ -102,11 +104,11 @@ fn lmove_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError>
             from: parse_end(from)?,
             to: parse_end(to)?,
         }),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     }
 }
 
-fn blmove_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError> {
+fn blmove_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [src, dst, from, to, timeout] => Ok(Command::BLMove {
             src: src.clone(),
@@ -115,14 +117,14 @@ fn blmove_command(rest: &[Vec<u8>], name: &[u8]) -> Result<Command, CommandError
             to: parse_end(to)?,
             timeout: parse_timeout(timeout)?,
         }),
-        _ => return Err(CommandError::WrongArity(name.to_vec())),
+        _ => return Err(CommandError::WrongArity(name.clone())),
     }
 }
 
-pub(super) fn push(key: &Vec<u8>, values: Vec<Vec<u8>>, from: End, db: &mut Db) -> Result<Value, CommandError> {
-    Ok(Value::Integer(db.push(&key, values, from)? as i64))
+pub(super) fn push(key: Bytes, values: Vec<Bytes>, from: End, db: &mut Db) -> Result<Value, CommandError> {
+    Ok(Value::Integer(db.push(key, values, from)? as i64))
 }
-pub(super) fn pop(key: &Vec<u8>, count: Option<usize>, from: End, db: &mut Db) -> Result<Value, CommandError> {
+pub(super) fn pop(key: &Bytes, count: Option<usize>, from: End, db: &mut Db) -> Result<Value, CommandError> {
     let popped = db.pop(&key, count, from)?;
     Ok(match (count, popped) {
         (None, Some(v)) => v
@@ -136,7 +138,7 @@ pub(super) fn pop(key: &Vec<u8>, count: Option<usize>, from: End, db: &mut Db) -
 }
 
 pub(super) fn bpop(
-    keys: Vec<Vec<u8>>,
+    keys: Vec<Bytes>,
     from: End,
     timeout: Option<Duration>,
     db: &mut Db,
@@ -158,10 +160,10 @@ pub(super) fn bpop(
     })
 }
 
-pub(super) fn llen(key: &Vec<u8>, db: &mut Db) -> Result<Value, CommandError> {
+pub(super) fn llen(key: &Bytes, db: &mut Db) -> Result<Value, CommandError> {
     Ok(Value::Integer(db.llen(&key)? as i64))
 }
-pub(super) fn lrange(key: &Vec<u8>, start: i64, stop: i64, db: &mut Db) -> Result<Value, CommandError> {
+pub(super) fn lrange(key: &Bytes, start: i64, stop: i64, db: &mut Db) -> Result<Value, CommandError> {
     Ok(Value::Array(
         db.lrange(&key, start, stop)?
             .into_iter()
@@ -169,16 +171,16 @@ pub(super) fn lrange(key: &Vec<u8>, start: i64, stop: i64, db: &mut Db) -> Resul
             .collect(),
     ))
 }
-pub(super) fn lmove(src: &Vec<u8>, dst: &Vec<u8>, from: End, to: End, db: &mut Db) -> Result<Value, CommandError> {
-    Ok(match db.lmove(&src, &dst, from, to)? {
+pub(super) fn lmove(src: &Bytes, dst: Bytes, from: End, to: End, db: &mut Db) -> Result<Value, CommandError> {
+    Ok(match db.lmove(&src, dst, from, to)? {
         Some(v) => Value::BulkString(v),
         None => Value::NullBulkString,
     })
 }
 
 
-pub(super) fn blmove(src: Vec<u8>, dst: Vec<u8>, from: End, to: End, timeout: Option<Duration>, db: &mut Db) -> Result<Outcome, CommandError> {
-    match db.lmove(&src, &dst, from, to)? {
+pub(super) fn blmove(src: Bytes, dst: Bytes, from: End, to: End, timeout: Option<Duration>, db: &mut Db) -> Result<Outcome, CommandError> {
+    match db.lmove(&src, dst.clone(), from, to)? {
         Some(v) => Ok(Outcome::Reply(Value::BulkString(v))),
         None => Ok(Outcome::Block {
             keys: vec![src.clone()],
@@ -230,8 +232,8 @@ mod list_tests {
         assert_eq!(
             cmd_ok(b"*5\r\n$5\r\nlmove\r\n$1\r\na\r\n$1\r\nb\r\n$4\r\nleft\r\n$5\r\nright\r\n"),
             Command::LMove {
-                src: b"a".to_vec(),
-                dst: b"b".to_vec(),
+                src: Bytes::from_static(b"a"),
+                dst: Bytes::from_static(b"b"),
                 from: End::Left,
                 to: End::Right,
             }

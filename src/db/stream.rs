@@ -1,8 +1,10 @@
+use bytes::Bytes;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntryId { pub ms: u64, pub seq: u64 }
 impl EntryId {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        format!("{}-{}", self.ms, self.seq).into_bytes()
+    pub fn to_bytes(&self) -> Bytes {
+        Bytes::from(format!("{}-{}", self.ms, self.seq))
     }
 }
 impl std::fmt::Display for EntryId {
@@ -10,7 +12,12 @@ impl std::fmt::Display for EntryId {
         write!(f, "{}-{}", self.ms, self.seq)
     }
 }
-pub type StreamEntry = (EntryId, Vec<(Vec<u8>, Vec<u8>)>);
+// pub type StreamEntry = (EntryId, Vec<(Bytes, Bytes)>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamEntry {
+    pub id: EntryId,
+    pub fields: Vec<(Bytes, Bytes)>,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReadFrom {
     Id(EntryId),
@@ -27,13 +34,13 @@ pub enum XaddError {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Stream {
-    entries: Vec<(EntryId, Vec<(Vec<u8>, Vec<u8>)>)>,
+    entries: Vec<StreamEntry>,
     last_id: EntryId,
 }
 
 impl Stream {
     // explicit id: validate and append
-    pub fn append(&mut self, id: EntryId, fields: Vec<(Vec<u8>, Vec<u8>)>)
+    pub fn append(&mut self, id: EntryId, fields: Vec<(Bytes, Bytes)>)
     -> Result<EntryId, XaddError>
     {
         if id.ms == 0 && id.seq == 0 {
@@ -43,12 +50,12 @@ impl Stream {
             return Err(XaddError::IdTooSmall);
         }
         self.last_id = id;
-        self.entries.push((id, fields));
+        self.entries.push(StreamEntry { id, fields });
         Ok(id)
     }
 
     // auto sequence: derive the seq from last_id, then append
-    pub fn append_auto_seq(&mut self, ms: u64, fields: Vec<(Vec<u8>, Vec<u8>)>)
+    pub fn append_auto_seq(&mut self, ms: u64, fields: Vec<(Bytes, Bytes)>)
         -> Result<EntryId, XaddError>
     {
         if ms < self.last_id.ms {
@@ -62,7 +69,7 @@ impl Stream {
         };
 
         self.last_id = id;
-        self.entries.push((id, fields));
+        self.entries.push(StreamEntry { id, fields });
         Ok(id)
     }
 
@@ -72,7 +79,7 @@ impl Stream {
     pub fn append_auto(
         &mut self,
         clock_ms: u64,
-        fields: Vec<(Vec<u8>, Vec<u8>)>,
+        fields: Vec<(Bytes, Bytes)>,
     ) -> Result<EntryId, XaddError> {
         let ms = clock_ms.max(self.last_id.ms);
         self.append_auto_seq(ms, fields)
@@ -82,15 +89,16 @@ impl Stream {
         self.entries.len()
     }
 
+    pub fn last_slice(&self) -> &[StreamEntry] {
+        match self.entries.len() {
+            0 => &[],
+            n => &self.entries[n - 1..],
+        }
+    }
+
     pub fn range(&self, start: EntryId, end: EntryId, count: Option<usize>) -> &[StreamEntry] {
-        let lo = match self.entries.binary_search_by_key(&start, |(id, _)| *id) {
-            Ok(i) => i, // exact match
-            Err(i) => i, // not present, i is the insertion point, which is the lower bound
-        };
-        let hi = match self.entries.binary_search_by_key(&end, |(id, _)| *id) {
-            Ok(i) => i + 1,
-            Err(i) => i,
-        };
+        let lo = self.entries.partition_point(|e| e.id < start);   // inclusive start
+        let hi = self.entries.partition_point(|e| e.id <= end);    // inclusive end
         let slice = &self.entries[lo..hi];
         match count {
             Some(n) => &slice[..n.min(slice.len())],
@@ -100,7 +108,7 @@ impl Stream {
 
     pub(super) fn range_after(&self, after: EntryId, count: Option<usize>)
     -> &[StreamEntry] {
-        let lo = self.entries.partition_point(|(id, _)| *id <= after);
+        let lo = self.entries.partition_point(|e| e.id <= after); // exclusive: skip `after` itself
         let slice = &self.entries[lo..];
         match count {
             Some(n) => &slice[..n.min(slice.len())],
@@ -115,8 +123,16 @@ impl Stream {
     pub(super) fn last_entry(&self) -> Option<&StreamEntry> {
         match self.len() {
             0 => None,
-            _ => self.entries.last()
+            _ => self.entries.last(),
         }
+    }
+
+    pub(super) fn delete(&mut self, id: EntryId) -> usize {
+        if let Ok(i) = self.entries.binary_search_by_key(&id, |e| e.id) {
+            self.entries.remove(i);
+            return 1;
+        }
+        0
     }
 }
 
