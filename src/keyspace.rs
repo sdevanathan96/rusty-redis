@@ -8,18 +8,16 @@ use crate::resp::Value;
 use crate::command::execute;
 use crate::db::Db;
 
+pub type ReplyTx = mpsc::UnboundedSender<Value>;
+
 pub enum Request {
-    Run {
-        cmd: Command,
-        reply: oneshot::Sender<Value>,
-        id: u64,
-    },
-    Unpark { id: u64 },
+    Run { cmd: Command, reply: ReplyTx, id: u64 },
+    Unpark { id: u64, on_timeout: Value },
 }
 
 struct Waiter {
     id: u64,
-    reply: oneshot::Sender<Value>,
+    reply: ReplyTx,
     keys: Vec<Bytes>,
     retry: Command,
 }
@@ -37,19 +35,16 @@ pub async fn keyspace_task(mut db: Db, mut rx: mpsc::Receiver<Request>) {
                     }
                     Err(e) => { let _ = reply.send(Value::Error(e.to_resp())); }
                 }
-                // The cascade terminates on its own. Every serve removes one
-                // waiter, no waiter is added while a cascade is running, and a
-                // key is only queued by a serve, so the number of pops is
-                // bounded by one plus the total keys fed. A round counter could
-                // therefore never prevent a live lock, only silently abandon
-                // parked clients once a fan out got large enough.
                 let mut pending: VecDeque<Bytes> = touched.into();
                 while let Some(key) = pending.pop_front() {
                     pending.extend(serve_waiters(&mut db, &mut waiters, &key));
                 }
             }
-            Request::Unpark { id } => {
-                waiters.retain(|w| w.id != id);
+            Request::Unpark { id, on_timeout } => {
+                if let Some(i) = waiters.iter().position(|w| w.id == id) {
+                    let w = waiters.remove(i).unwrap();
+                    let _ = w.reply.send(on_timeout);
+                }
             }
         }
     }

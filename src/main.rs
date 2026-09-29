@@ -8,7 +8,7 @@ use rusty_redis::command::{BlockSpec, to_command};
 use rusty_redis::db::Db;
 use rusty_redis::db::SystemClock;
 use rusty_redis::keyspace::{Request, keyspace_task};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc};
 use tokio::time::timeout;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -71,7 +71,7 @@ async fn handle_client(
 ) -> std::io::Result<()> {
     let mut inbuf = BytesMut::with_capacity(4096);
     let mut outbuf = BytesMut::with_capacity(4096);
-
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Value>();
     loop {
         loop {
             match resp::parse(&inbuf) {
@@ -97,28 +97,34 @@ async fn handle_client(
                                 outbuf.clear();
                             }
 
-                            let (reply_tx, reply_rx) = oneshot::channel();
-                            if tx.send(Request::Run { cmd, reply: reply_tx, id }).await.is_err() {
+                            if tx.send(Request::Run { cmd, reply: reply_tx.clone(), id }).await.is_err(){
                                 return Ok(()); // keyspace task is gone
                             }
 
                             let received = match deadline {
                                 Some(BlockSpec { timeout: Some(d), on_timeout }) => {
-                                    match timeout(d, reply_rx).await {
+                                    match timeout(d, reply_rx.recv()).await {
                                         Ok(inner) => inner,
                                         Err(_) => {
-                                            let _ = tx.send(Request::Unpark { id }).await;
-                                            resp::encode(&on_timeout, &mut outbuf);
-                                            continue; // next frame in the drain loop
+                                            // Do not write the timeout reply here.
+                                            // A push may already have served this
+                                            // waiter. Let the keyspace task decide
+                                            // and send whichever answer is right.
+                                            if tx.send(Request::Unpark { id, on_timeout })
+                                                .await.is_err()
+                                            {
+                                                return Ok(());
+                                            }
+                                            reply_rx.recv().await
                                         }
                                     }
                                 }
-                                _ => reply_rx.await, // forever, or not blocking
+                                _ => reply_rx.recv().await,
                             };
 
                             match received {
-                                Ok(v) => resp::encode(&v, &mut outbuf),
-                                Err(_) => return Ok(()),
+                                Some(v) => resp::encode(&v, &mut outbuf),
+                                None => return Ok(()), // every sender dropped
                             }
                         }
                     }
