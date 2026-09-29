@@ -124,3 +124,12 @@ src/
   keyspace.rs    single task owning the keyspace; blocking-command wakeups
 fuzz/            cargo-fuzz targets
 ```
+
+## Credits
+
+- [redis-oxide](https://github.com/dpbriggs/redis-oxide), for the shape of the
+  RESP parser: it first records byte offsets into the input and resolves them
+  into values afterwards and each parse step returns
+  `Result<Option<(usize, T)>, E>`.
+- [Redis](https://github.com/redis/redis), the reference for every behavior and
+  error message here and the server `test.sh` diffs against.
