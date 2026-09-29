@@ -55,18 +55,21 @@ subgraph group_network["TCP and RESP"]
   node_resp["RESP codec<br/>[resp.rs]"]
 end
 
-subgraph group_commands["Command Handling"]
-  node_command["Command dispatch<br/>[command.rs]"]
+subgraph group_commands["Command Execution"]
+  node_command["Command parsing and dispatch<br/>[command.rs]"]
   node_generic["Generic commands<br/>[generic.rs]"]
   node_strings["String commands<br/>[string.rs]"]
   node_lists["List commands<br/>[list.rs]"]
   node_streams["Stream commands<br/>[stream.rs]"]
 end
 
-subgraph group_state["Keyspace and Storage"]
-  node_keyspace["Keyspace owner<br/>[keyspace.rs]"]
+subgraph group_keyspace["Keyspace Coordination"]
+  node_keyspace_task["Keyspace owner and blocking coordination<br/>[keyspace.rs]"]
+end
+
+subgraph group_storage["In-Memory Storage"]
   node_db[("In-memory database<br/>[db.rs]")]
-  node_streamdata["Stream entries<br/>[stream.rs]"]
+  node_stream_model["Stream entries and IDs<br/>[stream.rs]"]
 end
 
 node_client(("Redis client"))
@@ -74,8 +77,8 @@ node_client(("Redis client"))
 node_client -->|"sends requests"| node_server
 node_server -->|"parses frames"| node_resp
 node_server -->|"parses commands"| node_command
-node_server -->|"submits requests"| node_keyspace
-node_keyspace -->|"executes commands"| node_command
+node_server -->|"submits requests"| node_keyspace_task
+node_keyspace_task -->|"executes commands"| node_command
 node_command -->|"dispatches"| node_generic
 node_command -->|"dispatches"| node_strings
 node_command -->|"dispatches"| node_lists
@@ -84,8 +87,9 @@ node_generic -->|"reads and writes"| node_db
 node_strings -->|"reads and writes"| node_db
 node_lists -->|"reads and writes"| node_db
 node_streams -->|"reads and writes"| node_db
-node_db -->|"uses stream model"| node_streamdata
+node_db -->|"uses stream model"| node_stream_model
 node_server -->|"encodes replies"| node_resp
+node_keyspace_task -->|"returns replies"| node_server
 node_server -->|"sends replies"| node_client
 
 click node_server "https://github.com/sdevanathan96/rusty-redis/blob/main/src/main.rs"
@@ -95,9 +99,9 @@ click node_generic "https://github.com/sdevanathan96/rusty-redis/blob/main/src/c
 click node_strings "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/string.rs"
 click node_lists "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/list.rs"
 click node_streams "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/stream.rs"
-click node_keyspace "https://github.com/sdevanathan96/rusty-redis/blob/main/src/keyspace.rs"
+click node_keyspace_task "https://github.com/sdevanathan96/rusty-redis/blob/main/src/keyspace.rs"
 click node_db "https://github.com/sdevanathan96/rusty-redis/blob/main/src/db.rs"
-click node_streamdata "https://github.com/sdevanathan96/rusty-redis/blob/main/src/db/stream.rs"
+click node_stream_model "https://github.com/sdevanathan96/rusty-redis/blob/main/src/db/stream.rs"
 
 classDef toneNeutral fill:#f8fafc,stroke:#334155,stroke-width:1.5px,color:#0f172a
 classDef toneBlue fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#172554
@@ -108,7 +112,8 @@ classDef toneIndigo fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#312e81
 classDef toneTeal fill:#ccfbf1,stroke:#0f766e,stroke-width:1.5px,color:#134e4a
 class node_server,node_resp toneBlue
 class node_command,node_generic,node_strings,node_lists,node_streams,node_client toneAmber
-class node_keyspace,node_db,node_streamdata toneMint
+class node_keyspace_task toneMint
+class node_db,node_stream_model toneRose
 ```
 
 ## Layout
