@@ -9,5 +9,6 @@ target/
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
-# Working plan, kept local
+# Working plan and oracle probe, kept local
 /PLAN.md
+/probe.sh
