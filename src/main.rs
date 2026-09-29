@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9,7 +10,7 @@ use rusty_redis::db::Db;
 use rusty_redis::db::SystemClock;
 use rusty_redis::keyspace::{Request, keyspace_task};
 use tokio::sync::{mpsc};
-use tokio::time::timeout;
+use tokio::time::sleep;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -65,6 +66,15 @@ async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<Request>) -> std::i
 /// the drain loop.
 const OUTBUF_FLUSH_AT: usize = 64 * 1024;
 
+/// Close the connection once unparsed input passes this. Same value and same
+/// rule as Redis's client-query-buffer-limit: checked after every read, parked
+/// or not, and the client gets no reply.
+const MAX_QUERY_BUF: usize = 1024 * 1024 * 1024;
+
+fn query_buf_limit() -> std::io::Error {
+    std::io::Error::other("closing client that reached max query buffer length")
+}
+
 async fn handle_client(
     mut stream: TcpStream,
     tx: mpsc::Sender<Request>,
@@ -102,29 +112,16 @@ async fn handle_client(
                             }
 
                             let received = match deadline {
-                                Some(BlockSpec { timeout: Some(d), on_timeout }) => {
-                                    match timeout(d, reply_rx.recv()).await {
-                                        Ok(inner) => inner,
-                                        Err(_) => {
-                                            // Do not write the timeout reply here.
-                                            // A push may already have served this
-                                            // waiter. Let the keyspace task decide
-                                            // and send whichever answer is right.
-                                            if tx.send(Request::Unpark { id, on_timeout })
-                                                .await.is_err()
-                                            {
-                                                return Ok(());
-                                            }
-                                            reply_rx.recv().await
-                                        }
-                                    }
+                                Some(BlockSpec { timeout, on_timeout }) => {
+                                    wait_parked(&mut stream, &mut inbuf, &mut reply_rx, &tx, id, timeout, on_timeout)
+                                        .await?
                                 }
-                                _ => reply_rx.recv().await,
+                                None => reply_rx.recv().await,
                             };
 
                             match received {
                                 Some(v) => resp::encode(&v, &mut outbuf),
-                                None => return Ok(()), // every sender dropped
+                                None => return Ok(()), // client left, or every sender dropped
                             }
                         }
                     }
@@ -155,6 +152,53 @@ async fn handle_client(
         inbuf.reserve(4096);
         if stream.read_buf(&mut inbuf).await? == 0 {
             return Ok(());
+        }
+        if inbuf.len() > MAX_QUERY_BUF {
+            return Err(query_buf_limit());
+        }
+    }
+}
+
+/// Waits for a parked command's reply while still reading the socket. On EOF
+/// it returns None, and the caller returning drops `reply_rx`, which is what
+/// makes the keyspace task's `is_closed` check skip this waiter. Bytes that
+/// arrive meanwhile stay in `inbuf`, unparsed until the reply is in.
+async fn wait_parked(
+    stream: &mut TcpStream,
+    inbuf: &mut BytesMut,
+    reply_rx: &mut mpsc::UnboundedReceiver<Value>,
+    tx: &mpsc::Sender<Request>,
+    id: u64,
+    timeout: Option<Duration>,
+    on_timeout: Value,
+) -> std::io::Result<Option<Value>> {
+    // A pinned sleep inside the select rather than a timeout around it, so the
+    // socket is still watched while the keyspace task settles the Unpark.
+    let timer = sleep(timeout.unwrap_or_default());
+    tokio::pin!(timer);
+    let mut on_timeout = timeout.map(|_| on_timeout); // Some while the timer is armed
+
+    loop {
+        inbuf.reserve(4096);
+        tokio::select! {
+            reply = reply_rx.recv() => return Ok(reply),
+            read = stream.read_buf(inbuf) => {
+                if read? == 0 {
+                    return Ok(None);
+                }
+                if inbuf.len() > MAX_QUERY_BUF {
+                    return Err(query_buf_limit());
+                }
+            }
+            () = &mut timer, if on_timeout.is_some() => {
+                // Do not write the timeout reply here. A push may already have
+                // served this waiter; the keyspace task decides and sends
+                // exactly one more message either way.
+                let on_timeout = on_timeout.take().expect("guarded by the branch condition");
+                if tx.send(Request::Unpark { id, on_timeout }).await.is_err() {
+                    return Ok(None);
+                }
+            }
         }
     }
 }

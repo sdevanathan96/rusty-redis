@@ -70,6 +70,7 @@ BLOCK_PY=$(mktemp)
 cleanup() {
     rm -f "$BLOCK_PY"
     rm -f "$BLOCK2_PY"
+    rm -f "$CONN_PY"
     [ "$OUR_REDIS" = 1 ] && redis-cli -p "$REAL" SHUTDOWN NOSAVE >/dev/null 2>&1
     return 0
 }
@@ -212,6 +213,59 @@ t2.join()
 sys.stdout.write("first=%r second=%r" % (out[0], out[1]))
 PYEOF
 
+# Driver for scripted multi-connection scenarios. Each argument after the tag
+# is one step: "<conn> send <cmds>", "<conn> read", "<conn> close", or
+# "sleep <secs>". A connection opens on its first send.
+CONN_PY=$(mktemp)
+cat > "$CONN_PY" <<'PYEOF'
+import socket, sys, time
+
+port  = int(sys.argv[1])
+tag   = sys.argv[2]
+steps = sys.argv[3:]
+
+def sub(s):
+    return s.replace("{K3}", tag + "c").replace("{K2}", tag + "b").replace("{K}", tag + "a")
+
+def frame(spec):
+    parts = [sub(p).encode() for p in spec.split("|")]
+    out = b"*%d\r\n" % len(parts)
+    for p in parts:
+        out += b"$%d\r\n%s\r\n" % (len(p), p)
+    return out
+
+def frames(spec):
+    return b"".join(frame(c) for c in spec.split(";"))
+
+conns = {}
+for step in steps:
+    words = step.split(" ", 2)
+    if words[0] == "sleep":
+        time.sleep(float(words[1]))
+        continue
+    name, action = words[0], words[1]
+    if action == "send":
+        if name not in conns:
+            conns[name] = socket.create_connection(("127.0.0.1", port))
+        conns[name].sendall(frames(words[2]))
+    elif action == "read":
+        # Whatever arrives before 0.5s of quiet, so b'' means nothing did.
+        s = conns[name]
+        s.settimeout(0.5)
+        buf = b""
+        try:
+            while True:
+                c = s.recv(4096)
+                if not c:
+                    break
+                buf += c
+        except socket.timeout:
+            pass
+        print("%s: %r" % (name, buf))
+    elif action == "close":
+        conns.pop(name).close()
+PYEOF
+
 # ---------------------------------------------------------------- helpers
 
 skip_filtered() {
@@ -332,6 +386,18 @@ block2_scenario() {
     report "$name" " ${DIM}(block2)${OFF}" \
         "$(python3 "$BLOCK2_PY" "$MINE" "$tag" "$delay" "$b1" "$b2" "$trigger" 2>&1)" \
         "$(python3 "$BLOCK2_PY" "$REAL" "$tag" "$delay" "$b1" "$b2" "$trigger" 2>&1)" \
+        "yours" "redis"
+}
+
+# Named connections driven step by step, for a connection that acts or
+# disconnects while another is parked. Steps are described above CONN_PY.
+conn_scenario() {
+    local name="$1"; shift
+    skip_filtered "$name" && return
+    local tag="r${RUN}s${N}k"
+    report "$name" " ${DIM}(conns)${OFF}" \
+        "$(python3 "$CONN_PY" "$MINE" "$tag" "$@" 2>&1)" \
+        "$(python3 "$CONN_PY" "$REAL" "$tag" "$@" 2>&1)" \
         "yours" "redis"
 }
 
@@ -712,6 +778,32 @@ scenario "leading plus and zeros in stream ids" \
     "XADD {K} +5-1 f v" "XADD {K} 05-1 f v" "XADD {K} 5-01 f v" \
     "XRANGE {K} +5 +6" \
     "XREAD COUNT 010 STREAMS {K} 0" "XREAD BLOCK 010 STREAMS {K} 0"
+
+section "parked connections"
+# Phase 3 step 2 exit criteria. A parked client's later commands run only after
+# it is served, and a client that leaves while parked must not take an element.
+
+conn_scenario "commands pipelined behind a parked one wait for it" \
+    "a send PING;BLPOP|{K}|0;SET|{K2}|1" "a read" \
+    "b send GET|{K2}" "b read" \
+    "b send RPUSH|{K}|v" "b read" "a read" \
+    "b send GET|{K2}" "b read"
+
+conn_scenario "commands sent while parked wait for it" \
+    "a send BLPOP|{K}|0" "sleep 0.2" "a send SET|{K2}|1" "a read" \
+    "b send GET|{K2}" "b read" \
+    "b send RPUSH|{K}|v" "b read" "a read" \
+    "b send GET|{K2}" "b read"
+
+conn_scenario "a client that leaves while parked takes nothing" \
+    "a send BLPOP|{K}|0" "sleep 0.2" "a close" "sleep 0.2" \
+    "b send RPUSH|{K}|v" "b read" \
+    "b send LRANGE|{K}|0|-1" "b read"
+
+conn_scenario "a client that leaves during a timed block takes nothing" \
+    "a send BLPOP|{K}|5" "sleep 0.2" "a close" "sleep 0.2" \
+    "b send RPUSH|{K}|v" "b read" \
+    "b send LRANGE|{K}|0|-1" "b read"
 
 # Deliberate divergences from real Redis, documented rather than fixed:
 #   - no inline command support: Redis parses input not starting with '*' as a

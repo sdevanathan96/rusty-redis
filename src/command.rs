@@ -15,7 +15,7 @@ pub enum Outcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Blocking { No, Forever, Until(Duration) }
+pub enum Blocking { No, Forever, For(Duration) }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Command {
@@ -132,7 +132,7 @@ impl Command {
     //         Command::XRead { timeout, .. } => match timeout {
     //             Blocking::No => None,
     //             Blocking::Forever => Some(BlockSpec { timeout: None, on_timeout: Value::NullArray }),
-    //             Blocking::Until(d) => Some(BlockSpec { timeout: Some(*d), on_timeout: Value::NullArray }),
+    //             Blocking::For(d) => Some(BlockSpec { timeout: Some(*d), on_timeout: Value::NullArray }),
     //         },
     //         Command::Ping(_)
     //         | Command::Echo(_)
@@ -171,7 +171,7 @@ impl Command {
                 blocks: match timeout {
                     Blocking::No => None,
                     Blocking::Forever => Some(BlockSpec { timeout: None, on_timeout: Value::NullArray }),
-                    Blocking::Until(d) => Some(BlockSpec { timeout: Some(*d), on_timeout: Value::NullArray }),
+                    Blocking::For(d) => Some(BlockSpec { timeout: Some(*d), on_timeout: Value::NullArray }),
                 },
             },
             Command::Ping(_)
@@ -478,7 +478,7 @@ fn parse_block(raw: &[u8]) -> Result<Blocking, CommandError> {
     Ok(if millis == 0 {
         Blocking::Forever
     } else {
-        Blocking::Until(Duration::from_millis(millis as u64))
+        Blocking::For(Duration::from_millis(millis as u64))
     })
 }
 
@@ -509,7 +509,7 @@ pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError> {
 
 // pub fn blocking_timeout(cmd: &Command) -> Blocking {
 //     match cmd {
-//         Command::BPop { timeout: Some(d), .. } => Blocking::Until(*d),
+//         Command::BPop { timeout: Some(d), .. } => Blocking::For(*d),
 //         Command::BPop { timeout: None, .. } => Blocking::Forever,
 //         _ => Blocking::No,
 //     }
