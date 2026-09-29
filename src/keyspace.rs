@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::command::{Command, Outcome};
 use crate::resp::Value;
@@ -35,6 +35,9 @@ pub async fn keyspace_task(mut db: Db, mut rx: mpsc::Receiver<Request>) {
                     }
                     Err(e) => { let _ = reply.send(Value::Error(e.to_resp())); }
                 }
+                // No round cap needed: every serve removes a waiter and none
+                // are added mid cascade, so this ends. A cap could only
+                // abandon parked clients.
                 let mut pending: VecDeque<Bytes> = touched.into();
                 while let Some(key) = pending.pop_front() {
                     pending.extend(serve_waiters(&mut db, &mut waiters, &key));
