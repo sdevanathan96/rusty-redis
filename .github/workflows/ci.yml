@@ -1,9 +1,19 @@
 name: CI
 
+# Pushes that only touch these files skip CI. Anything else, including this
+# workflow and test.sh, still runs it.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - LICENSE
+      - .gitignore
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - LICENSE
+      - .gitignore
 
 env:
   CARGO_TERM_COLOR: always
