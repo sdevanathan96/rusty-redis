@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::db::{Db, End, EntryId, IdSpec, ReadFrom, WrongType, XaddError};
+use crate::db::{Db, End, EntryId, IdSpec, IncrError, ReadFrom, WrongType, XaddError};
 use crate::int::strict_i64;
 use crate::resp::Value;
 use std::time::Duration;
@@ -8,6 +8,7 @@ mod stream;
 mod generic;
 mod list;
 mod string;
+mod integer;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Outcome {
@@ -39,6 +40,7 @@ pub enum Command {
     XRange {key: Bytes, start: EntryId, stop: EntryId, count: Option<i64> },
     XRead {count: Option<i64>, timeout: Blocking, streams: Vec<(Bytes, ReadFrom)>},
     XDel { key: Bytes, ids: Vec<EntryId>},
+    Incr { key: Bytes },
     Unknown { name: Bytes, args: Vec<Bytes> },
 }
 
@@ -60,12 +62,23 @@ pub enum CommandError {
     InvalidStreamId,
     XaddIdZero,
     XaddIdTooSmall,
-    UnbalancedXread
+    UnbalancedXread,
+    Overflow,
 }
 
 impl From<WrongType> for CommandError {
     fn from(_: WrongType) -> Self {
         CommandError::WrongType
+    }
+}
+
+impl From<IncrError> for CommandError {
+    fn from(e: IncrError) -> Self {
+        match e {
+            IncrError::NotAnInteger => CommandError::NotAnInteger,
+            IncrError::Overflow => CommandError::Overflow,
+            IncrError::WrongType => CommandError::WrongType,
+        }
     }
 }
 
@@ -189,6 +202,7 @@ impl Command {
             | Command::XLen { .. }
             | Command::XRange { .. }
             | Command::XDel { .. }
+            | Command::Incr { .. }
             | Command::Unknown { .. } => Meta { feeds: vec![], blocks: None },
         }
     }
@@ -240,7 +254,8 @@ impl CommandError {
             CommandError::XaddIdTooSmall =>
                 Bytes::from_static(b"ERR The ID specified in XADD is equal or smaller than the target stream top item"),
             CommandError::UnbalancedXread => 
-                Bytes::from_static(b"ERR Unbalanced 'xread' list of streams: for each stream key an ID, '+', or '$' must be specified.")
+                Bytes::from_static(b"ERR Unbalanced 'xread' list of streams: for each stream key an ID, '+', or '$' must be specified."),
+            CommandError::Overflow => Bytes::from_static(b"ERR increment or decrement would overflow"),
         }
     }
 }
@@ -280,7 +295,8 @@ pub fn to_command(v: Value) -> Result<Option<Command>, CommandError> {
     let parsed = generic::try_parse(&upper, rest, name)
         .or_else(|| string::try_parse(&upper, rest, name))
         .or_else(|| list::try_parse(&upper, rest, name))
-        .or_else(|| stream::try_parse(&upper, rest, name));
+        .or_else(|| stream::try_parse(&upper, rest, name))
+        .or_else(|| integer::try_parse(&upper, rest, name));
 
     let cmd = match parsed {
         Some(result) => result?,
@@ -444,6 +460,7 @@ pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError> {
         Command::XRange { key, start, stop, count } => stream::xrange(&key, start, stop, count, db),
         Command::XRead { count, timeout, streams } => stream::xread(count, timeout, streams, db),
         Command::XDel { key, ids} => stream::xdel(&key, &ids, db),
+        Command::Incr { key } => Ok(Outcome::Reply(integer::incr(&key, db)?)),
         Command::Unknown { name, args } => Err(CommandError::UnknownCommand { name, args }),
     }
 }

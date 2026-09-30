@@ -8,6 +8,7 @@ use bytes::Bytes;
 
 use crate::db::stream::{Stream};
 pub use crate::db::stream::{EntryId, XaddError, IdSpec, ReadFrom, StreamEntry};
+use crate::int::strict_i64;
 
 #[cfg(test)]
 use std::sync::Mutex;
@@ -34,6 +35,11 @@ impl Clock for SystemClock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WrongType;
 
+/// Why INCR failed. A type of its own, so every other accessor goes on
+/// returning plain `WrongType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncrError { WrongType, NotAnInteger, Overflow }
+
 /// The expiry deadline does not fit in Redis's i64 of milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidExpireTime;
@@ -52,10 +58,37 @@ impl Entry {
     }
 }
 
+/// A string's value, stored the way Redis encodes it. `Integer` holds only what
+/// `strict_i64` accepts, which is the canonical form, so turning it back into
+/// bytes gives exactly what the client wrote: `010` stays `Raw`.
+#[derive(Debug, Clone)]
+enum Str {
+    Raw(Bytes),
+    Integer(i64),
+}
+
+impl Str {
+    fn from_bytes(value: Bytes) -> Self {
+        match strict_i64(&value) {
+            Some(n) => Str::Integer(n),
+            None => Str::Raw(value),
+        }
+    }
+
+    /// Owned, because an `Integer` has no bytes to lend. Cheap for `Raw`, a
+    /// reference count bump; an `Integer` is formatted.
+    fn to_bytes(&self) -> Bytes {
+        match self {
+            Str::Raw(bytes) => bytes.clone(),
+            Str::Integer(n) => Bytes::from(n.to_string()),
+        }
+    }
+}
+
 // private: the storage
 #[derive(Debug, Clone)]
 enum Data {
-    String(Bytes),
+    String(Str),
     List(VecDeque<Bytes>),
     Stream(Stream),
 }
@@ -64,11 +97,18 @@ impl Data {
     // One line each, and they live next to the enum rather than being spelled
     // out inside six nearly identical Db methods. A new variant adds one of
     // these, not two Db methods.
-    fn as_string(&self) -> Result<&Bytes, WrongType> {
+    fn as_str(&self) -> Result<&Str, WrongType> {
         match self { Data::String(s) => Ok(s), _ => Err(WrongType) }
     }
-    fn as_string_mut(&mut self) -> Result<&mut Bytes, WrongType> {
+    fn as_str_mut(&mut self) -> Result<&mut Str, WrongType> {
         match self { Data::String(s) => Ok(s), _ => Err(WrongType) }
+    }
+    fn as_integer_mut(&mut self) -> Result<&mut i64, IncrError> {
+        match self {
+            Data::String(Str::Integer(n)) => Ok(n),
+            Data::String(Str::Raw(_)) => Err(IncrError::NotAnInteger),
+            _ => Err(IncrError::WrongType),
+        }
     }
     fn as_list(&self) -> Result<&VecDeque<Bytes>, WrongType> {
         match self { Data::List(l) => Ok(l), _ => Err(WrongType) }
@@ -193,7 +233,7 @@ impl Db {
             Some(d) => Some(now.checked_add(d).unwrap_or(now)),
             None => None,
         };
-        self.map.insert(key, Entry { data: Data::String(value), expires_at });
+        self.map.insert(key, Entry { data: Data::String(Str::from_bytes(value)), expires_at });
         Ok(())
     }
 
@@ -201,7 +241,24 @@ impl Db {
         self.reap(key);
         match self.data(key) {
             None => Ok(None),
-            Some(d) => Ok(Some(d.as_string()?.clone())),
+            Some(d) => Ok(Some(d.as_str()?.to_bytes())),
+        }
+    }
+
+    /// INCR. A missing key starts from 0, so it becomes 1 with no expiry. An
+    /// existing value changes in place, which keeps its TTL, as Redis does.
+    pub fn incr(&mut self, key: Bytes) -> Result<i64, IncrError> {
+        self.reap(&key);
+        match self.data_mut(&key) {
+            None => {
+                self.map.insert(key, Entry { data: Data::String(Str::Integer(1)), expires_at: None });
+                Ok(1)
+            }
+            Some(d) => {
+                let value = d.as_integer_mut()?;
+                *value = value.checked_add(1).ok_or(IncrError::Overflow)?;
+                Ok(*value)
+            }
         }
     }
 
@@ -513,7 +570,7 @@ impl Clock for TestClock {
 mod tests {
     use bytes::Bytes;
 
-use super::{Clock, Db, InvalidExpireTime, TestClock};
+use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -631,5 +688,66 @@ use super::{Clock, Db, InvalidExpireTime, TestClock};
         .unwrap();
 
         assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))));
+    }
+
+    fn set(db: &mut Db, key: &'static [u8], value: &'static [u8]) {
+        db.set(Bytes::from_static(key), Bytes::from_static(value), None).unwrap();
+    }
+
+    #[test]
+    fn get_returns_a_number_exactly_as_it_was_set() {
+        let (_clock, mut db) = fixture();
+        for value in [&b"5"[..], b"-7", b"0", b"9223372036854775807", b"010", b"+5", b"-0", b"hello"] {
+            db.set(Bytes::from_static(b"k"), Bytes::copy_from_slice(value), None).unwrap();
+            assert_eq!(db.get(b"k"), Ok(Some(Bytes::copy_from_slice(value))), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn incr_on_a_missing_key_gives_one() {
+        let (_clock, mut db) = fixture();
+        assert_eq!(db.incr(Bytes::from_static(b"k")), Ok(1));
+        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"1"))));
+    }
+
+    #[test]
+    fn incr_adds_to_a_number_written_by_set() {
+        let (_clock, mut db) = fixture();
+        set(&mut db, b"k", b"5");
+        assert_eq!(db.incr(Bytes::from_static(b"k")), Ok(6));
+        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"6"))));
+    }
+
+    #[test]
+    fn incr_on_a_non_canonical_number_is_not_an_integer() {
+        let (_clock, mut db) = fixture();
+        for value in [&b"hello"[..], b"010", b"+5", b""] {
+            db.set(Bytes::from_static(b"k"), Bytes::copy_from_slice(value), None).unwrap();
+            assert_eq!(db.incr(Bytes::from_static(b"k")), Err(IncrError::NotAnInteger), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn incr_on_a_list_is_wrongtype() {
+        let (_clock, mut db) = fixture();
+        db.push(Bytes::from_static(b"l"), vec![Bytes::from_static(b"a")], End::Right).unwrap();
+        assert_eq!(db.incr(Bytes::from_static(b"l")), Err(IncrError::WrongType));
+    }
+
+    #[test]
+    fn incr_at_the_maximum_fails_and_leaves_the_value() {
+        let (_clock, mut db) = fixture();
+        set(&mut db, b"k", b"9223372036854775807");
+        assert_eq!(db.incr(Bytes::from_static(b"k")), Err(IncrError::Overflow));
+        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"9223372036854775807"))));
+    }
+
+    #[test]
+    fn incr_keeps_the_ttl() {
+        let (clock, mut db) = fixture();
+        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"5"), Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(db.incr(Bytes::from_static(b"k")), Ok(6));
+        clock.advance(Duration::from_millis(100));
+        assert_eq!(db.get(b"k"), Ok(None), "the deadline from SET still applies");
     }
 }

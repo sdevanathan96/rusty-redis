@@ -447,6 +447,41 @@ scenario "expiry option errors" \
 scenario "write path reaps an expired key" \
     "SET {K} v PX 50" "SLEEP 0.3" "RPUSH {K} a" "TYPE {K}" "LRANGE {K} 0 -1"
 
+section "incr"
+scenario "incr increments a value set by set" \
+    "SET {K} 5" "INCR {K}" "INCR {K}" "GET {K}" "TYPE {K}"
+
+scenario "incr on a missing key starts at one" \
+    "INCR {K}" "GET {K}" "TYPE {K}"
+
+# Only the canonical form is stored as an integer, so these stay strings.
+scenario "incr refuses a value that is not a canonical integer" \
+    "SET {K} hello" "INCR {K}" \
+    "SET {K} 010" "INCR {K}" "GET {K}" \
+    "SET {K} +5" "INCR {K}" "SET {K} -0" "INCR {K}" "SET {K} 1.5" "INCR {K}"
+
+scenario "incr at the maximum overflows and leaves the value" \
+    "SET {K} 9223372036854775807" "INCR {K}" "GET {K}" \
+    "SET {K} -9223372036854775808" "INCR {K}"
+
+scenario "incr on a list is wrongtype" \
+    "RPUSH {K} a" "INCR {K}" "LRANGE {K} 0 -1"
+
+scenario "incr arity" \
+    "INCR" "INCR {K} {K2}"
+
+# INCR changes the value in place, so the deadline from SET still applies.
+scenario "incr keeps the ttl" \
+    "SET {K} 5 PX 200" "INCR {K}" "GET {K}" "SLEEP 0.4" "GET {K}"
+
+scenario "incr on an expired key starts again with no ttl" \
+    "SET {K} 5 PX 100" "SLEEP 0.3" "INCR {K}" "SLEEP 0.2" "GET {K}"
+
+# run_seq cannot send an empty or space-led argument, so these go raw. The key
+# is fixed rather than {K}, which is safe because SET overwrites it each run.
+raw_scenario "incr on an empty string or a leading space" \
+    "b'*3\r\n\$3\r\nSET\r\n\$9\r\nincr:raw1\r\n\$0\r\n\r\n*2\r\n\$4\r\nINCR\r\n\$9\r\nincr:raw1\r\n*3\r\n\$3\r\nSET\r\n\$9\r\nincr:raw1\r\n\$2\r\n 1\r\n*2\r\n\$4\r\nINCR\r\n\$9\r\nincr:raw1\r\n'"
+
 section "lists"
 scenario "rpush accumulates" \
     "RPUSH {K} a" "RPUSH {K} b c" "RPUSH {K} d e f" "LLEN {K}" "LRANGE {K} 0 -1" \
@@ -821,6 +856,8 @@ conn_scenario "a served timed block sends nothing when its timeout passes" \
     "a send BLPOP|{K}|1" "sleep 0.2" \
     "b send RPUSH|{K}|v" "b read" "a read" \
     "sleep 1.0" "a read"
+
+section "transaction correctness"
 
 # Deliberate divergences from real Redis, documented rather than fixed:
 #   - no inline command support: Redis parses input not starting with '*' as a
