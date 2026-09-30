@@ -805,6 +805,10 @@ conn_scenario "a client that leaves during a timed block takes nothing" \
     "b send RPUSH|{K}|v" "b read" \
     "b send LRANGE|{K}|0|-1" "b read"
 
+conn_scenario "errors sent while parked wait for it" \
+    "a send BLPOP|{K}|0" "sleep 0.2" "a send GET" "a read" \
+    "b send RPUSH|{K}|v" "b read" "a read"
+
 # Deliberate divergences from real Redis, documented rather than fixed:
 #   - no inline command support: Redis parses input not starting with '*' as a
 #     space-separated inline command, and skips 2 bytes after a bulk payload

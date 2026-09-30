@@ -13,6 +13,7 @@ pub type ReplyTx = mpsc::UnboundedSender<Value>;
 pub enum Request {
     Run { cmd: Command, reply: ReplyTx, id: u64 },
     Unpark { id: u64, on_timeout: Value },
+    Gone { id: u64 },
 }
 
 struct Waiter {
@@ -25,31 +26,7 @@ struct Waiter {
 pub async fn keyspace_task(mut db: Db, mut rx: mpsc::Receiver<Request>) {
     let mut waiters: VecDeque<Waiter> = VecDeque::new();
     while let Some(req) = rx.recv().await {
-        match req {
-            Request::Run { cmd, reply, id } => {
-                let touched = cmd.meta().feeds;
-                match execute(cmd, &mut db) {
-                    Ok(Outcome::Reply(v)) => { let _ = reply.send(v); }
-                    Ok(Outcome::Block { keys, retry }) => {
-                        waiters.push_back(Waiter { id, reply, keys, retry });
-                    }
-                    Err(e) => { let _ = reply.send(Value::Error(e.to_resp())); }
-                }
-                // No round cap needed: every serve removes a waiter and none
-                // are added mid cascade, so this ends. A cap could only
-                // abandon parked clients.
-                let mut pending: VecDeque<Bytes> = touched.into();
-                while let Some(key) = pending.pop_front() {
-                    pending.extend(serve_waiters(&mut db, &mut waiters, &key));
-                }
-            }
-            Request::Unpark { id, on_timeout } => {
-                if let Some(i) = waiters.iter().position(|w| w.id == id) {
-                    let w = waiters.remove(i).unwrap();
-                    let _ = w.reply.send(on_timeout);
-                }
-            }
-        }
+        handle(req, &mut db, &mut waiters);
     }
 }
 
@@ -85,4 +62,76 @@ fn serve_waiters(
         }
     }
     fed
+}
+
+fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>) {
+    match req {
+        Request::Run { cmd, reply, id } => {
+            let touched = cmd.meta().feeds;
+            match execute(cmd, db) {
+                Ok(Outcome::Reply(v)) => { let _ = reply.send(v); }
+                Ok(Outcome::Block { keys, retry }) => {
+                    waiters.push_back(Waiter { id, reply, keys, retry });
+                }
+                Err(e) => { let _ = reply.send(Value::Error(e.to_resp())); }
+            }
+            // No round cap needed: every serve removes a waiter and none
+            // are added mid cascade, so this ends. A cap could only
+            // abandon parked clients.
+            let mut pending: VecDeque<Bytes> = touched.into();
+            while let Some(key) = pending.pop_front() {
+                pending.extend(serve_waiters(db, waiters, &key));
+            }
+        }
+        Request::Unpark { id, on_timeout } => {
+            if let Some(i) = waiters.iter().position(|w| w.id == id) {
+                let w = waiters.remove(i).unwrap();
+                let _ = w.reply.send(on_timeout);
+            }
+        }
+        Request::Gone { id } => {
+            if let Some(i) = waiters.iter().position(|w| w.id == id) {
+                waiters.remove(i);
+            }
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::command::test_support::cmd_ok;
+    use crate::db::TestClock;
+
+    fn blpop_forever(key: &str) -> Command {
+        let raw = format!("*3\r\n$5\r\nBLPOP\r\n${}\r\n{}\r\n$1\r\n0\r\n", key.len(), key);
+        cmd_ok(raw.as_bytes())
+    }
+
+    #[test]
+    fn gone_removes_the_waiter_at_once() {
+        let mut db = Db::with_clock(Arc::new(TestClock::new()));
+        let mut waiters = VecDeque::new();
+        let (reply, _rx) = mpsc::unbounded_channel();
+
+        handle(Request::Run { cmd: blpop_forever("k"), reply, id: 7 }, &mut db, &mut waiters);
+        assert_eq!(waiters.len(), 1, "BLPOP on an empty list parks");
+
+        handle(Request::Gone { id: 7 }, &mut db, &mut waiters);
+        assert!(waiters.is_empty(), "without waiting for a write to k");
+    }
+
+    #[test]
+    fn gone_for_an_unknown_id_changes_nothing() {
+        let mut db = Db::with_clock(Arc::new(TestClock::new()));
+        let mut waiters = VecDeque::new();
+        let (reply, _rx) = mpsc::unbounded_channel();
+
+        handle(Request::Run { cmd: blpop_forever("k"), reply, id: 7 }, &mut db, &mut waiters);
+        handle(Request::Gone { id: 8 }, &mut db, &mut waiters);
+        assert_eq!(waiters.len(), 1, "a stale or duplicate Gone is harmless");
+    }
 }
