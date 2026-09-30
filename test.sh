@@ -105,46 +105,49 @@ def frame(spec):
 def frames(spec):
     return b"".join(frame(c) for c in spec.split(";"))
 
+def drain(s, first, quiet):
+    """Everything s receives: waits up to `first` seconds for anything at all,
+    then stops after `quiet` seconds of silence or when the server closes. Only
+    `first` decides whether a missing or late reply is caught; `quiet` just
+    ends the wait once the answer is in."""
+    buf = b""
+    s.settimeout(max(first, 0.05))
+    try:
+        while True:
+            c = s.recv(4096)
+            if not c:
+                break
+            buf += c
+            s.settimeout(quiet)
+    except socket.timeout:
+        pass
+    return buf
+
 if setup:
     s = socket.create_connection(("127.0.0.1", port))
     s.sendall(frames(setup))
-    s.settimeout(1.0)
-    try:
-        while s.recv(4096):
-            pass
-    except socket.timeout:
-        pass
+    drain(s, 1.0, 0.2)
     s.close()
 
 blocked = socket.create_connection(("127.0.0.1", port))
 blocked.sendall(frame(blocking))
+deadline = time.time() + delay + 3.0
 
 def other():
     time.sleep(delay)
     s = socket.create_connection(("127.0.0.1", port))
     s.sendall(frames(meanwhile))
-    s.settimeout(1.0)
-    try:
-        while s.recv(4096):
-            pass
-    except socket.timeout:
-        pass
+    drain(s, 1.0, 0.2)
     s.close()
 
 t = threading.Thread(target=other)
 t.start()
 
-blocked.settimeout(delay + 3.0)
-buf = b""
-try:
-    while True:
-        c = blocked.recv(4096)
-        if not c:
-            break
-        buf += c
-except socket.timeout:
-    pass
+# Read only once the other connection is done, so anything its commands cause
+# on this one, such as an element wrongly handed over after a timeout, is
+# already buffered. The reply itself still gets until the old deadline.
 t.join()
+buf = drain(blocked, deadline - time.time(), 0.3)
 sys.stdout.write(repr(buf))
 PYEOF
 
@@ -152,7 +155,7 @@ PYEOF
 BLOCK2_PY=$(mktemp)
 # add to the cleanup trap: rm -f "$BLOCK2_PY"
 cat > "$BLOCK2_PY" <<'PYEOF'
-import socket, sys, threading, time
+import socket, sys, time
 
 port    = int(sys.argv[1])
 tag     = sys.argv[2]
@@ -173,44 +176,43 @@ def frame(spec):
 def frames(spec):
     return b"".join(frame(c) for c in spec.split(";"))
 
-def blocker(spec, out, idx):
-    s = socket.create_connection(("127.0.0.1", port))
-    s.sendall(frame(spec))
-    s.settimeout(delay + 3.0)
+def drain(s, first, quiet):
+    """Same as in BLOCK_PY: `first` catches a missing or late reply, `quiet`
+    only ends the wait once the answer is in."""
     buf = b""
+    s.settimeout(max(first, 0.05))
     try:
         while True:
             c = s.recv(4096)
             if not c:
                 break
             buf += c
+            s.settimeout(quiet)
     except socket.timeout:
         pass
-    out[idx] = buf
-    s.close()
+    return buf
 
-out = [b"", b""]
-t1 = threading.Thread(target=blocker, args=(b1, out, 0))
-t1.start()
+def park(spec):
+    s = socket.create_connection(("127.0.0.1", port))
+    s.sendall(frame(spec))
+    return s, time.time() + delay + 3.0
+
+s1, d1 = park(b1)
 time.sleep(0.3)                 # b1 must park before b2 arrives, for FIFO order
-t2 = threading.Thread(target=blocker, args=(b2, out, 1))
-t2.start()
+s2, d2 = park(b2)
 time.sleep(0.3)
 
 time.sleep(delay)
 s = socket.create_connection(("127.0.0.1", port))
 s.sendall(frames(trigger))
-s.settimeout(1.0)
-try:
-    while s.recv(4096):
-        pass
-except socket.timeout:
-    pass
+drain(s, 1.0, 0.2)
 s.close()
 
-t1.join()
-t2.join()
-sys.stdout.write("first=%r second=%r" % (out[0], out[1]))
+# Replies wait in each socket's buffer, so reading them after the trigger loses
+# nothing, and each still gets until its own deadline.
+first = drain(s1, d1 - time.time(), 0.3)
+second = drain(s2, d2 - time.time(), 0.3)
+sys.stdout.write("first=%r second=%r" % (first, second))
 PYEOF
 
 # Driver for scripted multi-connection scenarios. Each argument after the tag
@@ -249,7 +251,8 @@ for step in steps:
             conns[name] = socket.create_connection(("127.0.0.1", port))
         conns[name].sendall(frames(words[2]))
     elif action == "read":
-        # Whatever arrives before 0.5s of quiet, so b'' means nothing did.
+        # Waits 0.5s for anything, so b'' means nothing arrived in that time,
+        # then stops after 0.2s of quiet once something has.
         s = conns[name]
         s.settimeout(0.5)
         buf = b""
@@ -259,6 +262,7 @@ for step in steps:
                 if not c:
                     break
                 buf += c
+                s.settimeout(0.2)
         except socket.timeout:
             pass
         print("%s: %r" % (name, buf))
@@ -354,6 +358,7 @@ try:
         c = s.recv(4096)
         if not c: break
         buf += c
+        s.settimeout(0.3)   # the reply is in; only wait out a short quiet
 except socket.timeout:
     pass
 sys.stdout.write(repr(buf))
@@ -808,6 +813,14 @@ conn_scenario "a client that leaves during a timed block takes nothing" \
 conn_scenario "errors sent while parked wait for it" \
     "a send BLPOP|{K}|0" "sleep 0.2" "a send GET" "a read" \
     "b send RPUSH|{K}|v" "b read" "a read"
+
+# The drivers stop listening shortly after a scenario's last event, so this is
+# the one place that checks nothing arrives later on its own: a timed block
+# that was served must not also time out.
+conn_scenario "a served timed block sends nothing when its timeout passes" \
+    "a send BLPOP|{K}|1" "sleep 0.2" \
+    "b send RPUSH|{K}|v" "b read" "a read" \
+    "sleep 1.0" "a read"
 
 # Deliberate divergences from real Redis, documented rather than fixed:
 #   - no inline command support: Redis parses input not starting with '*' as a
