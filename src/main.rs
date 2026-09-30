@@ -14,6 +14,7 @@ use tokio::sync::{mpsc};
 use tokio::time::sleep;
 use std::sync::atomic::{AtomicU64, Ordering};
 use rusty_redis::command::Command;
+use rusty_redis::config;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -23,8 +24,19 @@ fn next_id() -> u64 {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:6379").await?;
-    println!("listening on 127.0.0.1:6379");
+    // Matched here rather than returned: an Err out of main is printed with
+    // Debug, and a bad flag deserves one plain line and exit code 1, as in Redis.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let config = match config::parse(&args) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("configuration error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let port = config.net.port;
+    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    println!("listening on 127.0.0.1:{port}");
 
     let db = Db::with_clock(Arc::new(SystemClock));
     let (tx, rx) = mpsc::channel::<Request>(64);
