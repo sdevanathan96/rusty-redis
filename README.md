@@ -140,6 +140,7 @@ node_client -->|"sends requests"| node_server
 node_server -->|"parses frames"| node_resp
 node_server -->|"parses commands"| node_command
 node_server -->|"submits requests"| node_keyspace
+node_server -->|"reads flags"| node_config
 node_keyspace -->|"executes commands"| node_command
 node_command -->|"dispatches"| node_generic
 node_command -->|"dispatches"| node_strings
