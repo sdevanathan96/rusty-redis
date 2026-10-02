@@ -37,6 +37,20 @@ cargo test          # unit tests
 It needs `redis-cli`, `redis-server`, `nc` and `python3`. Run `./test.sh list`
 to filter by scenario name.
 
+## Benchmarking
+
+```sh
+bench/bench.py                   # throughput and latency against redis-server
+bench/bench.py --memory 200000   # also bytes per key, list element, stream entry
+```
+
+`bench.py` runs `redis-benchmark` with identical settings against this server
+and a real `redis-server`, each in a fresh process per repeat, and reports the
+median as a table of ops/s, p50 and p99 latency, and the ratio between them.
+Any error reply invalidates the run, since `redis-benchmark` does not check
+replies. Each run writes a report to `bench/results/` with the commit, versions
+and machine. It needs `redis-server`, `redis-benchmark` and `python3`.
+
 ## Fuzzing
 
 The RESP parser has a `cargo-fuzz` target:
