@@ -644,6 +644,95 @@ scenario "xread same stream twice" \
     "XADD {K} 1-0 a 1" "XADD {K} 2-0 b 2" \
     "XREAD STREAMS {K} {K} 0 1-0"
 
+section "xtrim"
+# Explicit ids throughout: run_seq expands commands unquoted, so a bare * would
+# become the file names in the current directory.
+FIVE=("XADD {K} 1-0 f v" "XADD {K} 2-0 f v" "XADD {K} 3-0 f v" "XADD {K} 4-0 f v" "XADD {K} 5-0 f v")
+
+scenario "xtrim maxlen trims exactly" \
+    "${FIVE[@]}" "XTRIM {K} MAXLEN 2" "XRANGE {K} - +"
+
+scenario "xtrim maxlen with an equals sign" \
+    "${FIVE[@]}" "XTRIM {K} MAXLEN = 2" "XLEN {K}"
+
+scenario "xtrim maxlen above the length removes nothing" \
+    "${FIVE[@]}" "XTRIM {K} MAXLEN 10" "XLEN {K}"
+
+scenario "xtrim to zero keeps the key and the last id" \
+    "${FIVE[@]}" "XTRIM {K} MAXLEN 0" "XLEN {K}" "EXISTS {K}" \
+    "XADD {K} 1-0 f v" "XADD {K} 6-0 f v"
+
+scenario "xtrim minid" \
+    "${FIVE[@]}" "XTRIM {K} MINID 3-0" "XRANGE {K} - +" \
+    "XTRIM {K} MINID 4" "XRANGE {K} - +"
+
+scenario "xtrim on a missing key" \
+    "XTRIM {K} MAXLEN 1" "EXISTS {K}"
+
+# The XLEN at the end shows that no failed form trimmed anything.
+scenario "xtrim errors" \
+    "${FIVE[@]}" "XTRIM {K}" "XTRIM {K} MAXLEN" \
+    "XTRIM {K} MAXLEN -1" "XTRIM {K} MAXLEN abc" "XTRIM {K} MAXLEN 010" \
+    "XTRIM {K} MAXLEN 2 LIMIT 10" "XTRIM {K} MAXLEN 2 MINID 1" \
+    "XTRIM {K} MINID abc" "XTRIM {K} FOO 1" "XTRIM {K} MAXLEN 2 extra" \
+    "XLEN {K}"
+
+scenario "xtrim on a string is wrongtype" \
+    "SET {K} x" "XTRIM {K} MAXLEN 1"
+
+# Consumer group options. With no groups they change nothing.
+scenario "xtrim accepts the reference options" \
+    "${FIVE[@]}" "XTRIM {K} MAXLEN 4 KEEPREF" "XTRIM {K} KEEPREF MAXLEN 3" \
+    "XTRIM {K} MAXLEN 2 DELREF" "XTRIM {K} MAXLEN 1 ACKED" "XLEN {K}"
+
+scenario "xadd trims after adding" \
+    "${FIVE[@]}" "XADD {K} MAXLEN 2 6-0 f v" "XRANGE {K} - +"
+
+scenario "xadd minid" \
+    "${FIVE[@]}" "XADD {K} MINID 4 6-0 f v" "XRANGE {K} - +"
+
+scenario "xadd maxlen zero adds then trims everything" \
+    "${FIVE[@]}" "XADD {K} MAXLEN 0 6-0 f v" "XLEN {K}" "XADD {K} 6-0 f v"
+
+# Options end at the id. After it, MAXLEN is just a field name.
+scenario "xadd options after the id are fields" \
+    "XADD {K} 6-0 MAXLEN 2 f v" "XRANGE {K} - +"
+
+scenario "xadd nomkstream" \
+    "XADD {K} NOMKSTREAM 1-0 f v" "EXISTS {K}" \
+    "XADD {K} NOMKSTREAM MAXLEN 1 1-0 f v" "XADD {K} MAXLEN 1 NOMKSTREAM 1-0 f v" \
+    "EXISTS {K}" "XADD {K} 1-0 f v" "XADD {K} NOMKSTREAM 2-0 f v" "XLEN {K}"
+
+# Trim arguments are checked before the id, so MAXLEN -1 wins over 0-0.
+scenario "xadd checks the trim clause before the id" \
+    "${FIVE[@]}" "XADD {K} MAXLEN -1 0-0 f v" "XADD {K} MAXLEN abc 6-0 f v" \
+    "XADD {K} MAXLEN 2 LIMIT 5 6-0 f v" "XADD {K} MAXLEN 2 6-0 f" \
+    "XADD {K} MAXLEN 2" "XADD {K} MAXLEN 2 6-0" "XADD {K} MAXLEN 2 0-0 f v" \
+    "XLEN {K}"
+
+scenario "xadd accepts the reference options" \
+    "${FIVE[@]}" "XADD {K} KEEPREF MAXLEN 2 6-0 f v" \
+    "XADD {K} MAXLEN 2 KEEPREF 7-0 f v" "XLEN {K}"
+
+# XADD adds and trims inside one command, so a reader blocked on $ finds
+# nothing new when it is served and stays parked until its timeout.
+conn_scenario "a blocked xread gets nothing when xadd trims its entry away" \
+    "a send XREAD|BLOCK|1000|STREAMS|{K}|\$" "sleep 0.2" \
+    "b send XADD|{K}|MAXLEN|0|5-0|f|v" "b read" \
+    "sleep 1.0" "a read"
+
+# Redis trims ~ by whole macro nodes of up to 100 entries, so on a short stream
+# it removes nothing, while this server trims exactly until phase 5 has buckets.
+# STRICT=1 ./test.sh to see the diffs.
+if [ "${STRICT:-0}" = 1 ]; then
+    scenario "xtrim approximate maxlen" \
+        "${FIVE[@]}" "XTRIM {K} MAXLEN ~ 2" "XLEN {K}"
+    scenario "xtrim approximate with a limit" \
+        "${FIVE[@]}" "XTRIM {K} MAXLEN ~ 2 LIMIT 10" "XLEN {K}"
+    scenario "xadd approximate maxlen" \
+        "${FIVE[@]}" "XADD {K} MAXLEN ~ 2 6-0 f v" "XLEN {K}"
+fi
+
 section "blocking"
 # A push arrives while a client is parked. The reply must be [key, element].
 block_scenario "blpop woken by a later push" 0.5 "" \

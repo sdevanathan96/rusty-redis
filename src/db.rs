@@ -7,7 +7,7 @@ use std::u64;
 use bytes::Bytes;
 
 use crate::db::stream::{Stream};
-pub use crate::db::stream::{EntryId, XaddError, IdSpec, ReadFrom, StreamEntry};
+pub use crate::db::stream::{EntryId, XaddError, IdSpec, ReadFrom, StreamEntry, Trim, TrimBy, Mode, RefPolicy};
 use crate::int::strict_i64;
 
 #[cfg(test)]
@@ -348,13 +348,24 @@ impl Db {
     }
 
 
-    pub fn xadd(&mut self, key: Bytes, spec: IdSpec, fields: Vec<(Bytes, Bytes)>) -> Result<EntryId, XaddError> {
-        // reap_if_expired
-        // get or create Data::Stream
-        // resolve IdSpec::Auto using self.clock
-        // delegate to Stream::append or append_auto_seq
+    /// Appends, then trims, in that order, so `MAXLEN 0` removes the entry just
+    /// added. `None` means NOMKSTREAM found no key, and nothing was created. A
+    /// failed append returns before anything is trimmed.
+    pub fn xadd(
+        &mut self,
+        key: Bytes,
+        spec: IdSpec,
+        fields: Vec<(Bytes, Bytes)>,
+        trim: Option<Trim>,
+        nomkstream: bool,
+    ) -> Result<Option<EntryId>, XaddError> {
         self.reap(&key);
         let now_ms = self.clock.now_ms();
+
+        // Before or_insert_with, which would create the key.
+        if nomkstream && !self.map.contains_key(&key) {
+            return Ok(None);
+        }
 
         let entry = self.map.entry(key).or_insert_with(|| Entry {
             data: Data::Stream(Stream::default()),
@@ -366,11 +377,15 @@ impl Db {
             _ => return Err(XaddError::WrongType),
         };
 
-        match spec {
+        let entry_id = match spec {
             IdSpec::Explicit(id) => stream.append(id, fields),
             IdSpec::AutoSeq(ms) => stream.append_auto_seq(ms, fields),
             IdSpec::Auto => stream.append_auto(now_ms, fields),
+        }?;
+        if let Some(t) = &trim {
+            stream.trim(t);
         }
+        Ok(Some(entry_id))
     }
 
     pub fn xlen(&mut self, key: &[u8]) -> Result<usize, WrongType> {
@@ -421,6 +436,17 @@ impl Db {
             n+=stream.delete(id);
         }
         Ok(n)
+    }
+
+    /// A missing key is 0 and stays missing. An emptied stream keeps its key
+    /// and its last id, as in Redis.
+    pub fn xtrim(&mut self, key: &[u8], trim: &Trim) -> Result<usize, WrongType> {
+        self.reap(key);
+        let stream = match self.data_mut(key) {
+            None => return Ok(0),
+            Some(d) => d.as_stream_mut()?,
+        };
+        Ok(stream.trim(trim))
     }
 }
 

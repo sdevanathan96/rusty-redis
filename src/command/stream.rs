@@ -1,6 +1,90 @@
 use bytes::Bytes;
 
-use crate::{command::{Blocking, Command, CommandError, Outcome, lenient_u64, parse_block, parse_i64}, db::{Db, EntryId, IdSpec, ReadFrom, StreamEntry}, resp::Value};
+use crate::{command::{Blocking, Command, CommandError, Outcome, lenient_u64, parse_block, parse_i64}, db::{Db, EntryId, IdSpec, Mode, ReadFrom, RefPolicy, StreamEntry, Trim, TrimBy}, resp::Value};
+
+/// The trim options XADD and XTRIM share, collected one token at a time.
+#[derive(Default)]
+struct TrimOptions {
+    by: Option<TrimBy>,
+    approx: bool,
+    limit: Option<usize>,
+    refs: Option<RefPolicy>,
+}
+
+impl TrimOptions {
+    /// If `args[i]` starts a trim option, consume it and return how many
+    /// tokens it used. `Ok(None)` means `args[i]` is not a trim option.
+    fn take(&mut self, args: &[Bytes], i: usize) -> Result<Option<usize>, CommandError> {
+        let more = args.len() - i - 1; // tokens after this one
+        let upper = args[i].to_ascii_uppercase();
+        match upper.as_slice() {
+            b"MAXLEN" | b"MINID" if more > 0 => {
+                if self.by.is_some() {
+                    return Err(CommandError::MaxlenWithMinid);
+                }
+                // `=` or `~` counts only if another token follows it.
+                let mut used = 1;
+                if more >= 2 && (args[i + 1] == "~" || args[i + 1] == "=") {
+                    self.approx = args[i + 1] == "~";
+                    used += 1;
+                }
+                let value = &args[i + used];
+                self.by = Some(if upper == b"MAXLEN" {
+                    let n = parse_i64(value)?;
+                    if n < 0 {
+                        return Err(CommandError::MaxlenNegative);
+                    }
+                    TrimBy::MaxLen(n as usize)
+                } else {
+                    TrimBy::MinId(parse_bound(value, 0)?)
+                });
+                Ok(Some(used + 1))
+            }
+            b"LIMIT" if more > 0 => {
+                let n = parse_i64(&args[i + 1])?;
+                if n < 0 {
+                    return Err(CommandError::LimitNegative);
+                }
+                self.limit = Some(n as usize);
+                Ok(Some(2))
+            },
+            // Consumer group options. Only one may appear, anywhere among the
+            // trim options.
+            b"KEEPREF" | b"DELREF" | b"ACKED" => {
+                if self.refs.is_some() {
+                    return Err(CommandError::Syntax);
+                }
+                self.refs = Some(match upper.as_slice() {
+                    b"KEEPREF" => RefPolicy::KeepRef,
+                    b"DELREF" => RefPolicy::DelRef,
+                    _ => RefPolicy::Acked,
+                });
+                Ok(Some(1))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Check the combination once every option has been read. `None` means
+    /// no MAXLEN or MINID was given.
+    fn finish(self) -> Result<Option<Trim>, CommandError> {
+        let Some(by) = self.by else {
+            // No MAXLEN or MINID. A LIMIT on its own has nothing to limit.
+            if self.limit.is_some() {
+                return Err(CommandError::LimitWithoutStrategy);
+            }
+            return Ok(None);
+        };
+        let mode = if self.approx {
+            Mode::Approx { limit: self.limit.filter(|&n| n != 0) } // LIMIT 0 means no limit
+        } else if self.limit.is_some() {
+            return Err(CommandError::LimitWithoutApprox);
+        } else {
+            Mode::Exact
+        };
+        Ok(Some(Trim { by, mode, refs: self.refs.unwrap_or(RefPolicy::KeepRef) }))
+    }
+}
 
 fn parse_xadd_id(raw: &[u8]) -> Result<IdSpec, CommandError> {
     if raw == b"*" {
@@ -107,7 +191,7 @@ pub(super) fn try_parse(
         b"XRANGE" => xrange_command(rest, name),
         b"XREAD" => xread_command(rest, name),
         b"XDEL" => xdel_command(rest, name),
-        // b"XTRIM" => xtrim_command(rest, name),   // not written yet
+        b"XTRIM" => xtrim_command(rest, name),
         _ => return None,          // not a Stream command
     })
 }
@@ -117,17 +201,46 @@ fn xadd_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     if rest.len() < 4 {
         return Err(CommandError::WrongArity(name.clone()));
     }
-    match rest {
-        [key, id, fields @ ..] => {
-            let id = parse_xadd_id(id)?;
-            let fields = parse_fields(fields, name)?;
-            if let IdSpec::Explicit(EntryId { ms: 0, seq: 0 }) = id {
-                return Err(CommandError::XaddIdZero);
-            }
-            Ok(Command::XAdd { key: key.clone(), id, fields })
-        },
-        _ => return Err(CommandError::WrongArity(name.clone())),
+    let mut opts = TrimOptions::default();
+    let mut nomkstream = false;
+    let mut i = 1;
+    loop {
+        let Some(token) = rest.get(i) else {
+            return Err(CommandError::WrongArity(name.clone()));
+        };
+        if token.eq_ignore_ascii_case(b"NOMKSTREAM") {
+            nomkstream = true;
+            i += 1;
+            continue;
+        }
+        match opts.take(rest, i)? {
+            Some(used) => i += used,
+            None => break, // rest[i] is the ID
+        }
     }
+    let trim = opts.finish()?; // before the ID, so trim errors win, as in Redis
+    let id = parse_xadd_id(&rest[i])?;
+    let fields = parse_fields(&rest[i + 1..], name)?;
+    if let IdSpec::Explicit(EntryId { ms: 0, seq: 0 }) = id {
+        return Err(CommandError::XaddIdZero);
+    }
+    Ok(Command::XAdd { key: rest[0].clone(), id, fields, trim, nomkstream })
+}
+
+fn xtrim_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
+    if rest.len() < 3 { // key, MAXLEN|MINID, threshold at the very least
+        return Err(CommandError::WrongArity(name.clone()));
+    }
+    let mut opts = TrimOptions::default();
+    let mut i = 1;
+    while i < rest.len() {
+        match opts.take(rest, i)? {
+            Some(used) => i += used,
+            None => return Err(CommandError::Syntax), // a word that isn't an option
+        }
+    }
+    let trim = opts.finish()?.ok_or(CommandError::Syntax)?; // XTRIM must have a strategy
+    Ok(Command::XTrim { key: rest[0].clone(), trim })
 }
 
 fn xlen_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
@@ -218,8 +331,22 @@ fn xdel_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     }
 }
 
-pub(super) fn xadd(key: Bytes, id: IdSpec, fields: Vec<(Bytes, Bytes)>, db: &mut Db) -> Result<Outcome, CommandError> {
-    Ok(Outcome::Reply(Value::BulkString(db.xadd(key, id, fields)?.to_bytes())))
+pub(super) fn xadd(
+    key: Bytes,
+    id: IdSpec,
+    fields: Vec<(Bytes, Bytes)>,
+    trim: Option<Trim>,
+    nomkstream: bool,
+    db: &mut Db,
+) -> Result<Outcome, CommandError> {
+    Ok(Outcome::Reply(match db.xadd(key, id, fields, trim, nomkstream)? {
+        Some(id) => Value::BulkString(id.to_bytes()),
+        None => Value::NullBulkString, // NOMKSTREAM on a missing key: $-1, as Redis sends
+    }))
+}
+
+pub(super) fn xtrim(key: &[u8], trim: &Trim, db: &mut Db) -> Result<Outcome, CommandError> {
+    Ok(Outcome::Reply(Value::Integer(db.xtrim(key, trim)? as i64)))
 }
 
 pub(super) fn xlen(key: &[u8], db: &mut Db) -> Result<Outcome, CommandError> {

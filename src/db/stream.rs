@@ -12,7 +12,36 @@ impl std::fmt::Display for EntryId {
         write!(f, "{}-{}", self.ms, self.seq)
     }
 }
-// pub type StreamEntry = (EntryId, Vec<(Bytes, Bytes)>);
+/// What a trim keeps: the newest `MaxLen` entries, or those at or above `MinId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrimBy {
+    MaxLen(usize),
+    MinId(EntryId),
+}
+
+/// A parsed MAXLEN or MINID clause, shared by XADD and XTRIM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Trim {
+    pub by: TrimBy,
+    pub mode: Mode,
+    #[allow(dead_code)] // consumer groups will read this; not built yet
+    pub refs: RefPolicy,
+}
+
+/// `Exact` for `=` or no marker, `Approx` for `~`. A LIMIT exists only with
+/// `~`, so the type cannot hold the combination Redis rejects. `None` is no
+/// limit, which is also what `LIMIT 0` means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Mode {
+    Exact,
+    Approx { limit: Option<usize> },
+}
+
+/// What trimming does to consumer group references. Parsed and kept for when
+/// groups exist; with none, all three behave the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefPolicy { KeepRef, DelRef, Acked }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamEntry {
     pub id: EntryId,
@@ -134,6 +163,22 @@ impl Stream {
         }
         0
     }
+    /// Removes entries from the front and returns how many. `last_id` is left
+    /// alone, so an id at or below it stays rejected after a full trim.
+    pub(super) fn trim(&mut self, trim: &Trim) -> usize {
+        let count = match trim.by {
+            TrimBy::MaxLen(max_len) => self.entries.len().saturating_sub(max_len),
+            TrimBy::MinId(min_id) => self.entries.partition_point(|e| e.id < min_id),
+        };
+        // `~` trims exactly here, which keeps Redis's only promise that at
+        // least the threshold remains. Its LIMIT caps the removals.
+        let count = match trim.mode {
+            Mode::Exact | Mode::Approx { limit: None } => count,
+            Mode::Approx { limit: Some(limit) } => count.min(limit),
+        };
+        self.entries.drain(..count);
+        count
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -141,4 +186,92 @@ pub enum IdSpec {
     Explicit(EntryId),
     AutoSeq(u64),      // ms given, seq to be generated
     Auto,              // both generated
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    /// Entries 1-0 through 5-0.
+    fn five() -> Stream {
+        let mut s = Stream::default();
+        for ms in 1..=5 {
+            s.append(EntryId { ms, seq: 0 }, vec![]).unwrap();
+        }
+        s
+    }
+
+    fn trim(by: TrimBy, mode: Mode) -> Trim {
+        Trim { by, mode, refs: RefPolicy::KeepRef }
+    }
+
+    fn id(ms: u64, seq: u64) -> EntryId {
+        EntryId { ms, seq }
+    }
+
+    /// The milliseconds of every entry left, oldest first.
+    fn left(s: &Stream) -> Vec<u64> {
+        s.range(id(0, 0), id(u64::MAX, u64::MAX), None).iter().map(|e| e.id.ms).collect()
+    }
+
+    #[test]
+    fn maxlen_keeps_the_newest() {
+        let mut s = five();
+        assert_eq!(s.trim(&trim(TrimBy::MaxLen(2), Mode::Exact)), 3);
+        assert_eq!(left(&s), [4, 5]);
+    }
+
+    #[test]
+    fn maxlen_above_the_length_removes_nothing() {
+        let mut s = five();
+        assert_eq!(s.trim(&trim(TrimBy::MaxLen(10), Mode::Exact)), 0, "saturating, not an underflow");
+        assert_eq!(s.len(), 5);
+    }
+
+    #[test]
+    fn maxlen_zero_empties_the_stream() {
+        let mut s = five();
+        assert_eq!(s.trim(&trim(TrimBy::MaxLen(0), Mode::Exact)), 5);
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn minid_keeps_the_id_itself() {
+        // Redis's MINID 3-0 on 1-0..5-0 removes 2. A `<=` would remove 3.
+        let mut s = five();
+        assert_eq!(s.trim(&trim(TrimBy::MinId(id(3, 0)), Mode::Exact)), 2);
+        assert_eq!(left(&s), [3, 4, 5]);
+    }
+
+    #[test]
+    fn minid_between_two_entries() {
+        let mut s = five();
+        assert_eq!(s.trim(&trim(TrimBy::MinId(id(3, 5)), Mode::Exact)), 3);
+        assert_eq!(left(&s), [4, 5]);
+    }
+
+    #[test]
+    fn approx_trims_exactly_here() {
+        // Redis would remove nothing from a stream this short.
+        let mut s = five();
+        assert_eq!(s.trim(&trim(TrimBy::MaxLen(2), Mode::Approx { limit: None })), 3);
+        assert_eq!(left(&s), [4, 5]);
+    }
+
+    #[test]
+    fn limit_caps_the_removals() {
+        let mut s = five();
+        assert_eq!(s.trim(&trim(TrimBy::MaxLen(0), Mode::Approx { limit: Some(2) })), 2);
+        assert_eq!(left(&s), [3, 4, 5], "the oldest two go first");
+    }
+
+    #[test]
+    fn a_full_trim_keeps_the_last_id() {
+        let mut s = five();
+        s.trim(&trim(TrimBy::MaxLen(0), Mode::Exact));
+        assert!(matches!(s.append(id(1, 0), vec![]), Err(XaddError::IdTooSmall)));
+        assert!(matches!(s.append_auto_seq(5, vec![]), Ok(EntryId { ms: 5, seq: 1 })),
+            "auto sequence continues from 5-0, not from an empty stream");
+        assert!(s.append(id(6, 0), vec![]).is_ok());
+    }
 }

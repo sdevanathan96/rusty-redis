@@ -10,9 +10,11 @@ A Redis-compatible server written in Rust on top of Tokio. It speaks RESP, so
 | Generic | `PING`, `ECHO`, `DEL`, `EXISTS`, `TYPE`                         |
 | Strings | `GET`, `SET` (with `EX` / `PX` expiry), `INCR`                  |
 | Lists   | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LMOVE`, `BLPOP`, `BRPOP`, `BLMOVE` |
-| Streams | `XADD`, `XRANGE`, `XREAD` (with `COUNT` / `BLOCK`), `XLEN`, `XDEL` |
+| Streams | `XADD` (with `NOMKSTREAM` and `MAXLEN` / `MINID` trimming), `XRANGE`, `XREAD` (with `COUNT` / `BLOCK`), `XLEN`, `XDEL`, `XTRIM` |
 
-Error messages follow real Redis byte for byte, including its quirks.
+Error messages follow real Redis byte for byte, including its quirks. One
+known difference: approximate trimming (`MAXLEN ~ n`) trims exactly to `n`,
+while Redis removes only whole internal nodes and may keep more.
 
 ## Running
 

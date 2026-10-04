@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::db::{Db, End, EntryId, IdSpec, IncrError, ReadFrom, WrongType, XaddError};
+use crate::db::{Db, End, EntryId, IdSpec, IncrError, ReadFrom, WrongType, XaddError, Trim};
 use crate::int::strict_i64;
 use crate::resp::Value;
 use std::time::Duration;
@@ -35,11 +35,12 @@ pub enum Command {
     LMove { src: Bytes, dst: Bytes, from: End, to: End },
     BPop { keys: Vec<Bytes>, timeout: Option<Duration>, from: End },
     BLMove { src: Bytes, dst: Bytes, from: End, to: End , timeout: Option<Duration> },
-    XAdd { key: Bytes, id: IdSpec, fields: Vec<(Bytes, Bytes)> },
+    XAdd { key: Bytes, id: IdSpec, fields: Vec<(Bytes, Bytes)>, trim: Option<Trim>, nomkstream: bool },
     XLen { key: Bytes },
     XRange {key: Bytes, start: EntryId, stop: EntryId, count: Option<i64> },
     XRead {count: Option<i64>, timeout: Blocking, streams: Vec<(Bytes, ReadFrom)>},
     XDel { key: Bytes, ids: Vec<EntryId>},
+    XTrim { key: Bytes, trim: Trim },
     Incr { key: Bytes },
     Unknown { name: Bytes, args: Vec<Bytes> },
 }
@@ -64,6 +65,11 @@ pub enum CommandError {
     XaddIdTooSmall,
     UnbalancedXread,
     Overflow,
+    LimitWithoutApprox,
+    MaxlenNegative,
+    MaxlenWithMinid,
+    LimitNegative,
+    LimitWithoutStrategy,
 }
 
 impl From<WrongType> for CommandError {
@@ -103,71 +109,6 @@ pub struct Meta {
     }
 
 impl Command {
-    /// Lists this command adds elements to. A parked waiter on one of these
-    /// keys may become satisfiable after this command runs.
-    /// ADD AN ARM when you add a command that pushes to a list.
-    // pub fn feeds(&self) -> Vec<Bytes> {
-    //     match self {
-    //         Command::Push { key, .. } => vec![key.clone()],
-    //         Command::LMove { dst, .. } => vec![dst.clone()],
-    //         Command::BLMove { dst, .. } => vec![dst.clone()],
-    //         Command::XAdd { key, .. } => vec![key.clone()],
-    //         Command::Ping(_)
-    //         | Command::Echo(_)
-    //         | Command::Get { .. }
-    //         | Command::Set { .. }
-    //         | Command::Type { .. }
-    //         | Command::Del { .. }
-    //         | Command::Exists { .. }
-    //         | Command::Pop { .. }
-    //         | Command::LLen { .. }
-    //         | Command::LRange { .. }
-    //         | Command::BPop { .. }
-    //         | Command::XLen { .. }
-    //         | Command::XRange { .. }
-    //         | Command::XRead { .. }
-    //         | Command::XDel { .. }
-    //         | Command::Unknown { .. } => vec![],
-    //     }
-    // }
-
-    // /// Whether this command can park, and what to send if it times out.
-    // /// ADD AN ARM when you add a blocking command.
-    // pub fn blocking(&self) -> Option<BlockSpec> {
-    //     match self {
-    //         Command::BPop { timeout, .. } => Some(BlockSpec {
-    //             timeout: *timeout,
-    //             on_timeout: Value::NullArray,
-    //         }),
-    //         Command::BLMove { timeout, .. } => Some(BlockSpec {
-    //             timeout: *timeout,
-    //             on_timeout: Value::NullArray,
-    //         }),
-    //         Command::XRead { timeout, .. } => match timeout {
-    //             Blocking::No => None,
-    //             Blocking::Forever => Some(BlockSpec { timeout: None, on_timeout: Value::NullArray }),
-    //             Blocking::For(d) => Some(BlockSpec { timeout: Some(*d), on_timeout: Value::NullArray }),
-    //         },
-    //         Command::Ping(_)
-    //         | Command::Echo(_)
-    //         | Command::Get { .. }
-    //         | Command::Set { .. }
-    //         | Command::Type { .. }
-    //         | Command::Del { .. }
-    //         | Command::Exists { .. }
-    //         | Command::Push { .. }
-    //         | Command::Pop { .. }
-    //         | Command::LLen { .. }
-    //         | Command::LRange { .. }
-    //         | Command::LMove { .. }
-    //         | Command::XAdd { .. }
-    //         | Command::XLen { .. }
-    //         | Command::XRange { .. }
-    //         | Command::XDel { .. }
-    //         | Command::Unknown { .. } => None,
-    //     }
-    // }
-
     pub fn meta(&self) -> Meta {
         match self {
             Command::Push { key, .. } => Meta { feeds: vec![key.clone()], blocks: None },
@@ -202,6 +143,7 @@ impl Command {
             | Command::XLen { .. }
             | Command::XRange { .. }
             | Command::XDel { .. }
+            | Command::XTrim { .. }
             | Command::Incr { .. }
             | Command::Unknown { .. } => Meta { feeds: vec![], blocks: None },
         }
@@ -242,8 +184,6 @@ impl CommandError {
                 }
             }
             CommandError::NegativeTimeout => { Bytes::from_static(b"ERR timeout is negative") }
-            // VERIFY this string on 6380 with `BLPOP k 1e300`. It is a
-            // third distinct message, not a reuse of TimeoutError.
             CommandError::TimeoutOutOfRange => { Bytes::from_static(b"ERR timeout is out of range") }
             CommandError::TimeoutError => { Bytes::from_static(b"ERR timeout is not a float or out of range") }
             CommandError::MTimeoutError => { Bytes::from_static(b"ERR timeout is not an integer or out of range") }
@@ -256,6 +196,11 @@ impl CommandError {
             CommandError::UnbalancedXread => 
                 Bytes::from_static(b"ERR Unbalanced 'xread' list of streams: for each stream key an ID, '+', or '$' must be specified."),
             CommandError::Overflow => Bytes::from_static(b"ERR increment or decrement would overflow"),
+            CommandError::LimitWithoutApprox => Bytes::from_static(b"ERR syntax error, LIMIT cannot be used without the special ~ option"),
+            CommandError::MaxlenNegative => Bytes::from_static(b"ERR The MAXLEN argument must be >= 0."),
+            CommandError::MaxlenWithMinid => Bytes::from_static(b"ERR syntax error, MAXLEN and MINID options at the same time are not compatible"),
+            CommandError::LimitWithoutStrategy => Bytes::from_static(b"ERR syntax error, LIMIT cannot be used without specifying a trimming strategy"),
+            CommandError::LimitNegative => Bytes::from_static(b"ERR The LIMIT argument must be >= 0."),
         }
     }
 }
@@ -455,23 +400,16 @@ pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError> {
         Command::LMove { src, dst, from, to } => Ok(Outcome::Reply(list::lmove(&src, dst, from, to, db)?)),
         Command::BPop { keys, timeout, from } => list::bpop(keys, from, timeout, db),
         Command::BLMove { src, dst, from, to, timeout } => list::blmove(src, dst, from, to, timeout, db),
-        Command::XAdd { key, id, fields } => stream::xadd(key, id, fields, db),
+        Command::XAdd { key, id, fields, trim, nomkstream } => stream::xadd(key, id, fields, trim, nomkstream, db),
         Command::XLen { key } => stream::xlen(&key, db),
         Command::XRange { key, start, stop, count } => stream::xrange(&key, start, stop, count, db),
         Command::XRead { count, timeout, streams } => stream::xread(count, timeout, streams, db),
         Command::XDel { key, ids} => stream::xdel(&key, &ids, db),
+        Command::XTrim { key, trim } => stream::xtrim(&key, &trim, db),
         Command::Incr { key } => Ok(Outcome::Reply(integer::incr(&key, db)?)),
         Command::Unknown { name, args } => Err(CommandError::UnknownCommand { name, args }),
     }
 }
-
-// pub fn blocking_timeout(cmd: &Command) -> Blocking {
-//     match cmd {
-//         Command::BPop { timeout: Some(d), .. } => Blocking::For(*d),
-//         Command::BPop { timeout: None, .. } => Blocking::Forever,
-//         _ => Blocking::No,
-//     }
-// }
 
 /// Renders client supplied bytes for an error message. Escapes so the message
 /// reads clearly, truncates so a huge argument cannot fill the reply.
