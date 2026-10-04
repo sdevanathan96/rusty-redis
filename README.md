@@ -1,7 +1,9 @@
 # rusty-redis
 
 A Redis-compatible server written in Rust on top of Tokio. It speaks RESP, so
-`redis-cli` and ordinary Redis client libraries can talk to it.
+`redis-cli` and ordinary Redis client libraries can talk to it. It covers
+strings, lists including blocking pops, and streams including blocking reads
+and trimming, and it is tested by comparing every reply with a real Redis.
 
 ## Supported commands
 
@@ -12,9 +14,35 @@ A Redis-compatible server written in Rust on top of Tokio. It speaks RESP, so
 | Lists   | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LMOVE`, `BLPOP`, `BRPOP`, `BLMOVE` |
 | Streams | `XADD` (with `NOMKSTREAM` and `MAXLEN` / `MINID` trimming), `XRANGE`, `XREAD` (with `COUNT` / `BLOCK`), `XLEN`, `XDEL`, `XTRIM` |
 
-Error messages follow real Redis byte for byte, including its quirks. One
-known difference: approximate trimming (`MAXLEN ~ n`) trims exactly to `n`,
-while Redis removes only whole internal nodes and may keep more.
+Any other command gets Redis's `ERR unknown command` error.
+
+### Differences from Redis
+
+Replies and error messages match Redis 8.10.1 byte for byte, including its
+quirks, except for these:
+
+- **Approximate trimming** (`MAXLEN ~`, `MINID ~`) trims exactly. Redis
+  removes only whole internal nodes of up to 100 entries, so it may keep more,
+  and on a short stream removes nothing.
+- **Inline commands** are not supported. Redis also accepts plain text lines
+  such as `PING`, for typing into telnet; this server requires RESP arrays,
+  which is what `redis-cli` and client libraries send.
+- **Malformed input** is handled a little more strictly, and two protocol
+  errors are worded differently. The two bytes after a bulk payload must be
+  CRLF, where Redis skips them unchecked. CR and LF inside an echoed error are
+  escaped rather than replaced by spaces. A non-bulk array element is reported
+  as "expected a bulk string" rather than "expected '$', got ':'".
+- **A protocol error sent while a client is blocked** is answered right after
+  the blocked command's reply. Redis waits until the client next sends data.
+
+`STRICT=1 ./test.sh` shows the first three as diffs.
+
+### Not implemented
+
+Other data types (hashes, sets, sorted sets), transactions (`MULTI` /
+`EXEC`), pub/sub, persistence (RDB, AOF), replication, `AUTH` and ACLs, more
+than one database (`SELECT`), keyspace commands such as `KEYS`, `DBSIZE` and
+`FLUSHALL`, and `--bind`: the server listens on `127.0.0.1` only.
 
 ## Running
 
@@ -74,23 +102,27 @@ and machine. It needs `redis-server`, `redis-benchmark` and `python3`.
 
 ### Latest results
 
-A snapshot from one session on an Apple M1 Pro: commit `cbb2985`, Redis 8.10.1,
-100,000 requests per command, 50 clients, median of 3 runs. Full report:
-[bench/results/2026-10-01-1141-cbb2985.md](bench/results/2026-10-01-1141-cbb2985.md).
+One session on an Apple M1 Pro: commit `36607be`, Redis 8.10.1, 100,000
+requests per command, 50 clients, median of 3 runs. Full report:
+[bench/results/2026-10-04-1803-36607be.md](bench/results/2026-10-04-1803-36607be.md).
 
 | compared with Redis | no pipelining | 16 commands per pipeline |
 |---|---|---|
-| throughput, 10 commands | 0.70x to 0.88x | 0.53x to 1.01x, `XADD` at parity |
-| p99 latency | 0.72x to 1.02x, lower for 9 of 10 | 1.01x to 2.23x |
+| throughput, 10 commands | 0.66x to 0.80x | 0.39x to 0.97x |
+| p99 latency | 0.69x to 1.18x, lower for 8 of 10 | 1.06x to 5.86x |
+
+Treat these as approximate. An earlier run on the same machine, three days
+before, measured 0.70x to 0.88x without pipelining: between the two runs this
+server's throughput moved by at most 2%, while Redis's own moved by up to 24%. The 5.86x is a single `INCR` spike; the earlier run measured 2.23x.
 
 Without pipelining, every command runs at about 104,000 ops/s whatever it
-does, which suggests the cost is in the per command round trip rather than in
-the commands themselves.
+does, in both runs, which suggests the cost is in the per command round trip
+rather than in the commands themselves.
 
 | memory per item, 3 byte values | rusty-redis | Redis |
 |---|---:|---:|
 | string key | 287 B | 75 B |
-| list element | 54 B | 8 B |
+| list element | 54 B | 7 B |
 | stream entry | 196 B | 18 B |
 
 Redis packs small values into compact encodings, while this server stores
