@@ -28,34 +28,34 @@ fn ping_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [] => Ok(Command::Ping(None)),
         [msg] => Ok(Command::Ping(Some(msg.clone()))),
-        _ => return Err(CommandError::WrongArity(name.clone())),
+        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 
 fn echo_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [msg] => Ok(Command::Echo(msg.clone())),
-        _ => return Err(CommandError::WrongArity(name.clone())),
+        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 
 fn type_of_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [key] => Ok(Command::Type { key: key.clone() }),
-        _ => return Err(CommandError::WrongArity(name.clone())),
+        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 
 fn del_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
-        [] => return Err(CommandError::WrongArity(name.clone())),
+        [] => Err(CommandError::WrongArity(name.clone())),
         keys => Ok(Command::Del { keys: keys.to_vec() }),
     }
 }
 
 fn exists_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
-        [] => return Err(CommandError::WrongArity(name.clone())),
+        [] => Err(CommandError::WrongArity(name.clone())),
         keys => Ok(Command::Exists { keys: keys.to_vec() }),
     }
 }
@@ -68,7 +68,7 @@ fn no_args(rest: &[Bytes], name: &Bytes, cmd: Command) -> Result<Command, Comman
 pub(super) fn ping(msg: Option<Bytes>) -> Result<Value, CommandError> {
     match msg {
         None => Ok(Value::SimpleString(Bytes::from_static(b"PONG"))),
-        Some(v) => Ok(Value::BulkString(Bytes::from(v))),
+        Some(v) => Ok(Value::BulkString(v)),
     }
 }
 
@@ -77,7 +77,7 @@ pub(super) fn echo(msg: Bytes) -> Result<Value, CommandError> {
 }
 
 pub(super) fn type_of(key: &Bytes, db: &mut Db) -> Result<Value, CommandError> {
-    Ok(Value::SimpleString(Bytes::from(match db.type_of(&key) {
+    Ok(Value::SimpleString(Bytes::from(match db.type_of(key) {
         Some(t) => t.as_bytes().to_vec(),
         None => b"none".to_vec(),
     })))

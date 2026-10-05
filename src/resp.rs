@@ -534,15 +534,15 @@ fn test_nested_arrays() {
     fn round_trip_values() -> Vec<Value> {
         let values = vec![
             Value::SimpleString(Bytes::from_static(b"OK")),
-            Value::SimpleString(Bytes::copy_from_slice(&vec![])),
+            Value::SimpleString(Bytes::copy_from_slice(&[])),
             Value::Error(Bytes::from_static(b"ERR something went wrong")),   // was missing
             Value::Integer(0),
             Value::Integer(-42),
             Value::Integer(i64::MAX),
             Value::Integer(i64::MIN),
-            Value::BulkString(Bytes::copy_from_slice(&vec![])),
+            Value::BulkString(Bytes::copy_from_slice(&[])),
             Value::BulkString(Bytes::from_static(b"a\r\nb")),                // binary safe, must survive
-            Value::BulkString(Bytes::copy_from_slice(&vec![0, 255, 13, 10])),              // arbitrary bytes
+            Value::BulkString(Bytes::copy_from_slice(&[0, 255, 13, 10])),              // arbitrary bytes
             Value::NullBulkString,
             Value::NullArray,                                     // was missing
             Value::Array(vec![]),

@@ -149,13 +149,6 @@ impl Stream {
         self.last_id
     }
 
-    pub(super) fn last_entry(&self) -> Option<&StreamEntry> {
-        match self.len() {
-            0 => None,
-            _ => self.entries.last(),
-        }
-    }
-
     pub(super) fn delete(&mut self, id: EntryId) -> usize {
         if let Ok(i) = self.entries.binary_search_by_key(&id, |e| e.id) {
             self.entries.remove(i);

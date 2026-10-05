@@ -48,7 +48,7 @@ than one database (`SELECT`), keyspace commands such as `KEYS`, `DBSIZE` and
 
 ## Running
 
-Requires Rust 1.85+ (edition 2024).
+Requires Rust 1.88+ (edition 2024; the code uses let chains).
 
 ```sh
 ./run.sh            # or: cargo run --release

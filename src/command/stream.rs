@@ -147,7 +147,7 @@ fn parse_fields(
     args: &[Bytes],
     name: &Bytes,
 ) -> Result<Vec<(Bytes, Bytes)>, CommandError> {
-    if args.is_empty() || args.len() % 2 != 0 {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
         return Err(CommandError::WrongArity(name.clone()));
     }
     Ok(args
@@ -246,7 +246,7 @@ fn xtrim_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> 
 fn xlen_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [key] => Ok(Command::XLen { key: key.clone() }),
-        _ => return Err(CommandError::WrongArity(name.clone())),
+        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 
@@ -303,7 +303,7 @@ fn xread_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> 
 
     let tail = &rest[streams_at + 1..];
 
-    if tail.is_empty() || tail.len() % 2 != 0 {
+    if tail.is_empty() || !tail.len().is_multiple_of(2) {
         return Err(CommandError::UnbalancedXread);
     }
     let n = tail.len() / 2;
@@ -327,7 +327,7 @@ fn xdel_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
             .map(|id| parse_bound(id, 0))
             .collect::<Result<_, CommandError>>()?,
         }),
-        _ => return Err(CommandError::WrongArity(name.clone())),
+        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 

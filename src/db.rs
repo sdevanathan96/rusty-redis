@@ -3,7 +3,6 @@ mod stream;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::u64;
 use bytes::Bytes;
 
 use crate::db::stream::{Stream};
@@ -100,9 +99,6 @@ impl Data {
     fn as_str(&self) -> Result<&Str, WrongType> {
         match self { Data::String(s) => Ok(s), _ => Err(WrongType) }
     }
-    fn as_str_mut(&mut self) -> Result<&mut Str, WrongType> {
-        match self { Data::String(s) => Ok(s), _ => Err(WrongType) }
-    }
     fn as_integer_mut(&mut self) -> Result<&mut i64, IncrError> {
         match self {
             Data::String(Str::Integer(n)) => Ok(n),
@@ -111,9 +107,6 @@ impl Data {
         }
     }
     fn as_list(&self) -> Result<&VecDeque<Bytes>, WrongType> {
-        match self { Data::List(l) => Ok(l), _ => Err(WrongType) }
-    }
-    fn as_list_mut(&mut self) -> Result<&mut VecDeque<Bytes>, WrongType> {
         match self { Data::List(l) => Ok(l), _ => Err(WrongType) }
     }
     fn as_stream(&self) -> Result<&Stream, WrongType> {
@@ -329,7 +322,7 @@ impl Db {
         // if !src_ready {
         //     return Ok(None);
         // }
-        if self.data(src).map(Data::as_list).transpose()?.map_or(true, |l| l.is_empty()) {
+        if self.data(src).map(Data::as_list).transpose()?.is_none_or(|l| l.is_empty()) {
             return Ok(None);
         }
         self.reap(&dst);
@@ -557,6 +550,13 @@ pub struct TestClock {
     start: Instant,
     base_ms: u64,
     offset: Mutex<Duration>,
+}
+
+#[cfg(test)]
+impl Default for TestClock {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

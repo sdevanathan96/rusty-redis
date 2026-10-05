@@ -69,10 +69,10 @@ fn bpop_command(rest: &[Bytes], name: &Bytes, from: End) -> Result<Command, Comm
     match rest {
         [keys @ .., timeout] if !keys.is_empty() => Ok(Command::BPop {
             keys: keys.to_vec(),
-            from: from,
+            from,
             timeout: parse_timeout(timeout)?,
         }),
-        _ => return Err(CommandError::WrongArity(name.clone())),
+        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 
@@ -80,7 +80,7 @@ fn bpop_command(rest: &[Bytes], name: &Bytes, from: End) -> Result<Command, Comm
 fn llen_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [key] => Ok(Command::LLen { key: key.clone() }),
-        _ => return Err(CommandError::WrongArity(name.clone())),
+        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 
@@ -92,7 +92,7 @@ fn lrange_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>
             start: parse_i64(start)?,
             stop: parse_i64(stop)?,
         }),
-        _ => return Err(CommandError::WrongArity(name.clone())),
+        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 
@@ -104,7 +104,7 @@ fn lmove_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> 
             from: parse_end(from)?,
             to: parse_end(to)?,
         }),
-        _ => return Err(CommandError::WrongArity(name.clone())),
+        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 
@@ -117,7 +117,7 @@ fn blmove_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>
             to: parse_end(to)?,
             timeout: parse_timeout(timeout)?,
         }),
-        _ => return Err(CommandError::WrongArity(name.clone())),
+        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 
@@ -125,7 +125,7 @@ pub(super) fn push(key: Bytes, values: Vec<Bytes>, from: End, db: &mut Db) -> Re
     Ok(Value::Integer(db.push(key, values, from)? as i64))
 }
 pub(super) fn pop(key: &Bytes, count: Option<usize>, from: End, db: &mut Db) -> Result<Value, CommandError> {
-    let popped = db.pop(&key, count, from)?;
+    let popped = db.pop(key, count, from)?;
     Ok(match (count, popped) {
         (None, Some(v)) => v
             .into_iter()
@@ -144,14 +144,13 @@ pub(super) fn bpop(
     db: &mut Db,
 ) -> Result<Outcome, CommandError> {
     for key in &keys {
-        if let Some(v) = db.pop(key, None, from)? {
-            if let Some(elem) = v.into_iter().next() {
+        if let Some(v) = db.pop(key, None, from)?
+            && let Some(elem) = v.into_iter().next() {
                 return Ok(Outcome::Reply(Value::Array(vec![
                     Value::BulkString(key.clone()),
                     Value::BulkString(elem),
                 ])));
             }
-        }
     }
 
     Ok(Outcome::Block {
@@ -161,18 +160,18 @@ pub(super) fn bpop(
 }
 
 pub(super) fn llen(key: &Bytes, db: &mut Db) -> Result<Value, CommandError> {
-    Ok(Value::Integer(db.llen(&key)? as i64))
+    Ok(Value::Integer(db.llen(key)? as i64))
 }
 pub(super) fn lrange(key: &Bytes, start: i64, stop: i64, db: &mut Db) -> Result<Value, CommandError> {
     Ok(Value::Array(
-        db.lrange(&key, start, stop)?
+        db.lrange(key, start, stop)?
             .into_iter()
             .map(Value::BulkString)
             .collect(),
     ))
 }
 pub(super) fn lmove(src: &Bytes, dst: Bytes, from: End, to: End, db: &mut Db) -> Result<Value, CommandError> {
-    Ok(match db.lmove(&src, dst, from, to)? {
+    Ok(match db.lmove(src, dst, from, to)? {
         Some(v) => Value::BulkString(v),
         None => Value::NullBulkString,
     })

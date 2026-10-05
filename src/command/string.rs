@@ -22,7 +22,7 @@ pub(super) fn try_parse(
 fn get_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>{
     match rest {
         [key] => Ok(Command::Get { key: key.clone() }),
-        _ => return Err(CommandError::WrongArity(name.clone())),
+        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 fn set_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>{
