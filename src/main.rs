@@ -81,9 +81,11 @@ async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<Request>) -> std::i
 const OUTBUF_FLUSH_AT: usize = 64 * 1024;
 
 /// Close the connection once the input a client holds passes this: unparsed
-/// bytes in `inbuf` plus commands parsed into `queued` but not yet run. Same
-/// value and same rule as Redis's client-query-buffer-limit: checked after
-/// every read, parked or not, and the client gets no reply.
+/// bytes in `inbuf`, commands parsed into `queued` but not yet run, and
+/// commands waiting in an open MULTI. Same value and same rule as Redis's
+/// client-query-buffer-limit, which also counts the MULTI queue
+/// (`argv_len_sums`): checked after every read, parked or not, and the client
+/// gets no reply.
 const MAX_QUERY_BUF: usize = 1024 * 1024 * 1024;
 
 fn query_buf_limit() -> std::io::Error {
@@ -101,7 +103,7 @@ async fn handle_client(
     let mut transaction: Option<Transaction> = None;
     loop {
         parse_into(&mut inbuf, &mut queued);
-        while let Some(item) = queued.pop() {
+        while let Some((item, size)) = queued.pop() {
             match item {
                 Queued::ProtocolError(err) => {
                     resp::encode(&err, &mut outbuf);
@@ -151,7 +153,7 @@ async fn handle_client(
                 // Any other item while a transaction is open: queue it. The
                 // guard has just checked for Some, so the unwrap cannot fail.
                 item if transaction.is_some() => {
-                    let reply = queue_in(transaction.as_mut().unwrap(), item);
+                    let reply = queue_in(transaction.as_mut().unwrap(), item, size);
                     resp::encode(&reply, &mut outbuf);
                 }
 
@@ -207,7 +209,8 @@ async fn handle_client(
         if stream.read_buf(&mut inbuf).await? == 0 {
             return Ok(());
         }
-        if inbuf.len() + queued.bytes() > MAX_QUERY_BUF {
+        let in_multi = transaction.as_ref().map_or(0, |t| t.bytes);
+        if inbuf.len() + queued.bytes() + in_multi > MAX_QUERY_BUF {
             return Err(query_buf_limit());
         }
     }
@@ -294,6 +297,9 @@ struct Transaction {
     /// answered by EXEC in their slot, as Redis does.
     queued: Vec<Result<Command, CommandError>>,
     failed: bool, // a queue-time error happened; EXEC answers EXECABORT
+    /// Wire bytes of everything in `queued`, counted toward MAX_QUERY_BUF.
+    /// No parked wait needs it: nothing parks while a transaction is open.
+    bytes: usize,
 }
 
 /// Parses every complete frame in `inbuf` into `queued`. Runs nothing. Stops
@@ -321,8 +327,9 @@ fn parse_into(inbuf: &mut BytesMut, queued: &mut Pending) {
 
 /// Queues one item inside MULTI and returns the immediate reply. Only an
 /// unknown command and a wrong argument count fail at queue time, which marks
-/// the transaction; every other error waits for EXEC.
-fn queue_in(transaction: &mut Transaction, item: Queued) -> Value {
+/// the transaction; every other error waits for EXEC. `size` is the item's
+/// length on the wire, counted only if the item is actually queued.
+fn queue_in(transaction: &mut Transaction, item: Queued, size: usize) -> Value {
     let queued = Value::SimpleString(Bytes::from_static(b"QUEUED"));
     match item {
         Queued::Run(Command::Unknown { name, args }) => {
@@ -335,10 +342,12 @@ fn queue_in(transaction: &mut Transaction, item: Queued) -> Value {
         }
         Queued::Run(cmd) => {
             transaction.queued.push(Ok(cmd));
+            transaction.bytes += size;
             queued
         }
         Queued::Error(e) => {
             transaction.queued.push(Err(e));
+            transaction.bytes += size;
             queued
         }
         // Never reached: the drain loop handles protocol errors before
@@ -370,10 +379,12 @@ mod pending {
             self.items.push_back((item, size));
         }
 
-        pub(super) fn pop(&mut self) -> Option<Queued> {
+        /// The item and its size, so a command moving on into a MULTI queue
+        /// keeps its bytes counted.
+        pub(super) fn pop(&mut self) -> Option<(Queued, usize)> {
             let (item, size) = self.items.pop_front()?;
             self.bytes -= size;
-            Some(item)
+            Some((item, size))
         }
 
         pub(super) fn bytes(&self) -> usize {
@@ -400,3 +411,41 @@ mod pending {
     }
 }
 
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+
+    fn ping() -> Command {
+        let request = Value::Array(vec![Value::BulkString(Bytes::from_static(b"PING"))]);
+        to_command(request).unwrap().unwrap()
+    }
+
+    fn queued() -> Value {
+        Value::SimpleString(Bytes::from_static(b"QUEUED"))
+    }
+
+    #[test]
+    fn a_queued_command_counts_its_bytes() {
+        let mut t = Transaction::default();
+        assert_eq!(queue_in(&mut t, Queued::Run(ping()), 14), queued());
+        assert_eq!((t.queued.len(), t.bytes, t.failed), (1, 14, false));
+    }
+
+    #[test]
+    fn an_error_waiting_for_exec_counts_too() {
+        // SET k v ZZ: queued, and answered by EXEC in its slot.
+        let mut t = Transaction::default();
+        assert_eq!(queue_in(&mut t, Queued::Error(CommandError::Syntax), 20), queued());
+        assert_eq!((t.queued.len(), t.bytes, t.failed), (1, 20, false));
+    }
+
+    #[test]
+    fn queue_time_failures_mark_the_transaction_and_hold_nothing() {
+        let mut t = Transaction::default();
+        let arity = CommandError::WrongArity(Bytes::from_static(b"get"));
+        assert_eq!(queue_in(&mut t, Queued::Error(arity.clone()), 9), Value::Error(arity.to_resp()));
+        let unknown = Command::Unknown { name: Bytes::from_static(b"NOSUCH"), args: vec![] };
+        assert!(matches!(queue_in(&mut t, Queued::Run(unknown), 16), Value::Error(_)));
+        assert_eq!((t.queued.len(), t.bytes, t.failed), (0, 0, true));
+    }
+}

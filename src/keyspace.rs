@@ -165,4 +165,61 @@ mod tests {
         handle(Request::Gone { id: 8 }, &mut db, &mut waiters);
         assert_eq!(waiters.len(), 1, "a stale or duplicate Gone is harmless");
     }
+
+    /// A command from its arguments, through the real parser.
+    fn cmd(parts: &[&str]) -> Command {
+        let mut raw = format!("*{}\r\n", parts.len());
+        for p in parts {
+            raw += &format!("${}\r\n{}\r\n", p.len(), p);
+        }
+        cmd_ok(raw.as_bytes())
+    }
+
+    fn bulk(s: &'static str) -> Value {
+        Value::BulkString(Bytes::from_static(s.as_bytes()))
+    }
+
+    #[test]
+    fn exec_answers_a_blocking_command_with_its_timeout_reply() {
+        let mut db = Db::with_clock(Arc::new(TestClock::new()));
+        let mut waiters = VecDeque::new();
+        let (reply, mut rx) = mpsc::unbounded_channel();
+
+        handle(Request::Exec { cmds: vec![Ok(blpop_forever("k"))], reply }, &mut db, &mut waiters);
+
+        assert_eq!(rx.try_recv().unwrap(), Value::Array(vec![Value::NullArray]));
+        assert!(waiters.is_empty(), "nothing parks inside EXEC");
+    }
+
+    #[test]
+    fn exec_puts_each_error_in_its_slot_and_runs_the_rest() {
+        let mut db = Db::with_clock(Arc::new(TestClock::new()));
+        let mut waiters = VecDeque::new();
+        let (reply, mut rx) = mpsc::unbounded_channel();
+        let cmds = vec![Err(CommandError::Syntax), Ok(cmd(&["SET", "k", "1"])), Ok(cmd(&["GET", "k"]))];
+
+        handle(Request::Exec { cmds, reply }, &mut db, &mut waiters);
+
+        let ok = Value::SimpleString(Bytes::from_static(b"OK"));
+        let syntax = Value::Error(CommandError::Syntax.to_resp());
+        assert_eq!(rx.try_recv().unwrap(), Value::Array(vec![syntax, ok, bulk("1")]));
+    }
+
+    #[test]
+    fn exec_wakes_waiters_only_after_the_whole_transaction() {
+        let mut db = Db::with_clock(Arc::new(TestClock::new()));
+        let mut waiters = VecDeque::new();
+        let (waiter_reply, mut waiter_rx) = mpsc::unbounded_channel();
+        handle(Request::Run { cmd: blpop_forever("k"), reply: waiter_reply, id: 1 }, &mut db, &mut waiters);
+        assert_eq!(waiters.len(), 1);
+
+        let (reply, mut rx) = mpsc::unbounded_channel();
+        let cmds = vec![Ok(cmd(&["RPUSH", "k", "x", "y"])), Ok(cmd(&["LLEN", "k"]))];
+        handle(Request::Exec { cmds, reply }, &mut db, &mut waiters);
+
+        // LLEN inside the transaction still sees both: nobody was served yet.
+        assert_eq!(rx.try_recv().unwrap(), Value::Array(vec![Value::Integer(2), Value::Integer(2)]));
+        assert_eq!(waiter_rx.try_recv().unwrap(), Value::Array(vec![bulk("k"), bulk("x")]));
+        assert!(waiters.is_empty());
+    }
 }
