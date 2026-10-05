@@ -758,11 +758,13 @@ block_scenario "blpop scans past an empty key" 0.5 "" \
     "BLPOP|{K}|{K2}|0" \
     "RPUSH|{K2}|x"
 
-# The element must survive a push that lands after the client gave up.
-# This is the data-loss case that is_closed() exists to prevent.
-block_scenario "element survives a push after the timeout" 2 "" \
-    "BLPOP|{K}|1" \
-    "RPUSH|{K}|a;LRANGE|{K}|0|-1"
+# The element must survive a push that lands after the client gave up: the
+# LRANGE must still show it, and the timed-out client must get nothing more.
+# This is the race Unpark settles. A conn_scenario, because block_scenario
+# discards the replies of the commands it runs meanwhile.
+conn_scenario "element survives a push after the timeout" \
+    "a send BLPOP|{K}|1" "sleep 1.3" "a read" \
+    "b send RPUSH|{K}|a;LRANGE|{K}|0|-1" "b read" "a read"
 
 # A waiter blocked on a key that becomes a string gets WRONGTYPE, not silence.
 block_scenario "wrongtype while parked" 0.5 "" \
