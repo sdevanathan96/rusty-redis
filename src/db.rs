@@ -1,12 +1,14 @@
 mod stream;
 
+use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use bytes::Bytes;
 
-use crate::db::stream::{Stream};
-pub use crate::db::stream::{EntryId, XaddError, IdSpec, ReadFrom, StreamEntry, Trim, TrimBy, Mode, RefPolicy};
+use crate::db::stream::Stream;
+pub use crate::db::stream::{
+    EntryId, IdSpec, Mode, ReadFrom, RefPolicy, StreamEntry, Trim, TrimBy, XaddError,
+};
 use crate::int::strict_i64;
 
 #[cfg(test)]
@@ -37,7 +39,11 @@ pub struct WrongType;
 /// Why INCR failed. A type of its own, so every other accessor goes on
 /// returning plain `WrongType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IncrError { WrongType, NotAnInteger, Overflow }
+pub enum IncrError {
+    WrongType,
+    NotAnInteger,
+    Overflow,
+}
 
 /// The expiry deadline does not fit in Redis's i64 of milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +103,10 @@ impl Data {
     // out inside six nearly identical Db methods. A new variant adds one of
     // these, not two Db methods.
     fn as_str(&self) -> Result<&Str, WrongType> {
-        match self { Data::String(s) => Ok(s), _ => Err(WrongType) }
+        match self {
+            Data::String(s) => Ok(s),
+            _ => Err(WrongType),
+        }
     }
     fn as_integer_mut(&mut self) -> Result<&mut i64, IncrError> {
         match self {
@@ -107,19 +116,32 @@ impl Data {
         }
     }
     fn as_list(&self) -> Result<&VecDeque<Bytes>, WrongType> {
-        match self { Data::List(l) => Ok(l), _ => Err(WrongType) }
+        match self {
+            Data::List(l) => Ok(l),
+            _ => Err(WrongType),
+        }
     }
     fn as_stream(&self) -> Result<&Stream, WrongType> {
-        match self { Data::Stream(s) => Ok(s), _ => Err(WrongType) }
+        match self {
+            Data::Stream(s) => Ok(s),
+            _ => Err(WrongType),
+        }
     }
     fn as_stream_mut(&mut self) -> Result<&mut Stream, WrongType> {
-        match self { Data::Stream(s) => Ok(s), _ => Err(WrongType) }
+        match self {
+            Data::Stream(s) => Ok(s),
+            _ => Err(WrongType),
+        }
     }
 }
 
 // public: the tag only
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DataType { String, List, Stream }
+pub enum DataType {
+    String,
+    List,
+    Stream,
+}
 
 impl DataType {
     pub fn as_bytes(&self) -> &'static [u8] {
@@ -155,7 +177,6 @@ pub struct Db {
 }
 
 impl Db {
-
     /// Drop the key if its deadline has passed.
     ///
     /// Split out from reading on purpose. Reaping needs `&mut self`, so while
@@ -196,7 +217,12 @@ impl Db {
     /// ttl is relative. The absolute deadline is computed here, once, because
     /// this is the only layer that owns a clock. Fails, writing nothing, if
     /// that deadline overflows.
-    pub fn set(&mut self, key: Bytes, value: Bytes, ttl: Option<Duration>) -> Result<(), InvalidExpireTime> {
+    pub fn set(
+        &mut self,
+        key: Bytes,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> Result<(), InvalidExpireTime> {
         let now = self.clock.now();
         let now_ms = self.clock.now_ms();
         // Two separate hazards here.
@@ -226,11 +252,17 @@ impl Db {
             Some(d) => Some(now.checked_add(d).unwrap_or(now)),
             None => None,
         };
-        self.map.insert(key, Entry { data: Data::String(Str::from_bytes(value)), expires_at });
+        self.map.insert(
+            key,
+            Entry {
+                data: Data::String(Str::from_bytes(value)),
+                expires_at,
+            },
+        );
         Ok(())
     }
 
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Bytes>, WrongType>{
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Bytes>, WrongType> {
         self.reap(key);
         match self.data(key) {
             None => Ok(None),
@@ -244,7 +276,13 @@ impl Db {
         self.reap(&key);
         match self.data_mut(&key) {
             None => {
-                self.map.insert(key, Entry { data: Data::String(Str::Integer(1)), expires_at: None });
+                self.map.insert(
+                    key,
+                    Entry {
+                        data: Data::String(Str::Integer(1)),
+                        expires_at: None,
+                    },
+                );
                 Ok(1)
             }
             Some(d) => {
@@ -304,15 +342,23 @@ impl Db {
         push_to(&mut self.map, key, values, end)
     }
 
-    pub fn pop(&mut self, key: &[u8], count: Option<usize>, end: End) -> Result<Option<Vec<Bytes>>, WrongType>{
+    pub fn pop(
+        &mut self,
+        key: &[u8],
+        count: Option<usize>,
+        end: End,
+    ) -> Result<Option<Vec<Bytes>>, WrongType> {
         self.reap(key);
         pop_from(&mut self.map, key, count.unwrap_or(1), end)
     }
 
-
-    pub fn lmove(&mut self, src: &[u8], dst: Bytes, from: End, to: End)
-    -> Result<Option<Bytes>, WrongType>
-    {
+    pub fn lmove(
+        &mut self,
+        src: &[u8],
+        dst: Bytes,
+        from: End,
+        to: End,
+    ) -> Result<Option<Bytes>, WrongType> {
         self.reap(src);
         // self.reap(src);
         // let src_ready = match self.data(src) {
@@ -322,7 +368,12 @@ impl Db {
         // if !src_ready {
         //     return Ok(None);
         // }
-        if self.data(src).map(Data::as_list).transpose()?.is_none_or(|l| l.is_empty()) {
+        if self
+            .data(src)
+            .map(Data::as_list)
+            .transpose()?
+            .is_none_or(|l| l.is_empty())
+        {
             return Ok(None);
         }
         self.reap(&dst);
@@ -339,7 +390,6 @@ impl Db {
         push_to(&mut self.map, dst, vec![popped.clone()], to)?;
         Ok(Some(popped))
     }
-
 
     /// Appends, then trims, in that order, so `MAXLEN 0` removes the entry just
     /// added. `None` means NOMKSTREAM found no key, and nothing was created. A
@@ -386,8 +436,13 @@ impl Db {
         self.data(key).map_or(Ok(0), |s| Ok(s.as_stream()?.len()))
     }
 
-    pub fn xrange(&mut self, key: &[u8], start: EntryId, end: EntryId, count: Option<usize>)
-    -> Result<Option<&[StreamEntry]>, WrongType> {
+    pub fn xrange(
+        &mut self,
+        key: &[u8],
+        start: EntryId,
+        end: EntryId,
+        count: Option<usize>,
+    ) -> Result<Option<&[StreamEntry]>, WrongType> {
         self.reap(key);
         match self.data(key) {
             None => Ok(None),
@@ -405,12 +460,17 @@ impl Db {
 
     pub fn xlast(&mut self, key: &[u8]) -> Result<Option<&[StreamEntry]>, WrongType> {
         self.reap(key);
-        self.data(key).map(|d| Ok(d.as_stream()?.last_slice())).transpose()
+        self.data(key)
+            .map(|d| Ok(d.as_stream()?.last_slice()))
+            .transpose()
     }
 
-    pub fn xrange_after(&mut self, key: &[u8], after: EntryId, count: Option<usize>)
-    -> Result<Option<&[StreamEntry]>, WrongType>
-    {
+    pub fn xrange_after(
+        &mut self,
+        key: &[u8],
+        after: EntryId,
+        count: Option<usize>,
+    ) -> Result<Option<&[StreamEntry]>, WrongType> {
         self.reap(key);
         match self.data(key) {
             None => Ok(None),
@@ -426,7 +486,7 @@ impl Db {
         };
         let mut n = 0usize;
         for &id in ids {
-            n+=stream.delete(id);
+            n += stream.delete(id);
         }
         Ok(n)
     }
@@ -459,11 +519,15 @@ fn resolve_range(len: usize, start: i64, stop: i64) -> Option<(usize, usize)> {
 
     // negative counts from the end
     let mut start = if start < 0 { len + start } else { start };
-    let mut stop  = if stop  < 0 { len + stop  } else { stop  };
+    let mut stop = if stop < 0 { len + stop } else { stop };
 
     // clamp, do not wrap
-    if start < 0 { start = 0; }
-    if stop >= len { stop = len - 1; }
+    if start < 0 {
+        start = 0;
+    }
+    if stop >= len {
+        stop = len - 1;
+    }
 
     if start > stop || start >= len || len == 0 {
         return None;
@@ -596,7 +660,7 @@ impl Clock for TestClock {
 mod tests {
     use bytes::Bytes;
 
-use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
+    use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -617,7 +681,8 @@ use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
     #[test]
     fn set_then_get() {
         let (_clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None).unwrap();
+        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None)
+            .unwrap();
         assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))));
         assert_eq!(db.get(b"missing"), Ok(None));
     }
@@ -625,21 +690,35 @@ use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
     #[test]
     fn key_expires_exactly_at_deadline() {
         let (clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), Some(Duration::from_millis(100))).unwrap();
+        db.set(
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"v"),
+            Some(Duration::from_millis(100)),
+        )
+        .unwrap();
 
         assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))));
 
         clock.advance(Duration::from_millis(99));
-        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))), "not yet expired");
+        assert_eq!(
+            db.get(b"k"),
+            Ok(Some(Bytes::from_static(b"v"))),
+            "not yet expired"
+        );
 
         clock.advance(Duration::from_millis(1));
-        assert_eq!(db.get(b"k"), Ok(None), "expired at the deadline, not after it");
+        assert_eq!(
+            db.get(b"k"),
+            Ok(None),
+            "expired at the deadline, not after it"
+        );
     }
 
     #[test]
     fn no_expiry_never_expires() {
         let (clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None).unwrap();
+        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None)
+            .unwrap();
         clock.advance(Duration::from_secs(86_400 * 365));
         assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))));
     }
@@ -647,8 +726,18 @@ use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
     #[test]
     fn get_reaps_the_expired_entry() {
         let (clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"a"), Bytes::from_static(b"v"), Some(Duration::from_millis(100))).unwrap();
-        db.set(Bytes::from_static(b"b"), Bytes::from_static(b"v"), Some(Duration::from_millis(50))).unwrap();
+        db.set(
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"v"),
+            Some(Duration::from_millis(100)),
+        )
+        .unwrap();
+        db.set(
+            Bytes::from_static(b"b"),
+            Bytes::from_static(b"v"),
+            Some(Duration::from_millis(50)),
+        )
+        .unwrap();
         assert_eq!(db.len(), 2);
 
         clock.advance(Duration::from_millis(99));
@@ -663,7 +752,12 @@ use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
     #[test]
     fn delete_reports_false_for_expired_key() {
         let (clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), Some(Duration::from_millis(10))).unwrap();
+        db.set(
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"v"),
+            Some(Duration::from_millis(10)),
+        )
+        .unwrap();
         clock.advance(Duration::from_millis(10));
         assert!(!db.delete(b"k"), "expired key counts as absent");
         assert_eq!(db.len(), 0, "but it is still removed");
@@ -672,12 +766,17 @@ use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
     #[test]
     fn overwriting_clears_the_old_ttl() {
         let (clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v1"), Some(Duration::from_millis(10))).unwrap();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v2"), None).unwrap();
+        db.set(
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"v1"),
+            Some(Duration::from_millis(10)),
+        )
+        .unwrap();
+        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v2"), None)
+            .unwrap();
         clock.advance(Duration::from_secs(1));
         assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v2"))));
     }
-
 
     #[test]
     fn px_that_overflows_the_redis_deadline_is_rejected() {
@@ -685,7 +784,8 @@ use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
         // overflows, and it bails out before touching the key.
         let clock = Arc::new(TestClock::new());
         let mut db = Db::with_clock(clock.clone());
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"old"), None).unwrap();
+        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"old"), None)
+            .unwrap();
 
         let result = db.set(
             Bytes::from_static(b"k"),
@@ -694,7 +794,11 @@ use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
         );
 
         assert_eq!(result, Err(InvalidExpireTime));
-        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"old"))), "existing value untouched");
+        assert_eq!(
+            db.get(b"k"),
+            Ok(Some(Bytes::from_static(b"old"))),
+            "existing value untouched"
+        );
     }
 
     #[test]
@@ -717,15 +821,34 @@ use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
     }
 
     fn set(db: &mut Db, key: &'static [u8], value: &'static [u8]) {
-        db.set(Bytes::from_static(key), Bytes::from_static(value), None).unwrap();
+        db.set(Bytes::from_static(key), Bytes::from_static(value), None)
+            .unwrap();
     }
 
     #[test]
     fn get_returns_a_number_exactly_as_it_was_set() {
         let (_clock, mut db) = fixture();
-        for value in [&b"5"[..], b"-7", b"0", b"9223372036854775807", b"010", b"+5", b"-0", b"hello"] {
-            db.set(Bytes::from_static(b"k"), Bytes::copy_from_slice(value), None).unwrap();
-            assert_eq!(db.get(b"k"), Ok(Some(Bytes::copy_from_slice(value))), "{value:?}");
+        for value in [
+            &b"5"[..],
+            b"-7",
+            b"0",
+            b"9223372036854775807",
+            b"010",
+            b"+5",
+            b"-0",
+            b"hello",
+        ] {
+            db.set(
+                Bytes::from_static(b"k"),
+                Bytes::copy_from_slice(value),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                db.get(b"k"),
+                Ok(Some(Bytes::copy_from_slice(value))),
+                "{value:?}"
+            );
         }
     }
 
@@ -748,15 +871,29 @@ use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
     fn incr_on_a_non_canonical_number_is_not_an_integer() {
         let (_clock, mut db) = fixture();
         for value in [&b"hello"[..], b"010", b"+5", b""] {
-            db.set(Bytes::from_static(b"k"), Bytes::copy_from_slice(value), None).unwrap();
-            assert_eq!(db.incr(Bytes::from_static(b"k")), Err(IncrError::NotAnInteger), "{value:?}");
+            db.set(
+                Bytes::from_static(b"k"),
+                Bytes::copy_from_slice(value),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                db.incr(Bytes::from_static(b"k")),
+                Err(IncrError::NotAnInteger),
+                "{value:?}"
+            );
         }
     }
 
     #[test]
     fn incr_on_a_list_is_wrongtype() {
         let (_clock, mut db) = fixture();
-        db.push(Bytes::from_static(b"l"), vec![Bytes::from_static(b"a")], End::Right).unwrap();
+        db.push(
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+            End::Right,
+        )
+        .unwrap();
         assert_eq!(db.incr(Bytes::from_static(b"l")), Err(IncrError::WrongType));
     }
 
@@ -765,15 +902,27 @@ use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
         let (_clock, mut db) = fixture();
         set(&mut db, b"k", b"9223372036854775807");
         assert_eq!(db.incr(Bytes::from_static(b"k")), Err(IncrError::Overflow));
-        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"9223372036854775807"))));
+        assert_eq!(
+            db.get(b"k"),
+            Ok(Some(Bytes::from_static(b"9223372036854775807")))
+        );
     }
 
     #[test]
     fn incr_keeps_the_ttl() {
         let (clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"5"), Some(Duration::from_millis(100))).unwrap();
+        db.set(
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"5"),
+            Some(Duration::from_millis(100)),
+        )
+        .unwrap();
         assert_eq!(db.incr(Bytes::from_static(b"k")), Ok(6));
         clock.advance(Duration::from_millis(100));
-        assert_eq!(db.get(b"k"), Ok(None), "the deadline from SET still applies");
+        assert_eq!(
+            db.get(b"k"),
+            Ok(None),
+            "the deadline from SET still applies"
+        );
     }
 }

@@ -4,7 +4,6 @@ use super::{Command, CommandError};
 use crate::db::Db;
 use crate::resp::Value;
 
-
 pub(super) fn try_parse(
     upper: &[u8],
     rest: &[Bytes],
@@ -12,11 +11,11 @@ pub(super) fn try_parse(
 ) -> Option<Result<Command, CommandError>> {
     Some(match upper {
         b"INCR" => incr_command(rest, name),
-        _ => return None,          // not an integer command
+        _ => return None, // not an integer command
     })
 }
 
-fn incr_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>{
+fn incr_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [key] => Ok(Command::Incr { key: key.clone() }),
         _ => Err(CommandError::WrongArity(name.clone())),

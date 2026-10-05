@@ -1,20 +1,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pending::Pending;
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use rusty_redis::resp::{self, Value};
+use pending::Pending;
+use rusty_redis::command::Command;
 use rusty_redis::command::{BlockSpec, CommandError, to_command};
+use rusty_redis::config;
 use rusty_redis::db::Db;
 use rusty_redis::db::SystemClock;
 use rusty_redis::keyspace::{Request, keyspace_task};
-use tokio::sync::{mpsc};
-use tokio::time::sleep;
+use rusty_redis::resp::{self, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
-use rusty_redis::command::Command;
-use rusty_redis::config;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+use tokio::time::sleep;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -40,7 +40,7 @@ async fn main() -> std::io::Result<()> {
 
     let db = Db::with_clock(Arc::new(SystemClock));
     let (tx, rx) = mpsc::channel::<Request>(64);
-    let keyspace = tokio::spawn(keyspace_task(db, rx));  // db moves in, main never sees it again
+    let keyspace = tokio::spawn(keyspace_task(db, rx)); // db moves in, main never sees it again
 
     // The keyspace task owns the only copy of Db, so if it ever returns, every
     // connection is already doomed: tx.send starts failing and each connection
@@ -64,7 +64,7 @@ async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<Request>) -> std::i
         match listener.accept().await {
             Ok((stream, peer)) => {
                 println!("new connection from {peer}");
-                let tx = tx.clone();        // clone the SENDER, outside the async block
+                let tx = tx.clone(); // clone the SENDER, outside the async block
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(stream, tx).await {
                         eprintln!("connection {peer} ended: {e}");
@@ -143,10 +143,7 @@ impl Conn {
     }
 }
 
-async fn handle_client(
-    stream: TcpStream,
-    tx: mpsc::Sender<Request>,
-) -> std::io::Result<()> {
+async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std::io::Result<()> {
     let mut conn = Conn::new(stream);
     loop {
         parse_into(&mut conn.inbuf, &mut conn.queued);
@@ -170,9 +167,14 @@ async fn handle_client(
 
                 Queued::Run(Command::Exec) => match conn.transaction.take() {
                     None => conn.reply(&Value::Error(CommandError::ExecWithoutMulti.to_resp())),
-                    Some(t) if t.failed => conn.reply(&Value::Error(CommandError::ExecAbort.to_resp())),
+                    Some(t) if t.failed => {
+                        conn.reply(&Value::Error(CommandError::ExecAbort.to_resp()))
+                    }
                     Some(t) => {
-                        let request = Request::Exec { cmds: t.queued, reply: conn.reply_tx.clone() };
+                        let request = Request::Exec {
+                            cmds: t.queued,
+                            reply: conn.reply_tx.clone(),
+                        };
                         if tx.send(request).await.is_err() {
                             return Ok(()); // keyspace task is gone
                         }
@@ -220,15 +222,20 @@ async fn handle_client(
                         conn.flush().await?;
                     }
 
-                    let request = Request::Run { cmd, reply: conn.reply_tx.clone(), id };
+                    let request = Request::Run {
+                        cmd,
+                        reply: conn.reply_tx.clone(),
+                        id,
+                    };
                     if tx.send(request).await.is_err() {
                         return Ok(()); // keyspace task is gone
                     }
 
                     let received = match deadline {
-                        Some(BlockSpec { timeout, on_timeout }) => {
-                            wait_parked(&mut conn, &tx, id, timeout, on_timeout).await?
-                        }
+                        Some(BlockSpec {
+                            timeout,
+                            on_timeout,
+                        }) => wait_parked(&mut conn, &tx, id, timeout, on_timeout).await?,
                         None => conn.reply_rx.recv().await,
                     };
 
@@ -351,14 +358,14 @@ fn parse_into(inbuf: &mut BytesMut, queued: &mut Pending) {
                 let value = frame.into_value(&owned);
                 match to_command(value) {
                     Ok(Some(cmd)) => queued.push(Queued::Run(cmd), consumed),
-                    Ok(None) => {},
-                    Err(e) => queued.push(Queued::Error(e), consumed)
+                    Ok(None) => {}
+                    Err(e) => queued.push(Queued::Error(e), consumed),
                 }
             }
             Ok(None) => return,
             Err(e) => {
                 queued.push(Queued::ProtocolError(Value::Error(e.to_resp())), 0);
-                return
+                return;
             }
         }
     }
@@ -396,8 +403,8 @@ fn queue_in(transaction: &mut Transaction, item: Queued, size: usize) -> Value {
 }
 
 mod pending {
-    use std::collections::VecDeque;
     use super::Queued;
+    use std::collections::VecDeque;
 
     /// Commands parsed but not yet run, and how many input bytes they hold.
     /// The count is what is queued right now, not a running total, so the
@@ -409,7 +416,10 @@ mod pending {
 
     impl Pending {
         pub(super) fn new() -> Self {
-            Pending { items: VecDeque::new(), bytes: 0 }
+            Pending {
+                items: VecDeque::new(),
+                bytes: 0,
+            }
         }
 
         /// `size` is the item's length on the wire: `consumed` from `resp::parse`.
@@ -474,7 +484,10 @@ mod transaction_tests {
     fn an_error_waiting_for_exec_counts_too() {
         // SET k v ZZ: queued, and answered by EXEC in its slot.
         let mut t = Transaction::default();
-        assert_eq!(queue_in(&mut t, Queued::Error(CommandError::Syntax), 20), queued());
+        assert_eq!(
+            queue_in(&mut t, Queued::Error(CommandError::Syntax), 20),
+            queued()
+        );
         assert_eq!((t.queued.len(), t.bytes, t.failed), (1, 20, false));
     }
 
@@ -482,9 +495,18 @@ mod transaction_tests {
     fn queue_time_failures_mark_the_transaction_and_hold_nothing() {
         let mut t = Transaction::default();
         let arity = CommandError::WrongArity(Bytes::from_static(b"get"));
-        assert_eq!(queue_in(&mut t, Queued::Error(arity.clone()), 9), Value::Error(arity.to_resp()));
-        let unknown = Command::Unknown { name: Bytes::from_static(b"NOSUCH"), args: vec![] };
-        assert!(matches!(queue_in(&mut t, Queued::Run(unknown), 16), Value::Error(_)));
+        assert_eq!(
+            queue_in(&mut t, Queued::Error(arity.clone()), 9),
+            Value::Error(arity.to_resp())
+        );
+        let unknown = Command::Unknown {
+            name: Bytes::from_static(b"NOSUCH"),
+            args: vec![],
+        };
+        assert!(matches!(
+            queue_in(&mut t, Queued::Run(unknown), 16),
+            Value::Error(_)
+        ));
         assert_eq!((t.queued.len(), t.bytes, t.failed), (0, 0, true));
     }
 }

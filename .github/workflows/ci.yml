@@ -39,9 +39,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned rather than stable: a newer clippy brings new lints, and with
+      # warnings as errors that would fail CI without any change to the code.
+      # Move this up deliberately, together with any fixes it asks for.
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Build
         run: cargo build --release --locked

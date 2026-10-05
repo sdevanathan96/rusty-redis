@@ -1,14 +1,14 @@
 use bytes::Bytes;
 
-use crate::db::{Db, End, EntryId, IdSpec, IncrError, ReadFrom, WrongType, XaddError, Trim};
+use crate::db::{Db, End, EntryId, IdSpec, IncrError, ReadFrom, Trim, WrongType, XaddError};
 use crate::int::strict_i64;
 use crate::resp::Value;
 use std::time::Duration;
-mod stream;
 mod generic;
-mod list;
-mod string;
 mod integer;
+mod list;
+mod stream;
+mod string;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Outcome {
@@ -17,35 +17,108 @@ pub enum Outcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Blocking { No, Forever, For(Duration) }
+pub enum Blocking {
+    No,
+    Forever,
+    For(Duration),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Command {
     Ping(Option<Bytes>),
     Echo(Bytes),
-    Get { key: Bytes },
-    Set { key: Bytes, value: Bytes, expiry: Option<Duration> },
-    Type { key: Bytes },
-    Del { keys: Vec<Bytes> },
-    Exists { keys: Vec<Bytes> },
-    Push { key: Bytes, values: Vec<Bytes>, from: End },
-    Pop { key: Bytes, count: Option<usize>, from: End },
-    LLen { key: Bytes },
-    LRange { key: Bytes, start: i64, stop: i64 },
-    LMove { src: Bytes, dst: Bytes, from: End, to: End },
-    BPop { keys: Vec<Bytes>, timeout: Option<Duration>, from: End },
-    BLMove { src: Bytes, dst: Bytes, from: End, to: End , timeout: Option<Duration> },
-    XAdd { key: Bytes, id: IdSpec, fields: Vec<(Bytes, Bytes)>, trim: Option<Trim>, nomkstream: bool },
-    XLen { key: Bytes },
-    XRange {key: Bytes, start: EntryId, stop: EntryId, count: Option<i64> },
-    XRead {count: Option<i64>, timeout: Blocking, streams: Vec<(Bytes, ReadFrom)>},
-    XDel { key: Bytes, ids: Vec<EntryId>},
-    XTrim { key: Bytes, trim: Trim },
-    Incr { key: Bytes },
+    Get {
+        key: Bytes,
+    },
+    Set {
+        key: Bytes,
+        value: Bytes,
+        expiry: Option<Duration>,
+    },
+    Type {
+        key: Bytes,
+    },
+    Del {
+        keys: Vec<Bytes>,
+    },
+    Exists {
+        keys: Vec<Bytes>,
+    },
+    Push {
+        key: Bytes,
+        values: Vec<Bytes>,
+        from: End,
+    },
+    Pop {
+        key: Bytes,
+        count: Option<usize>,
+        from: End,
+    },
+    LLen {
+        key: Bytes,
+    },
+    LRange {
+        key: Bytes,
+        start: i64,
+        stop: i64,
+    },
+    LMove {
+        src: Bytes,
+        dst: Bytes,
+        from: End,
+        to: End,
+    },
+    BPop {
+        keys: Vec<Bytes>,
+        timeout: Option<Duration>,
+        from: End,
+    },
+    BLMove {
+        src: Bytes,
+        dst: Bytes,
+        from: End,
+        to: End,
+        timeout: Option<Duration>,
+    },
+    XAdd {
+        key: Bytes,
+        id: IdSpec,
+        fields: Vec<(Bytes, Bytes)>,
+        trim: Option<Trim>,
+        nomkstream: bool,
+    },
+    XLen {
+        key: Bytes,
+    },
+    XRange {
+        key: Bytes,
+        start: EntryId,
+        stop: EntryId,
+        count: Option<i64>,
+    },
+    XRead {
+        count: Option<i64>,
+        timeout: Blocking,
+        streams: Vec<(Bytes, ReadFrom)>,
+    },
+    XDel {
+        key: Bytes,
+        ids: Vec<EntryId>,
+    },
+    XTrim {
+        key: Bytes,
+        trim: Trim,
+    },
+    Incr {
+        key: Bytes,
+    },
     Multi,
     Exec,
     Discard,
-    Unknown { name: Bytes, args: Vec<Bytes> },
+    Unknown {
+        name: Bytes,
+        args: Vec<Bytes>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +131,10 @@ pub enum CommandError {
     OutOfRange,
     Syntax,
     WrongType,
-    UnknownCommand { name: Bytes, args: Vec<Bytes> },
+    UnknownCommand {
+        name: Bytes,
+        args: Vec<Bytes>,
+    },
     /// MULTI, EXEC or DISCARD reached `execute`. The connection handles them,
     /// so this means a bug, but it still replies with a well formed error.
     HandledByConnection,
@@ -113,34 +189,52 @@ impl From<XaddError> for CommandError {
 }
 
 pub struct BlockSpec {
-    pub timeout: Option<Duration>,   // None means forever
+    pub timeout: Option<Duration>, // None means forever
     pub on_timeout: Value,
 }
 
 pub struct Meta {
-        pub feeds: Vec<Bytes>,
-        pub blocks: Option<BlockSpec>,
-    }
+    pub feeds: Vec<Bytes>,
+    pub blocks: Option<BlockSpec>,
+}
 
 impl Command {
     pub fn meta(&self) -> Meta {
         match self {
-            Command::Push { key, .. } => Meta { feeds: vec![key.clone()], blocks: None },
+            Command::Push { key, .. } => Meta {
+                feeds: vec![key.clone()],
+                blocks: None,
+            },
             Command::BPop { timeout, .. } => Meta {
                 feeds: vec![],
-                blocks: Some(BlockSpec { timeout: *timeout, on_timeout: Value::NullArray }),
+                blocks: Some(BlockSpec {
+                    timeout: *timeout,
+                    on_timeout: Value::NullArray,
+                }),
             },
             Command::BLMove { dst, timeout, .. } => Meta {
                 feeds: vec![dst.clone()],
-                blocks: Some(BlockSpec { timeout: *timeout, on_timeout: Value::NullArray }),
+                blocks: Some(BlockSpec {
+                    timeout: *timeout,
+                    on_timeout: Value::NullArray,
+                }),
             },
-            Command::XAdd { key, .. } => Meta { feeds: vec![key.clone()], blocks: None },
+            Command::XAdd { key, .. } => Meta {
+                feeds: vec![key.clone()],
+                blocks: None,
+            },
             Command::XRead { timeout, .. } => Meta {
                 feeds: vec![],
                 blocks: match timeout {
                     Blocking::No => None,
-                    Blocking::Forever => Some(BlockSpec { timeout: None, on_timeout: Value::NullArray }),
-                    Blocking::For(d) => Some(BlockSpec { timeout: Some(*d), on_timeout: Value::NullArray }),
+                    Blocking::Forever => Some(BlockSpec {
+                        timeout: None,
+                        on_timeout: Value::NullArray,
+                    }),
+                    Blocking::For(d) => Some(BlockSpec {
+                        timeout: Some(*d),
+                        on_timeout: Value::NullArray,
+                    }),
                 },
             },
             Command::Ping(_)
@@ -162,10 +256,12 @@ impl Command {
             | Command::Unknown { .. }
             | Command::Exec
             | Command::Discard
-            | Command::Multi => Meta { feeds: vec![], blocks: None },
+            | Command::Multi => Meta {
+                feeds: vec![],
+                blocks: None,
+            },
         }
     }
-
 }
 
 impl CommandError {
@@ -210,8 +306,9 @@ impl CommandError {
                 Bytes::from_static(b"ERR The ID specified in XADD must be greater than 0-0"),
             CommandError::XaddIdTooSmall =>
                 Bytes::from_static(b"ERR The ID specified in XADD is equal or smaller than the target stream top item"),
-            CommandError::UnbalancedXread => 
-                Bytes::from_static(b"ERR Unbalanced 'xread' list of streams: for each stream key an ID, '+', or '$' must be specified."),
+            CommandError::UnbalancedXread => Bytes::from_static(
+                b"ERR Unbalanced 'xread' list of streams: for each stream key an ID, '+', or '$' must be specified.",
+            ),
             CommandError::Overflow => Bytes::from_static(b"ERR increment or decrement would overflow"),
             CommandError::LimitWithoutApprox => Bytes::from_static(b"ERR syntax error, LIMIT cannot be used without the special ~ option"),
             CommandError::MaxlenNegative => Bytes::from_static(b"ERR The MAXLEN argument must be >= 0."),
@@ -283,7 +380,10 @@ pub fn to_command(v: Value) -> Result<Option<Command>, CommandError> {
 
     let cmd = match parsed {
         Some(result) => result?,
-        None => Command::Unknown { name: name.clone(), args: rest.to_vec() },
+        None => Command::Unknown {
+            name: name.clone(),
+            args: rest.to_vec(),
+        },
     };
     Ok(Some(cmd))
 }
@@ -424,25 +524,58 @@ fn parse_block(raw: &[u8]) -> Result<Blocking, CommandError> {
 
 pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError> {
     match cmd {
-        Command::Ping(msg) => Ok(Outcome::Reply(generic::ping(msg)?)), 
+        Command::Ping(msg) => Ok(Outcome::Reply(generic::ping(msg)?)),
         Command::Echo(msg) => Ok(Outcome::Reply(generic::echo(msg)?)),
         Command::Type { key } => Ok(Outcome::Reply(generic::type_of(&key, db)?)),
         Command::Del { keys } => Ok(Outcome::Reply(generic::del(keys, db)?)),
         Command::Exists { keys } => Ok(Outcome::Reply(generic::exists(keys, db)?)),
         Command::Get { key } => Ok(Outcome::Reply(string::get(&key, db)?)),
-        Command::Set { key, value, expiry } => Ok(Outcome::Reply(string::set(key, value, expiry, db)?)),
-        Command::Push { key, values, from } => Ok(Outcome::Reply(list::push(key, values, from, db)?)),
+        Command::Set { key, value, expiry } => {
+            Ok(Outcome::Reply(string::set(key, value, expiry, db)?))
+        }
+        Command::Push { key, values, from } => {
+            Ok(Outcome::Reply(list::push(key, values, from, db)?))
+        }
         Command::Pop { key, count, from } => Ok(Outcome::Reply(list::pop(&key, count, from, db)?)),
         Command::LLen { key } => Ok(Outcome::Reply(list::llen(&key, db)?)),
-        Command::LRange { key, start, stop } => Ok(Outcome::Reply(list::lrange(&key, start, stop, db)?)),
-        Command::LMove { src, dst, from, to } => Ok(Outcome::Reply(list::lmove(&src, dst, from, to, db)?)),
-        Command::BPop { keys, timeout, from } => list::bpop(keys, from, timeout, db),
-        Command::BLMove { src, dst, from, to, timeout } => list::blmove(src, dst, from, to, timeout, db),
-        Command::XAdd { key, id, fields, trim, nomkstream } => stream::xadd(key, id, fields, trim, nomkstream, db),
+        Command::LRange { key, start, stop } => {
+            Ok(Outcome::Reply(list::lrange(&key, start, stop, db)?))
+        }
+        Command::LMove { src, dst, from, to } => {
+            Ok(Outcome::Reply(list::lmove(&src, dst, from, to, db)?))
+        }
+        Command::BPop {
+            keys,
+            timeout,
+            from,
+        } => list::bpop(keys, from, timeout, db),
+        Command::BLMove {
+            src,
+            dst,
+            from,
+            to,
+            timeout,
+        } => list::blmove(src, dst, from, to, timeout, db),
+        Command::XAdd {
+            key,
+            id,
+            fields,
+            trim,
+            nomkstream,
+        } => stream::xadd(key, id, fields, trim, nomkstream, db),
         Command::XLen { key } => stream::xlen(&key, db),
-        Command::XRange { key, start, stop, count } => stream::xrange(&key, start, stop, count, db),
-        Command::XRead { count, timeout, streams } => stream::xread(count, timeout, streams, db),
-        Command::XDel { key, ids} => stream::xdel(&key, &ids, db),
+        Command::XRange {
+            key,
+            start,
+            stop,
+            count,
+        } => stream::xrange(&key, start, stop, count, db),
+        Command::XRead {
+            count,
+            timeout,
+            streams,
+        } => stream::xread(count, timeout, streams, db),
+        Command::XDel { key, ids } => stream::xdel(&key, &ids, db),
         Command::XTrim { key, trim } => stream::xtrim(&key, &trim, db),
         Command::Incr { key } => Ok(Outcome::Reply(integer::incr(&key, db)?)),
         Command::Unknown { name, args } => Err(CommandError::UnknownCommand { name, args }),
@@ -489,7 +622,6 @@ fn quote_args(args: &[Bytes]) -> String {
     s
 }
 
-
 #[cfg(test)]
 pub(super) mod test_support {
     use super::*;
@@ -510,12 +642,11 @@ pub(super) mod test_support {
     }
 }
 
-
 #[cfg(test)]
 mod command_tests {
     use super::*;
-    use crate::resp::{encode, parse};
     use crate::command::test_support::{cmd, cmd_ok, db};
+    use crate::resp::{encode, parse};
 
     #[test]
     fn command_name_is_case_insensitive() {
@@ -527,7 +658,10 @@ mod command_tests {
     #[test]
     fn request_must_be_an_array_of_bulk_strings() {
         assert!(matches!(cmd(b":5\r\n"), Err(CommandError::NotAnArray)));
-        assert!(matches!(cmd(b"*1\r\n:5\r\n"), Err(CommandError::NotBulkString)));
+        assert!(matches!(
+            cmd(b"*1\r\n:5\r\n"),
+            Err(CommandError::NotBulkString)
+        ));
     }
 
     /// `*0\r\n` is a valid frame that Redis consumes without replying.
@@ -575,7 +709,10 @@ mod command_tests {
     fn get_missing_key_is_null_bulk_string() {
         let mut d = db();
         let c = cmd_ok(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
-        assert_eq!(execute(c, &mut d).unwrap(), Outcome::Reply(Value::NullBulkString));
+        assert_eq!(
+            execute(c, &mut d).unwrap(),
+            Outcome::Reply(Value::NullBulkString)
+        );
     }
 
     #[test]
@@ -604,7 +741,10 @@ mod command_tests {
     fn error_replies_have_exactly_one_sigil() {
         let mut d = db();
         let err = execute(
-            Command::Unknown { name: Bytes::from_static(b"FOO"), args: vec![] },
+            Command::Unknown {
+                name: Bytes::from_static(b"FOO"),
+                args: vec![],
+            },
             &mut d,
         )
         .unwrap_err();
@@ -632,7 +772,11 @@ mod command_tests {
         let mut out = Vec::new();
         encode(&Value::Error(err.to_resp()), &mut out);
         let (consumed, _) = parse(&out).unwrap().unwrap();
-        assert_eq!(consumed, out.len(), "one command must produce one reply frame");
+        assert_eq!(
+            consumed,
+            out.len(),
+            "one command must produce one reply frame"
+        );
     }
 
     #[test]

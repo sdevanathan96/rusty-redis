@@ -1,7 +1,10 @@
 use bytes::Bytes;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EntryId { pub ms: u64, pub seq: u64 }
+pub struct EntryId {
+    pub ms: u64,
+    pub seq: u64,
+}
 impl EntryId {
     pub fn to_bytes(&self) -> Bytes {
         Bytes::from(format!("{}-{}", self.ms, self.seq))
@@ -40,7 +43,11 @@ pub enum Mode {
 /// What trimming does to consumer group references. Parsed and kept for when
 /// groups exist; with none, all three behave the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RefPolicy { KeepRef, DelRef, Acked }
+pub enum RefPolicy {
+    KeepRef,
+    DelRef,
+    Acked,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamEntry {
@@ -51,7 +58,7 @@ pub struct StreamEntry {
 pub enum ReadFrom {
     Id(EntryId),
     Latest,
-    Last
+    Last,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,9 +76,11 @@ pub struct Stream {
 
 impl Stream {
     // explicit id: validate and append
-    pub fn append(&mut self, id: EntryId, fields: Vec<(Bytes, Bytes)>)
-    -> Result<EntryId, XaddError>
-    {
+    pub fn append(
+        &mut self,
+        id: EntryId,
+        fields: Vec<(Bytes, Bytes)>,
+    ) -> Result<EntryId, XaddError> {
         if id.ms == 0 && id.seq == 0 {
             return Err(XaddError::IdIsZero);
         }
@@ -84,15 +93,24 @@ impl Stream {
     }
 
     // auto sequence: derive the seq from last_id, then append
-    pub fn append_auto_seq(&mut self, ms: u64, fields: Vec<(Bytes, Bytes)>)
-        -> Result<EntryId, XaddError>
-    {
+    pub fn append_auto_seq(
+        &mut self,
+        ms: u64,
+        fields: Vec<(Bytes, Bytes)>,
+    ) -> Result<EntryId, XaddError> {
         if ms < self.last_id.ms {
             return Err(XaddError::IdTooSmall);
         }
 
         let id = if ms == self.last_id.ms {
-            EntryId { ms, seq: self.last_id.seq.checked_add(1).ok_or(XaddError::IdTooSmall)? }
+            EntryId {
+                ms,
+                seq: self
+                    .last_id
+                    .seq
+                    .checked_add(1)
+                    .ok_or(XaddError::IdTooSmall)?,
+            }
         } else {
             EntryId { ms, seq: 0 }
         };
@@ -126,8 +144,8 @@ impl Stream {
     }
 
     pub fn range(&self, start: EntryId, end: EntryId, count: Option<usize>) -> &[StreamEntry] {
-        let lo = self.entries.partition_point(|e| e.id < start);   // inclusive start
-        let hi = self.entries.partition_point(|e| e.id <= end);    // inclusive end
+        let lo = self.entries.partition_point(|e| e.id < start); // inclusive start
+        let hi = self.entries.partition_point(|e| e.id <= end); // inclusive end
         let slice = &self.entries[lo..hi];
         match count {
             Some(n) => &slice[..n.min(slice.len())],
@@ -135,8 +153,7 @@ impl Stream {
         }
     }
 
-    pub(super) fn range_after(&self, after: EntryId, count: Option<usize>)
-    -> &[StreamEntry] {
+    pub(super) fn range_after(&self, after: EntryId, count: Option<usize>) -> &[StreamEntry] {
         let lo = self.entries.partition_point(|e| e.id <= after); // exclusive: skip `after` itself
         let slice = &self.entries[lo..];
         match count {
@@ -177,8 +194,8 @@ impl Stream {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IdSpec {
     Explicit(EntryId),
-    AutoSeq(u64),      // ms given, seq to be generated
-    Auto,              // both generated
+    AutoSeq(u64), // ms given, seq to be generated
+    Auto,         // both generated
 }
 
 #[cfg(test)]
@@ -195,7 +212,11 @@ mod trim_tests {
     }
 
     fn trim(by: TrimBy, mode: Mode) -> Trim {
-        Trim { by, mode, refs: RefPolicy::KeepRef }
+        Trim {
+            by,
+            mode,
+            refs: RefPolicy::KeepRef,
+        }
     }
 
     fn id(ms: u64, seq: u64) -> EntryId {
@@ -204,7 +225,10 @@ mod trim_tests {
 
     /// The milliseconds of every entry left, oldest first.
     fn left(s: &Stream) -> Vec<u64> {
-        s.range(id(0, 0), id(u64::MAX, u64::MAX), None).iter().map(|e| e.id.ms).collect()
+        s.range(id(0, 0), id(u64::MAX, u64::MAX), None)
+            .iter()
+            .map(|e| e.id.ms)
+            .collect()
     }
 
     #[test]
@@ -217,7 +241,11 @@ mod trim_tests {
     #[test]
     fn maxlen_above_the_length_removes_nothing() {
         let mut s = five();
-        assert_eq!(s.trim(&trim(TrimBy::MaxLen(10), Mode::Exact)), 0, "saturating, not an underflow");
+        assert_eq!(
+            s.trim(&trim(TrimBy::MaxLen(10), Mode::Exact)),
+            0,
+            "saturating, not an underflow"
+        );
         assert_eq!(s.len(), 5);
     }
 
@@ -247,14 +275,20 @@ mod trim_tests {
     fn approx_trims_exactly_here() {
         // Redis would remove nothing from a stream this short.
         let mut s = five();
-        assert_eq!(s.trim(&trim(TrimBy::MaxLen(2), Mode::Approx { limit: None })), 3);
+        assert_eq!(
+            s.trim(&trim(TrimBy::MaxLen(2), Mode::Approx { limit: None })),
+            3
+        );
         assert_eq!(left(&s), [4, 5]);
     }
 
     #[test]
     fn limit_caps_the_removals() {
         let mut s = five();
-        assert_eq!(s.trim(&trim(TrimBy::MaxLen(0), Mode::Approx { limit: Some(2) })), 2);
+        assert_eq!(
+            s.trim(&trim(TrimBy::MaxLen(0), Mode::Approx { limit: Some(2) })),
+            2
+        );
         assert_eq!(left(&s), [3, 4, 5], "the oldest two go first");
     }
 
@@ -262,9 +296,14 @@ mod trim_tests {
     fn a_full_trim_keeps_the_last_id() {
         let mut s = five();
         s.trim(&trim(TrimBy::MaxLen(0), Mode::Exact));
-        assert!(matches!(s.append(id(1, 0), vec![]), Err(XaddError::IdTooSmall)));
-        assert!(matches!(s.append_auto_seq(5, vec![]), Ok(EntryId { ms: 5, seq: 1 })),
-            "auto sequence continues from 5-0, not from an empty stream");
+        assert!(matches!(
+            s.append(id(1, 0), vec![]),
+            Err(XaddError::IdTooSmall)
+        ));
+        assert!(
+            matches!(s.append_auto_seq(5, vec![]), Ok(EntryId { ms: 5, seq: 1 })),
+            "auto sequence continues from 5-0, not from an empty stream"
+        );
         assert!(s.append(id(6, 0), vec![]).is_ok());
     }
 }

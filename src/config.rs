@@ -16,7 +16,9 @@ pub struct NetConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { net: NetConfig { port: 6379 } }
+        Config {
+            net: NetConfig { port: 6379 },
+        }
     }
 }
 
@@ -24,13 +26,27 @@ impl Default for Config {
 /// lowercased, which is how Redis matches it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
-    UnknownFlag { flag: String },
+    UnknownFlag {
+        flag: String,
+    },
     /// A token before the first `--flag`. Redis would read it as a config
     /// file path; config files are not supported here.
-    UnexpectedArgument { value: String },
-    WrongNumberOfArguments { flag: String },
-    NotAnInteger { flag: String, value: String },
-    OutOfRange { flag: String, value: String, min: i64, max: i64 },
+    UnexpectedArgument {
+        value: String,
+    },
+    WrongNumberOfArguments {
+        flag: String,
+    },
+    NotAnInteger {
+        flag: String,
+        value: String,
+    },
+    OutOfRange {
+        flag: String,
+        value: String,
+        min: i64,
+        max: i64,
+    },
     /// Port 0, which Redis reads as "no TCP listener". With no unix socket
     /// either, there is nowhere left to listen.
     NotListening,
@@ -48,9 +64,17 @@ impl fmt::Display for ConfigError {
                 write!(f, "--{flag}: wrong number of arguments")
             }
             ConfigError::NotAnInteger { flag, value } => {
-                write!(f, "--{flag} \"{value}\": argument couldn't be parsed into an integer")
+                write!(
+                    f,
+                    "--{flag} \"{value}\": argument couldn't be parsed into an integer"
+                )
             }
-            ConfigError::OutOfRange { flag, value, min, max } => write!(
+            ConfigError::OutOfRange {
+                flag,
+                value,
+                min,
+                max,
+            } => write!(
                 f,
                 "--{flag} \"{value}\": argument must be between {min} and {max} inclusive"
             ),
@@ -97,7 +121,9 @@ fn group(args: &[String]) -> Result<Vec<(String, Vec<String>)>, ConfigError> {
 /// number and a number that is not a port fail with different errors.
 fn port(flag: &str, values: &[String]) -> Result<u16, ConfigError> {
     let [value] = values else {
-        return Err(ConfigError::WrongNumberOfArguments { flag: flag.to_string() });
+        return Err(ConfigError::WrongNumberOfArguments {
+            flag: flag.to_string(),
+        });
     };
     let n = strict_i64(value.as_bytes()).ok_or_else(|| ConfigError::NotAnInteger {
         flag: flag.to_string(),
@@ -149,7 +175,10 @@ mod tests {
         for value in ["abc", "06395", "+7000", " 7000"] {
             assert_eq!(
                 port_err(value),
-                Err(ConfigError::NotAnInteger { flag: "port".into(), value: value.into() }),
+                Err(ConfigError::NotAnInteger {
+                    flag: "port".into(),
+                    value: value.into()
+                }),
                 "{value:?}"
             );
         }
@@ -160,7 +189,12 @@ mod tests {
         for value in ["-1", "70000"] {
             assert_eq!(
                 port_err(value),
-                Err(ConfigError::OutOfRange { flag: "port".into(), value: value.into(), min: 0, max: 65535 }),
+                Err(ConfigError::OutOfRange {
+                    flag: "port".into(),
+                    value: value.into(),
+                    min: 0,
+                    max: 65535
+                }),
                 "{value:?}"
             );
         }
@@ -171,7 +205,9 @@ mod tests {
         for argv in ["--port", "--port 7000 extra", "--port --other"] {
             assert_eq!(
                 parse(&args(argv)),
-                Err(ConfigError::WrongNumberOfArguments { flag: "port".into() }),
+                Err(ConfigError::WrongNumberOfArguments {
+                    flag: "port".into()
+                }),
                 "{argv:?}"
             );
         }
@@ -180,14 +216,20 @@ mod tests {
     #[test]
     fn port_zero_listens_nowhere() {
         assert_eq!(parse(&args("--port 0")), Err(ConfigError::NotListening));
-        assert_eq!(parse(&args("--port 1 --port 0")), Err(ConfigError::NotListening), "the last one wins");
+        assert_eq!(
+            parse(&args("--port 1 --port 0")),
+            Err(ConfigError::NotListening),
+            "the last one wins"
+        );
     }
 
     #[test]
     fn an_unknown_flag_is_an_error() {
         assert_eq!(
             parse(&args("--nosuchflag 1")),
-            Err(ConfigError::UnknownFlag { flag: "nosuchflag".into() })
+            Err(ConfigError::UnknownFlag {
+                flag: "nosuchflag".into()
+            })
         );
     }
 
@@ -195,13 +237,18 @@ mod tests {
     fn an_argument_before_any_flag_is_an_error() {
         assert_eq!(
             parse(&args("redis.conf --port 7000")),
-            Err(ConfigError::UnexpectedArgument { value: "redis.conf".into() })
+            Err(ConfigError::UnexpectedArgument {
+                value: "redis.conf".into()
+            })
         );
     }
 
     #[test]
     fn errors_name_the_flag_and_the_value() {
         let e = port_err("abc").unwrap_err();
-        assert_eq!(e.to_string(), "--port \"abc\": argument couldn't be parsed into an integer");
+        assert_eq!(
+            e.to_string(),
+            "--port \"abc\": argument couldn't be parsed into an integer"
+        );
     }
 }

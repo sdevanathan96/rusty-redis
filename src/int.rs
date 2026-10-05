@@ -40,9 +40,7 @@ pub fn strict_i64(raw: &[u8]) -> Option<i64> {
         if !b.is_ascii_digit() {
             return None; // catches trailing junk and embedded whitespace
         }
-        magnitude = magnitude
-            .checked_mul(10)?
-            .checked_add((b - b'0') as u64)?;
+        magnitude = magnitude.checked_mul(10)?.checked_add((b - b'0') as u64)?;
     }
 
     if negative {
@@ -80,33 +78,43 @@ mod tests {
             (b"-9223372036854775808", i64::MIN),
         ];
         for (raw, want) in good {
-            assert_eq!(strict_i64(raw), Some(*want), "input {:?}", String::from_utf8_lossy(raw));
+            assert_eq!(
+                strict_i64(raw),
+                Some(*want),
+                "input {:?}",
+                String::from_utf8_lossy(raw)
+            );
         }
     }
 
     #[test]
     fn rejects_what_redis_rejects() {
         let bad: &[&[u8]] = &[
-            b"",                        // empty
-            b"+1",                      // leading plus
-            b"01",                      // leading zero
-            b"00",                      // leading zeros, value zero
-            b"-0",                      // sign then zero: first digit must be 1..=9
+            b"",   // empty
+            b"+1", // leading plus
+            b"01", // leading zero
+            b"00", // leading zeros, value zero
+            b"-0", // sign then zero: first digit must be 1..=9
             b"-01",
-            b" 1",                      // leading space
-            b"1 ",                      // trailing space
+            b" 1", // leading space
+            b"1 ", // trailing space
             b"1\n",
-            b"1.0",                     // not an integer
+            b"1.0", // not an integer
             b"1e3",
             b"abc",
-            b"-",                       // sign with no digits
+            b"-", // sign with no digits
             b"--1",
             b"9223372036854775808",     // i64::MAX + 1
             b"-9223372036854775809",    // i64::MIN - 1
             b"99999999999999999999999", // overflows u64 during accumulation
         ];
         for raw in bad {
-            assert_eq!(strict_i64(raw), None, "input {:?}", String::from_utf8_lossy(raw));
+            assert_eq!(
+                strict_i64(raw),
+                None,
+                "input {:?}",
+                String::from_utf8_lossy(raw)
+            );
         }
     }
 

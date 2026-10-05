@@ -2,10 +2,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use super::{expiry_arg, Command, CommandError, ExpiryUnit};
+use super::{Command, CommandError, ExpiryUnit, expiry_arg};
 use crate::db::Db;
 use crate::resp::Value;
-
 
 pub(super) fn try_parse(
     upper: &[u8],
@@ -15,17 +14,17 @@ pub(super) fn try_parse(
     Some(match upper {
         b"GET" => get_command(rest, name),
         b"SET" => set_command(rest, name),
-        _ => return None,          // not a list command
+        _ => return None, // not a list command
     })
 }
 
-fn get_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>{
+fn get_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [key] => Ok(Command::Get { key: key.clone() }),
         _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
-fn set_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>{
+fn set_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     let (key, value) = match rest {
         [k, v, ..] => (k.clone(), v.clone()),
         _ => return Err(CommandError::WrongArity(name.clone())),
@@ -63,7 +62,12 @@ pub(super) fn get(key: &Bytes, db: &mut Db) -> Result<Value, CommandError> {
     })
 }
 
-pub(super) fn set(key: Bytes, value: Bytes, expiry: Option<Duration>, db: &mut Db) -> Result<Value, CommandError> {
+pub(super) fn set(
+    key: Bytes,
+    value: Bytes,
+    expiry: Option<Duration>,
+    db: &mut Db,
+) -> Result<Value, CommandError> {
     db.set(key, value, expiry)
         .map_err(|_| CommandError::InvalidExpiry(Bytes::from_static(b"set")))?;
     Ok(Value::SimpleString(Bytes::from_static(b"OK")))
@@ -71,10 +75,10 @@ pub(super) fn set(key: Bytes, value: Bytes, expiry: Option<Duration>, db: &mut D
 
 #[cfg(test)]
 mod string_tests {
-    use super::*;
     use super::super::test_support::{cmd, cmd_ok};
+    use super::*;
 
-        #[test]
+    #[test]
     fn option_keyword_is_case_insensitive() {
         assert_eq!(
             cmd_ok(b"*5\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\npx\r\n$3\r\n100\r\n"),
@@ -93,7 +97,14 @@ mod string_tests {
         let ex = cmd_ok(b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$1\r\n1\r\n");
         let px = cmd_ok(b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n$1\r\n1\r\n");
         match (ex, px) {
-            (Command::Set { expiry: Some(a), .. }, Command::Set { expiry: Some(b), .. }) => {
+            (
+                Command::Set {
+                    expiry: Some(a), ..
+                },
+                Command::Set {
+                    expiry: Some(b), ..
+                },
+            ) => {
                 assert_eq!(a, Duration::from_secs(1));
                 assert_eq!(b, Duration::from_millis(1));
             }

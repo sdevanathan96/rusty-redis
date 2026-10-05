@@ -2,11 +2,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use super::{parse_end, parse_i64, parse_timeout, Command, CommandError, End};
+use super::{Command, CommandError, End, parse_end, parse_i64, parse_timeout};
 use crate::command::Outcome;
 use crate::db::Db;
 use crate::resp::Value;
-
 
 pub(super) fn try_parse(
     upper: &[u8],
@@ -16,18 +15,17 @@ pub(super) fn try_parse(
     Some(match upper {
         b"RPUSH" => push_command(rest, name, End::Right),
         b"LPUSH" => push_command(rest, name, End::Left),
-        b"LPOP"  => pop_command(rest, name, End::Left),
-        b"RPOP"  => pop_command(rest, name, End::Right),
+        b"LPOP" => pop_command(rest, name, End::Left),
+        b"RPOP" => pop_command(rest, name, End::Right),
         b"BLPOP" => bpop_command(rest, name, End::Left),
         b"BRPOP" => bpop_command(rest, name, End::Right),
-        b"LLEN"  => llen_command(rest, name),
+        b"LLEN" => llen_command(rest, name),
         b"LRANGE" => lrange_command(rest, name),
-        b"LMOVE"  => lmove_command(rest, name),
+        b"LMOVE" => lmove_command(rest, name),
         b"BLMOVE" => blmove_command(rest, name),
-        _ => return None,          // not a list command
+        _ => return None, // not a list command
     })
 }
-
 
 fn push_command(rest: &[Bytes], name: &Bytes, from: End) -> Result<Command, CommandError> {
     match rest {
@@ -62,7 +60,11 @@ fn pop_command(rest: &[Bytes], name: &Bytes, from: End) -> Result<Command, Comma
         }
     };
 
-    Ok(Command::Pop { key: key.clone(), count, from })
+    Ok(Command::Pop {
+        key: key.clone(),
+        count,
+        from,
+    })
 }
 
 fn bpop_command(rest: &[Bytes], name: &Bytes, from: End) -> Result<Command, CommandError> {
@@ -76,14 +78,12 @@ fn bpop_command(rest: &[Bytes], name: &Bytes, from: End) -> Result<Command, Comm
     }
 }
 
-
 fn llen_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [key] => Ok(Command::LLen { key: key.clone() }),
         _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
-
 
 fn lrange_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
@@ -121,10 +121,20 @@ fn blmove_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>
     }
 }
 
-pub(super) fn push(key: Bytes, values: Vec<Bytes>, from: End, db: &mut Db) -> Result<Value, CommandError> {
+pub(super) fn push(
+    key: Bytes,
+    values: Vec<Bytes>,
+    from: End,
+    db: &mut Db,
+) -> Result<Value, CommandError> {
     Ok(Value::Integer(db.push(key, values, from)? as i64))
 }
-pub(super) fn pop(key: &Bytes, count: Option<usize>, from: End, db: &mut Db) -> Result<Value, CommandError> {
+pub(super) fn pop(
+    key: &Bytes,
+    count: Option<usize>,
+    from: End,
+    db: &mut Db,
+) -> Result<Value, CommandError> {
     let popped = db.pop(key, count, from)?;
     Ok(match (count, popped) {
         (None, Some(v)) => v
@@ -145,24 +155,34 @@ pub(super) fn bpop(
 ) -> Result<Outcome, CommandError> {
     for key in &keys {
         if let Some(v) = db.pop(key, None, from)?
-            && let Some(elem) = v.into_iter().next() {
-                return Ok(Outcome::Reply(Value::Array(vec![
-                    Value::BulkString(key.clone()),
-                    Value::BulkString(elem),
-                ])));
-            }
+            && let Some(elem) = v.into_iter().next()
+        {
+            return Ok(Outcome::Reply(Value::Array(vec![
+                Value::BulkString(key.clone()),
+                Value::BulkString(elem),
+            ])));
+        }
     }
 
     Ok(Outcome::Block {
         keys: keys.clone(),
-        retry: Command::BPop { keys, from, timeout },
+        retry: Command::BPop {
+            keys,
+            from,
+            timeout,
+        },
     })
 }
 
 pub(super) fn llen(key: &Bytes, db: &mut Db) -> Result<Value, CommandError> {
     Ok(Value::Integer(db.llen(key)? as i64))
 }
-pub(super) fn lrange(key: &Bytes, start: i64, stop: i64, db: &mut Db) -> Result<Value, CommandError> {
+pub(super) fn lrange(
+    key: &Bytes,
+    start: i64,
+    stop: i64,
+    db: &mut Db,
+) -> Result<Value, CommandError> {
     Ok(Value::Array(
         db.lrange(key, start, stop)?
             .into_iter()
@@ -170,29 +190,46 @@ pub(super) fn lrange(key: &Bytes, start: i64, stop: i64, db: &mut Db) -> Result<
             .collect(),
     ))
 }
-pub(super) fn lmove(src: &Bytes, dst: Bytes, from: End, to: End, db: &mut Db) -> Result<Value, CommandError> {
+pub(super) fn lmove(
+    src: &Bytes,
+    dst: Bytes,
+    from: End,
+    to: End,
+    db: &mut Db,
+) -> Result<Value, CommandError> {
     Ok(match db.lmove(src, dst, from, to)? {
         Some(v) => Value::BulkString(v),
         None => Value::NullBulkString,
     })
 }
 
-
-pub(super) fn blmove(src: Bytes, dst: Bytes, from: End, to: End, timeout: Option<Duration>, db: &mut Db) -> Result<Outcome, CommandError> {
+pub(super) fn blmove(
+    src: Bytes,
+    dst: Bytes,
+    from: End,
+    to: End,
+    timeout: Option<Duration>,
+    db: &mut Db,
+) -> Result<Outcome, CommandError> {
     match db.lmove(&src, dst.clone(), from, to)? {
         Some(v) => Ok(Outcome::Reply(Value::BulkString(v))),
         None => Ok(Outcome::Block {
             keys: vec![src.clone()],
-            retry: Command::BLMove { src, dst, from, to, timeout },
+            retry: Command::BLMove {
+                src,
+                dst,
+                from,
+                to,
+                timeout,
+            },
         }),
     }
 }
 
 #[cfg(test)]
 mod list_tests {
-    use super::*;
     use super::super::test_support::{cmd, cmd_ok};
-
+    use super::*;
 
     /// Unlike the expiry arguments, a pop count uses one message for both a
     /// non numeric value and a negative one.
@@ -243,4 +280,3 @@ mod list_tests {
         ));
     }
 }
-

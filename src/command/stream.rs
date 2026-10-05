@@ -1,6 +1,10 @@
 use bytes::Bytes;
 
-use crate::{command::{Blocking, Command, CommandError, Outcome, lenient_u64, parse_block, parse_i64}, db::{Db, EntryId, IdSpec, Mode, ReadFrom, RefPolicy, StreamEntry, Trim, TrimBy}, resp::Value};
+use crate::{
+    command::{Blocking, Command, CommandError, Outcome, lenient_u64, parse_block, parse_i64},
+    db::{Db, EntryId, IdSpec, Mode, ReadFrom, RefPolicy, StreamEntry, Trim, TrimBy},
+    resp::Value,
+};
 
 /// The trim options XADD and XTRIM share, collected one token at a time.
 #[derive(Default)]
@@ -47,7 +51,7 @@ impl TrimOptions {
                 }
                 self.limit = Some(n as usize);
                 Ok(Some(2))
-            },
+            }
             // Consumer group options. Only one may appear, anywhere among the
             // trim options.
             b"KEEPREF" | b"DELREF" | b"ACKED" => {
@@ -76,13 +80,19 @@ impl TrimOptions {
             return Ok(None);
         };
         let mode = if self.approx {
-            Mode::Approx { limit: self.limit.filter(|&n| n != 0) } // LIMIT 0 means no limit
+            Mode::Approx {
+                limit: self.limit.filter(|&n| n != 0),
+            } // LIMIT 0 means no limit
         } else if self.limit.is_some() {
             return Err(CommandError::LimitWithoutApprox);
         } else {
             Mode::Exact
         };
-        Ok(Some(Trim { by, mode, refs: self.refs.unwrap_or(RefPolicy::KeepRef) }))
+        Ok(Some(Trim {
+            by,
+            mode,
+            refs: self.refs.unwrap_or(RefPolicy::KeepRef),
+        }))
     }
 }
 
@@ -93,7 +103,10 @@ fn parse_xadd_id(raw: &[u8]) -> Result<IdSpec, CommandError> {
     let text = std::str::from_utf8(raw).map_err(|_| CommandError::InvalidStreamId)?;
 
     match text.split_once('-') {
-        None => Ok(IdSpec::Explicit(EntryId { ms: lenient_u64(text)?, seq: 0 })),
+        None => Ok(IdSpec::Explicit(EntryId {
+            ms: lenient_u64(text)?,
+            seq: 0,
+        })),
         Some((ms, "*")) => Ok(IdSpec::AutoSeq(lenient_u64(ms)?)),
         Some((ms, seq)) => Ok(IdSpec::Explicit(EntryId {
             ms: lenient_u64(ms)?,
@@ -107,8 +120,14 @@ fn parse_xadd_id(raw: &[u8]) -> Result<IdSpec, CommandError> {
 fn parse_bound(raw: &[u8], default_seq: u64) -> Result<EntryId, CommandError> {
     let text = std::str::from_utf8(raw).map_err(|_| CommandError::InvalidStreamId)?;
     match text.split_once('-') {
-        None => Ok(EntryId { ms: lenient_u64(text)?, seq: default_seq }),
-        Some((ms, seq)) => Ok(EntryId { ms: lenient_u64(ms)?, seq: lenient_u64(seq)? }),
+        None => Ok(EntryId {
+            ms: lenient_u64(text)?,
+            seq: default_seq,
+        }),
+        Some((ms, seq)) => Ok(EntryId {
+            ms: lenient_u64(ms)?,
+            seq: lenient_u64(seq)?,
+        }),
     }
 }
 
@@ -121,7 +140,10 @@ fn parse_range_start(raw: &[u8]) -> Result<EntryId, CommandError> {
 
 fn parse_range_end(raw: &[u8]) -> Result<EntryId, CommandError> {
     if raw == b"+" {
-        return Ok(EntryId { ms: u64::MAX, seq: u64::MAX });
+        return Ok(EntryId {
+            ms: u64::MAX,
+            seq: u64::MAX,
+        });
     }
     parse_bound(raw, u64::MAX)
 }
@@ -134,8 +156,8 @@ fn parse_read_from(raw: &[u8]) -> Result<ReadFrom, CommandError> {
     match raw {
         b"$" => Ok(ReadFrom::Latest),
         b"+" => Ok(ReadFrom::Last),
-        _ => Ok(ReadFrom::Id(parse_bound(raw, 0)?)) 
-    }    // reuse XRANGE's helper
+        _ => Ok(ReadFrom::Id(parse_bound(raw, 0)?)),
+    } // reuse XRANGE's helper
 }
 
 fn arg_after(args: &[Bytes], i: usize) -> Result<&Bytes, CommandError> {
@@ -143,10 +165,7 @@ fn arg_after(args: &[Bytes], i: usize) -> Result<&Bytes, CommandError> {
 }
 /// Field/value pairs from a flat argument list. At least one pair, and the
 /// count must be even.
-fn parse_fields(
-    args: &[Bytes],
-    name: &Bytes,
-) -> Result<Vec<(Bytes, Bytes)>, CommandError> {
+fn parse_fields(args: &[Bytes], name: &Bytes) -> Result<Vec<(Bytes, Bytes)>, CommandError> {
     if args.is_empty() || !args.len().is_multiple_of(2) {
         return Err(CommandError::WrongArity(name.clone()));
     }
@@ -157,20 +176,19 @@ fn parse_fields(
 }
 
 fn xentries_to_value(entries: &[StreamEntry]) -> Value {
-    Value::Array(entries
-        .iter()
-        .map(|e| {
-            let mut flat = Vec::with_capacity(e.fields.len() * 2);
-            for (f, v) in &e.fields {
-                flat.push(Value::BulkString(f.clone()));
-                flat.push(Value::BulkString(v.clone()));
-            }
-            Value::Array(vec![
-                Value::BulkString(e.id.to_bytes()),
-                Value::Array(flat),
-            ])
-        })
-        .collect())
+    Value::Array(
+        entries
+            .iter()
+            .map(|e| {
+                let mut flat = Vec::with_capacity(e.fields.len() * 2);
+                for (f, v) in &e.fields {
+                    flat.push(Value::BulkString(f.clone()));
+                    flat.push(Value::BulkString(v.clone()));
+                }
+                Value::Array(vec![Value::BulkString(e.id.to_bytes()), Value::Array(flat)])
+            })
+            .collect(),
+    )
 }
 
 fn build_xread_reply(out: Vec<(Bytes, Value)>) -> Value {
@@ -192,10 +210,9 @@ pub(super) fn try_parse(
         b"XREAD" => xread_command(rest, name),
         b"XDEL" => xdel_command(rest, name),
         b"XTRIM" => xtrim_command(rest, name),
-        _ => return None,          // not a Stream command
+        _ => return None, // not a Stream command
     })
 }
-
 
 fn xadd_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     if rest.len() < 4 {
@@ -224,11 +241,18 @@ fn xadd_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     if let IdSpec::Explicit(EntryId { ms: 0, seq: 0 }) = id {
         return Err(CommandError::XaddIdZero);
     }
-    Ok(Command::XAdd { key: rest[0].clone(), id, fields, trim, nomkstream })
+    Ok(Command::XAdd {
+        key: rest[0].clone(),
+        id,
+        fields,
+        trim,
+        nomkstream,
+    })
 }
 
 fn xtrim_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
-    if rest.len() < 3 { // key, MAXLEN|MINID, threshold at the very least
+    if rest.len() < 3 {
+        // key, MAXLEN|MINID, threshold at the very least
         return Err(CommandError::WrongArity(name.clone()));
     }
     let mut opts = TrimOptions::default();
@@ -240,7 +264,10 @@ fn xtrim_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> 
         }
     }
     let trim = opts.finish()?.ok_or(CommandError::Syntax)?; // XTRIM must have a strategy
-    Ok(Command::XTrim { key: rest[0].clone(), trim })
+    Ok(Command::XTrim {
+        key: rest[0].clone(),
+        trim,
+    })
 }
 
 fn xlen_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
@@ -251,7 +278,6 @@ fn xlen_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
 }
 
 fn xrange_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
-
     let (key, start, end, tail) = match rest {
         [key, start, end, tail @ ..] => (key, start, end, tail),
         _ => return Err(CommandError::WrongArity(name.clone())),
@@ -269,11 +295,15 @@ fn xrange_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>
             _ => return Err(CommandError::Syntax),
         }
     }
-    Ok(Command::XRange { key: key.clone(), start, stop, count })
+    Ok(Command::XRange {
+        key: key.clone(),
+        start,
+        stop,
+        count,
+    })
 }
 
 fn xread_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
-
     // STREAMS is the last option, so everything before it is flags and
     // everything after is N keys followed by N ids.
     if rest.len() < 3 {
@@ -313,7 +343,11 @@ fn xread_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> 
         .map(|(k, id)| Ok((k.clone(), parse_read_from(id)?)))
         .collect::<Result<Vec<_>, CommandError>>()?;
 
-    Ok(Command::XRead { count, timeout: block, streams })
+    Ok(Command::XRead {
+        count,
+        timeout: block,
+        streams,
+    })
 }
 
 fn xdel_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
@@ -323,9 +357,9 @@ fn xdel_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
         [key, ids @ ..] if !ids.is_empty() => Ok(Command::XDel {
             key: key.clone(),
             ids: ids
-            .iter()
-            .map(|id| parse_bound(id, 0))
-            .collect::<Result<_, CommandError>>()?,
+                .iter()
+                .map(|id| parse_bound(id, 0))
+                .collect::<Result<_, CommandError>>()?,
         }),
         _ => Err(CommandError::WrongArity(name.clone())),
     }
@@ -339,10 +373,12 @@ pub(super) fn xadd(
     nomkstream: bool,
     db: &mut Db,
 ) -> Result<Outcome, CommandError> {
-    Ok(Outcome::Reply(match db.xadd(key, id, fields, trim, nomkstream)? {
-        Some(id) => Value::BulkString(id.to_bytes()),
-        None => Value::NullBulkString, // NOMKSTREAM on a missing key: $-1, as Redis sends
-    }))
+    Ok(Outcome::Reply(
+        match db.xadd(key, id, fields, trim, nomkstream)? {
+            Some(id) => Value::BulkString(id.to_bytes()),
+            None => Value::NullBulkString, // NOMKSTREAM on a missing key: $-1, as Redis sends
+        },
+    ))
 }
 
 pub(super) fn xtrim(key: &[u8], trim: &Trim, db: &mut Db) -> Result<Outcome, CommandError> {
@@ -353,10 +389,16 @@ pub(super) fn xlen(key: &[u8], db: &mut Db) -> Result<Outcome, CommandError> {
     Ok(Outcome::Reply(Value::Integer(db.xlen(key)? as i64)))
 }
 
-pub(super) fn xrange(key: &[u8], start: EntryId, end: EntryId, count: Option<i64>, db: &mut Db) -> Result<Outcome, CommandError> {
+pub(super) fn xrange(
+    key: &[u8],
+    start: EntryId,
+    end: EntryId,
+    count: Option<i64>,
+    db: &mut Db,
+) -> Result<Outcome, CommandError> {
     let limit = count.map(|n| if n <= 0 { 0 } else { n as usize });
     match db.xrange(key, start, end, limit)? {
-        None => Ok(Outcome::Reply(Value::Array(vec![]))),                    // key missing
+        None => Ok(Outcome::Reply(Value::Array(vec![]))), // key missing
         Some(_) if count.is_some_and(|n| n <= 0) => Ok(Outcome::Reply(Value::NullArray)),
         Some(entries) => Ok(Outcome::Reply(xentries_to_value(entries))),
     }
@@ -370,7 +412,7 @@ pub(super) fn xread(
 ) -> Result<Outcome, CommandError> {
     let limit = match count {
         Some(n) if n > 0 => Some(n as usize),
-        _ => None,                              // absent, zero, or negative: no limit
+        _ => None, // absent, zero, or negative: no limit
     };
 
     let mut out: Vec<(Bytes, Value)> = Vec::new();
@@ -378,7 +420,7 @@ pub(super) fn xread(
         let entries = match *from {
             ReadFrom::Last => db.xlast(key)?,
             ReadFrom::Id(id) => db.xrange_after(key, id, limit)?,
-            ReadFrom::Latest => None,   // `$` means added after this call, so nothing yet
+            ReadFrom::Latest => None, // `$` means added after this call, so nothing yet
         };
         match entries {
             Some(e) if !e.is_empty() => out.push((key.clone(), xentries_to_value(e))),
@@ -408,7 +450,11 @@ pub(super) fn xread(
 
     Ok(Outcome::Block {
         keys,
-        retry: Command::XRead { count, timeout, streams: resolved },
+        retry: Command::XRead {
+            count,
+            timeout,
+            streams: resolved,
+        },
     })
 }
 

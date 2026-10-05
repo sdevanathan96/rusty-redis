@@ -12,13 +12,14 @@ pub(super) fn try_parse(
     Some(match upper {
         b"PING" => ping_command(rest, name),
         b"ECHO" => echo_command(rest, name),
-        b"TYPE"  => type_of_command(rest, name),
-        b"DEL"  => del_command(rest, name),
-        b"EXISTS"  => exists_command(rest, name),
+        b"TYPE" => type_of_command(rest, name),
+        b"DEL" => del_command(rest, name),
+        b"EXISTS" => exists_command(rest, name),
         b"MULTI" => no_args(rest, name, Command::Multi),
         // A rejected EXEC is EXECABORT in Redis, not the plain arity error.
-        b"EXEC" => no_args(rest, name, Command::Exec)
-            .map_err(|e| CommandError::ExecRejected(Box::new(e))),
+        b"EXEC" => {
+            no_args(rest, name, Command::Exec).map_err(|e| CommandError::ExecRejected(Box::new(e)))
+        }
         b"DISCARD" => no_args(rest, name, Command::Discard),
         _ => return None,
     })
@@ -49,21 +50,28 @@ fn type_of_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError
 fn del_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [] => Err(CommandError::WrongArity(name.clone())),
-        keys => Ok(Command::Del { keys: keys.to_vec() }),
+        keys => Ok(Command::Del {
+            keys: keys.to_vec(),
+        }),
     }
 }
 
 fn exists_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
         [] => Err(CommandError::WrongArity(name.clone())),
-        keys => Ok(Command::Exists { keys: keys.to_vec() }),
+        keys => Ok(Command::Exists {
+            keys: keys.to_vec(),
+        }),
     }
 }
 
 fn no_args(rest: &[Bytes], name: &Bytes, cmd: Command) -> Result<Command, CommandError> {
-    if rest.is_empty() { Ok(cmd) } else { Err(CommandError::WrongArity(name.clone())) }
+    if rest.is_empty() {
+        Ok(cmd)
+    } else {
+        Err(CommandError::WrongArity(name.clone()))
+    }
 }
-
 
 pub(super) fn ping(msg: Option<Bytes>) -> Result<Value, CommandError> {
     match msg {
@@ -103,11 +111,10 @@ pub(super) fn exists(keys: Vec<Bytes>, db: &mut Db) -> Result<Value, CommandErro
     Ok(Value::Integer(n))
 }
 
-
 #[cfg(test)]
 mod generic_tests {
+    use super::super::test_support::cmd_ok;
     use super::*;
-    use super::super::test_support::{cmd_ok};
 
     #[test]
     fn ping_and_echo_reply_with_different_types() {
@@ -129,7 +136,13 @@ mod generic_tests {
     #[test]
     fn command_ping_echo_works() {
         assert_eq!(cmd_ok(b"*1\r\n$4\r\nPING\r\n"), Command::Ping(None));
-        assert_eq!(cmd_ok(b"*2\r\n$4\r\nping\r\n$2\r\nhi\r\n"), Command::Ping(Some(Bytes::from_static(b"hi"))));
-        assert_eq!(cmd_ok(b"*2\r\n$4\r\nECHO\r\n$4\r\necho\r\n"), Command::Echo(Bytes::from_static(b"echo")));
+        assert_eq!(
+            cmd_ok(b"*2\r\n$4\r\nping\r\n$2\r\nhi\r\n"),
+            Command::Ping(Some(Bytes::from_static(b"hi")))
+        );
+        assert_eq!(
+            cmd_ok(b"*2\r\n$4\r\nECHO\r\n$4\r\necho\r\n"),
+            Command::Echo(Bytes::from_static(b"echo"))
+        );
     }
 }
