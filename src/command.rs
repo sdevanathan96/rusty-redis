@@ -42,6 +42,9 @@ pub enum Command {
     XDel { key: Bytes, ids: Vec<EntryId>},
     XTrim { key: Bytes, trim: Trim },
     Incr { key: Bytes },
+    Multi,
+    Exec,
+    Discard,
     Unknown { name: Bytes, args: Vec<Bytes> },
 }
 
@@ -56,6 +59,9 @@ pub enum CommandError {
     Syntax,
     WrongType,
     UnknownCommand { name: Bytes, args: Vec<Bytes> },
+    /// MULTI, EXEC or DISCARD reached `execute`. The connection handles them,
+    /// so this means a bug, but it still replies with a well formed error.
+    HandledByConnection,
     TimeoutError,
     MTimeoutError,
     NegativeTimeout,
@@ -70,6 +76,14 @@ pub enum CommandError {
     MaxlenWithMinid,
     LimitNegative,
     LimitWithoutStrategy,
+    NestedMulti,
+    ExecAbort,
+    ExecWithoutMulti,
+    DiscardWithoutMulti,
+    /// EXEC itself was rejected before running, for now only for a wrong
+    /// argument count. Redis answers every such rejection with EXECABORT,
+    /// inside MULTI or not, and discards any open transaction.
+    ExecRejected(Box<CommandError>),
 }
 
 impl From<WrongType> for CommandError {
@@ -145,7 +159,10 @@ impl Command {
             | Command::XDel { .. }
             | Command::XTrim { .. }
             | Command::Incr { .. }
-            | Command::Unknown { .. } => Meta { feeds: vec![], blocks: None },
+            | Command::Unknown { .. }
+            | Command::Exec
+            | Command::Discard
+            | Command::Multi => Meta { feeds: vec![], blocks: None },
         }
     }
 
@@ -201,6 +218,21 @@ impl CommandError {
             CommandError::MaxlenWithMinid => Bytes::from_static(b"ERR syntax error, MAXLEN and MINID options at the same time are not compatible"),
             CommandError::LimitWithoutStrategy => Bytes::from_static(b"ERR syntax error, LIMIT cannot be used without specifying a trimming strategy"),
             CommandError::LimitNegative => Bytes::from_static(b"ERR The LIMIT argument must be >= 0."),
+            CommandError::HandledByConnection => {
+                Bytes::from_static(b"ERR MULTI, EXEC and DISCARD are handled by the connection")
+            },
+            CommandError::NestedMulti => Bytes::from_static(b"ERR MULTI calls can not be nested"),
+            CommandError::ExecAbort => Bytes::from_static(b"EXECABORT Transaction discarded because of previous errors."),
+            CommandError::ExecWithoutMulti => Bytes::from_static(b"ERR EXEC without MULTI"),
+            CommandError::DiscardWithoutMulti => Bytes::from_static(b"ERR DISCARD without MULTI"),
+            CommandError::ExecRejected(inner) => {
+                // Redis gives the reason without its ERR prefix.
+                let reason = inner.to_resp();
+                let reason = reason.strip_prefix(b"ERR ").unwrap_or(&reason);
+                let mut out = b"EXECABORT Transaction discarded because of: ".to_vec();
+                out.extend_from_slice(reason);
+                Bytes::from(out)
+            }
         }
     }
 }
@@ -216,6 +248,12 @@ fn lower(name: &[u8]) -> String {
 ///   Ok(Some(cmd)) - run it and reply
 ///   Ok(None)      - a valid frame that produces no reply at all (empty array)
 ///   Err(e)        - reply with the error
+///
+/// Must stay pure: it reads only the request, never the keyspace or a clock.
+/// Inside MULTI a command is parsed when it is queued but runs at EXEC, so
+/// anything resolved here would reflect the moment of queueing. That is why
+/// `EX` stays a relative `Duration` and `XADD *` and `XREAD $` are resolved by
+/// `execute`. Redis parses at EXEC instead; purity makes the two equivalent.
 pub fn to_command(v: Value) -> Result<Option<Command>, CommandError> {
     let items = match v {
         Value::Array(items) => items,
@@ -408,6 +446,10 @@ pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError> {
         Command::XTrim { key, trim } => stream::xtrim(&key, &trim, db),
         Command::Incr { key } => Ok(Outcome::Reply(integer::incr(&key, db)?)),
         Command::Unknown { name, args } => Err(CommandError::UnknownCommand { name, args }),
+        // Never reached: the connection intercepts these before anything goes
+        // to the keyspace task. An error rather than unreachable!(), because a
+        // panic here would stop the whole server.
+        Command::Multi | Command::Exec | Command::Discard => Err(CommandError::HandledByConnection),
     }
 }
 

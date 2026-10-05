@@ -947,6 +947,62 @@ conn_scenario "a served timed block sends nothing when its timeout passes" \
     "sleep 1.0" "a read"
 
 section "transaction correctness"
+# A transaction lives on one connection, so these are conn_scenarios: run_seq
+# opens a new redis-cli connection per command. Most send the whole sequence in
+# one write and read every reply back in order.
+
+conn_scenario "multi queues and exec runs them in order" \
+    "a send MULTI;SET|{K}|1;INCR|{K};GET|{K};EXEC" "a read"
+
+conn_scenario "an empty transaction" \
+    "a send MULTI;EXEC" "a read"
+
+conn_scenario "exec and discard without multi" \
+    "a send EXEC;DISCARD" "a read"
+
+# A rejected EXEC is EXECABORT even outside MULTI, and inside one it discards
+# the transaction, so the queued SET never runs and the next EXEC has no MULTI.
+conn_scenario "multi command arity" \
+    "a send MULTI|x;EXEC|x;DISCARD|x" "a read" \
+    "a send MULTI;SET|{K}|1;EXEC|x;EXEC;GET|{K}" "a read"
+
+# The nested MULTI is an error but does not fail the transaction.
+conn_scenario "multi cannot be nested" \
+    "a send MULTI;MULTI;SET|{K}|1;EXEC" "a read"
+
+conn_scenario "discard drops the queue" \
+    "a send MULTI;SET|{K}|1;DISCARD;GET|{K};EXEC" "a read"
+
+# Only a wrong argument count and an unknown command fail at queue time. Later
+# commands still reply QUEUED, and EXEC refuses the whole transaction.
+conn_scenario "a wrong argument count aborts the transaction" \
+    "a send MULTI;SET|{K}|1;GET;PING;EXEC;GET|{K}" "a read"
+
+conn_scenario "an unknown command aborts the transaction" \
+    "a send MULTI;NOSUCH|x;EXEC" "a read"
+
+# Every other error waits for EXEC, fills its own slot, and the rest still run.
+conn_scenario "errors at exec time do not abort the rest" \
+    "a send MULTI;SET|{K}|x;LPUSH|{K}|a;INCR|{K};SET|{K}|2;EXEC;GET|{K}" "a read"
+
+conn_scenario "a syntax error is queued and returned by exec" \
+    "a send MULTI;SET|{K}|v|ZZ;SET|{K2}|1;EXEC;GET|{K2}" "a read"
+
+conn_scenario "blocking commands inside multi do not block" \
+    "a send MULTI;BLPOP|{K}|0;XREAD|BLOCK|0|STREAMS|{K2}|\$;EXEC" "a read"
+
+# EXEC runs as one step: a client blocked on a key the transaction pushes to is
+# served only after the whole transaction, so LLEN inside it sees both.
+conn_scenario "a transaction wakes a blocked client only after exec" \
+    "b send BLPOP|{K}|5" "sleep 0.2" \
+    "a send MULTI;RPUSH|{K}|x|y;LLEN|{K}" "a read" "b read" \
+    "a send EXEC" "a read" "b read" \
+    "a send LRANGE|{K}|0|-1" "a read"
+
+# No isolation before EXEC: queued commands see the data as it is when it runs.
+conn_scenario "another client runs between multi and exec" \
+    "a send SET|{K}|1" "a read" "a send MULTI;INCR|{K}" "a read" \
+    "b send SET|{K}|10" "b read" "a send EXEC" "a read"
 
 # Deliberate divergences from real Redis, documented rather than fixed:
 #   - no inline command support: Redis parses input not starting with '*' as a

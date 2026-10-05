@@ -2,8 +2,9 @@
 
 A Redis-compatible server written in Rust on top of Tokio. It speaks RESP, so
 `redis-cli` and ordinary Redis client libraries can talk to it. It covers
-strings, lists including blocking pops, and streams including blocking reads
-and trimming, and it is tested by comparing every reply with a real Redis.
+strings, lists including blocking pops, streams including blocking reads and
+trimming, and transactions, and it is tested by comparing every reply with a
+real Redis.
 
 ## Supported commands
 
@@ -13,6 +14,7 @@ and trimming, and it is tested by comparing every reply with a real Redis.
 | Strings | `GET`, `SET` (with `EX` / `PX` expiry), `INCR`                  |
 | Lists   | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LMOVE`, `BLPOP`, `BRPOP`, `BLMOVE` |
 | Streams | `XADD` (with `NOMKSTREAM` and `MAXLEN` / `MINID` trimming), `XRANGE`, `XREAD` (with `COUNT` / `BLOCK`), `XLEN`, `XDEL`, `XTRIM` |
+| Transactions | `MULTI`, `EXEC`, `DISCARD` |
 
 Any other command gets Redis's `ERR unknown command` error.
 
@@ -39,8 +41,8 @@ quirks, except for these:
 
 ### Not implemented
 
-Other data types (hashes, sets, sorted sets), transactions (`MULTI` /
-`EXEC`), pub/sub, persistence (RDB, AOF), replication, `AUTH` and ACLs, more
+Other data types (hashes, sets, sorted sets), `WATCH`, pub/sub, persistence
+(RDB, AOF), replication, `AUTH` and ACLs, more
 than one database (`SELECT`), keyspace commands such as `KEYS`, `DBSIZE` and
 `FLUSHALL`, and `--bind`: the server listens on `127.0.0.1` only.
 

@@ -15,6 +15,11 @@ pub(super) fn try_parse(
         b"TYPE"  => type_of_command(rest, name),
         b"DEL"  => del_command(rest, name),
         b"EXISTS"  => exists_command(rest, name),
+        b"MULTI" => no_args(rest, name, Command::Multi),
+        // A rejected EXEC is EXECABORT in Redis, not the plain arity error.
+        b"EXEC" => no_args(rest, name, Command::Exec)
+            .map_err(|e| CommandError::ExecRejected(Box::new(e))),
+        b"DISCARD" => no_args(rest, name, Command::Discard),
         _ => return None,
     })
 }
@@ -54,6 +59,11 @@ fn exists_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>
         keys => Ok(Command::Exists { keys: keys.to_vec() }),
     }
 }
+
+fn no_args(rest: &[Bytes], name: &Bytes, cmd: Command) -> Result<Command, CommandError> {
+    if rest.is_empty() { Ok(cmd) } else { Err(CommandError::WrongArity(name.clone())) }
+}
+
 
 pub(super) fn ping(msg: Option<Bytes>) -> Result<Value, CommandError> {
     match msg {

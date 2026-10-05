@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::command::{Command, Outcome};
+use crate::command::{Command, Outcome, CommandError};
 use crate::resp::Value;
 use crate::command::execute;
 use crate::db::Db;
@@ -14,6 +14,7 @@ pub enum Request {
     Run { cmd: Command, reply: ReplyTx, id: u64 },
     Unpark { id: u64, on_timeout: Value },
     Gone { id: u64 },
+    Exec { cmds: Vec<Result<Command, CommandError>>, reply: ReplyTx },
 }
 
 struct Waiter {
@@ -78,10 +79,7 @@ fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>) {
             // No round cap needed: every serve removes a waiter and none
             // are added mid cascade, so this ends. A cap could only
             // abandon parked clients.
-            let mut pending: VecDeque<Bytes> = touched.into();
-            while let Some(key) = pending.pop_front() {
-                pending.extend(serve_waiters(db, waiters, &key));
-            }
+            wake(db, waiters, touched);
         }
         Request::Unpark { id, on_timeout } => {
             if let Some(i) = waiters.iter().position(|w| w.id == id) {
@@ -94,6 +92,39 @@ fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>) {
                 waiters.remove(i);
             }
         }
+        Request::Exec { cmds, reply } => {
+            let mut replies = Vec::with_capacity(cmds.len());
+            let mut touched = Vec::new();
+            for item in cmds {                         // by value: each command is moved out
+                let value = match item {
+                    Err(e) => Value::Error(e.to_resp()),
+                    Ok(cmd) => {
+                        let meta = cmd.meta();         // before execute, which takes cmd
+                        touched.extend(meta.feeds);
+                        match execute(cmd, db) {
+                            Ok(Outcome::Reply(v)) => v,
+                            // Nothing parks inside EXEC: answer as if it had timed out.
+                            Ok(Outcome::Block { .. }) => meta.blocks.map_or(Value::NullArray, |b| b.on_timeout),
+                            Err(e) => Value::Error(e.to_resp()),
+                        }
+                    }
+                };
+                replies.push(value);
+            }
+            let _ = reply.send(Value::Array(replies));
+            wake(db, waiters, touched);                // only now, so nothing is served mid-transaction
+        }
+
+    }
+}
+
+
+/// Serves every waiter the written keys can now satisfy, including the chain
+/// of wakeups a BLMOVE can start.
+fn wake(db: &mut Db, waiters: &mut VecDeque<Waiter>, touched: Vec<Bytes>) {
+    let mut pending: VecDeque<Bytes> = touched.into();
+    while let Some(key) = pending.pop_front() {
+        pending.extend(serve_waiters(db, waiters, &key));
     }
 }
 

@@ -2,11 +2,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pending::Pending;
-use bytes::{BytesMut};
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use rusty_redis::resp::{self, Value};
-use rusty_redis::command::{BlockSpec, to_command};
+use rusty_redis::command::{BlockSpec, CommandError, to_command};
 use rusty_redis::db::Db;
 use rusty_redis::db::SystemClock;
 use rusty_redis::keyspace::{Request, keyspace_task};
@@ -98,10 +98,63 @@ async fn handle_client(
     let mut outbuf = BytesMut::with_capacity(4096);
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Value>();
     let mut queued = Pending::new();
+    let mut transaction: Option<Transaction> = None;
     loop {
         parse_into(&mut inbuf, &mut queued);
         while let Some(item) = queued.pop() {
             match item {
+                Queued::ProtocolError(err) => {
+                    resp::encode(&err, &mut outbuf);
+                    stream.write_all(&outbuf).await?;
+                    return Ok(());
+                }
+
+                Queued::Run(Command::Multi) => {
+                    let reply = if transaction.is_some() {
+                        Value::Error(CommandError::NestedMulti.to_resp())
+                    } else {
+                        transaction = Some(Transaction::default());
+                        Value::SimpleString(Bytes::from_static(b"OK"))
+                    };
+                    resp::encode(&reply, &mut outbuf);
+                }
+
+                Queued::Run(Command::Exec) => match transaction.take() {
+                    None => resp::encode(&Value::Error(CommandError::ExecWithoutMulti.to_resp()), &mut outbuf),
+                    Some(t) if t.failed => resp::encode(&Value::Error(CommandError::ExecAbort.to_resp()), &mut outbuf),
+                    Some(t) => {
+                        if tx.send(Request::Exec { cmds: t.queued, reply: reply_tx.clone() }).await.is_err() {
+                            return Ok(()); // keyspace task is gone
+                        }
+                        match reply_rx.recv().await {
+                            Some(v) => resp::encode(&v, &mut outbuf),
+                            None => return Ok(()),
+                        }
+                    },
+                }
+
+                Queued::Run(Command::Discard) => {
+                    let reply = match transaction.take() {
+                        Some(_) => Value::SimpleString(Bytes::from_static(b"OK")),
+                        None => Value::Error(CommandError::DiscardWithoutMulti.to_resp()),
+                    };
+                    resp::encode(&reply, &mut outbuf);
+                }
+
+                // A rejected EXEC ends any open transaction, as Redis's
+                // execCommandAbort does. Above the guard, so it is never queued.
+                Queued::Error(e @ CommandError::ExecRejected(_)) => {
+                    transaction = None;
+                    resp::encode(&Value::Error(e.to_resp()), &mut outbuf);
+                }
+
+                // Any other item while a transaction is open: queue it. The
+                // guard has just checked for Some, so the unwrap cannot fail.
+                item if transaction.is_some() => {
+                    let reply = queue_in(transaction.as_mut().unwrap(), item);
+                    resp::encode(&reply, &mut outbuf);
+                }
+
                 Queued::Run(cmd) => {
                     let id = next_id(); // AtomicU64 fetch_add
                     let deadline = cmd.meta().blocks;
@@ -136,12 +189,7 @@ async fn handle_client(
                     }
                 }
                 Queued::Error(err) => {
-                    resp::encode(&err, &mut outbuf)
-                }
-                Queued::ProtocolError(err) => {
-                    resp::encode(&err, &mut outbuf);
-                    stream.write_all(&outbuf).await?;
-                    return Ok(());
+                    resp::encode(&Value::Error(err.to_resp()), &mut outbuf)
                 }
             }
             if outbuf.len() >= OUTBUF_FLUSH_AT {
@@ -235,8 +283,17 @@ async fn wait_for_reply(
 /// One thing the connection must do, in the order the client sent it.
 enum Queued {
     Run(Command),
-    Error(Value),
+    Error(CommandError),
     ProtocolError(Value),
+}
+
+/// An open MULTI. `None` in `handle_client` means no transaction is open.
+#[derive(Default)]
+struct Transaction {
+    /// Parse errors other than a wrong argument count are queued as `Err` and
+    /// answered by EXEC in their slot, as Redis does.
+    queued: Vec<Result<Command, CommandError>>,
+    failed: bool, // a queue-time error happened; EXEC answers EXECABORT
 }
 
 /// Parses every complete frame in `inbuf` into `queued`. Runs nothing. Stops
@@ -250,7 +307,7 @@ fn parse_into(inbuf: &mut BytesMut, queued: &mut Pending) {
                 match to_command(value) {
                     Ok(Some(cmd)) => queued.push(Queued::Run(cmd), consumed),
                     Ok(None) => {},
-                    Err(e) => queued.push(Queued::Error(Value::Error(e.to_resp())), consumed)
+                    Err(e) => queued.push(Queued::Error(e), consumed)
                 }
             }
             Ok(None) => return,
@@ -262,9 +319,36 @@ fn parse_into(inbuf: &mut BytesMut, queued: &mut Pending) {
     }
 }
 
+/// Queues one item inside MULTI and returns the immediate reply. Only an
+/// unknown command and a wrong argument count fail at queue time, which marks
+/// the transaction; every other error waits for EXEC.
+fn queue_in(transaction: &mut Transaction, item: Queued) -> Value {
+    let queued = Value::SimpleString(Bytes::from_static(b"QUEUED"));
+    match item {
+        Queued::Run(Command::Unknown { name, args }) => {
+            transaction.failed = true;
+            Value::Error(CommandError::UnknownCommand { name, args }.to_resp())
+        }
+        Queued::Error(e @ CommandError::WrongArity(_)) => {
+            transaction.failed = true;
+            Value::Error(e.to_resp())
+        }
+        Queued::Run(cmd) => {
+            transaction.queued.push(Ok(cmd));
+            queued
+        }
+        Queued::Error(e) => {
+            transaction.queued.push(Err(e));
+            queued
+        }
+        // Never reached: the drain loop handles protocol errors before
+        // queue_in, since broken framing closes the connection either way.
+        Queued::ProtocolError(e) => e,
+    }
+}
+
 mod pending {
     use std::collections::VecDeque;
-
     use super::Queued;
 
     /// Commands parsed but not yet run, and how many input bytes they hold.
@@ -300,12 +384,12 @@ mod pending {
     #[cfg(test)]
     mod tests {
         use super::*;
-
+        use rusty_redis::command::CommandError;
         #[test]
         fn bytes_track_what_is_queued_now() {
             let mut p = Pending::new();
-            p.push(Queued::Error(crate::Value::Error("x".into())), 10);
-            p.push(Queued::Error(crate::Value::Error("y".into())), 5);
+            p.push(Queued::Error(CommandError::Syntax), 10);
+            p.push(Queued::Error(CommandError::Syntax), 5);
             assert_eq!(p.bytes(), 15);
             assert!(p.pop().is_some());
             assert_eq!(p.bytes(), 5, "popping gives the bytes back");
