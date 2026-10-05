@@ -92,69 +92,117 @@ fn query_buf_limit() -> std::io::Error {
     std::io::Error::other("closing client that reached max query buffer length")
 }
 
+/// Everything one client connection owns. One struct rather than separate
+/// locals, so the parked wait borrows it as a whole instead of taking each
+/// piece as an argument, and the flat event loop pub/sub needs (4.8) has one
+/// place to grow.
+struct Conn {
+    stream: TcpStream,
+    inbuf: BytesMut,
+    outbuf: BytesMut,
+    /// This connection's mailbox: every reply from the keyspace task arrives
+    /// on `reply_rx`, and a clone of `reply_tx` goes with each request.
+    reply_tx: mpsc::UnboundedSender<Value>,
+    reply_rx: mpsc::UnboundedReceiver<Value>,
+    queued: Pending,
+    transaction: Option<Transaction>,
+}
+
+impl Conn {
+    fn new(stream: TcpStream) -> Self {
+        let (reply_tx, reply_rx) = mpsc::unbounded_channel();
+        Conn {
+            stream,
+            inbuf: BytesMut::with_capacity(4096),
+            outbuf: BytesMut::with_capacity(4096),
+            reply_tx,
+            reply_rx,
+            queued: Pending::new(),
+            transaction: None,
+        }
+    }
+
+    /// Encodes a reply into `outbuf`. Nothing is sent until `flush`.
+    fn reply(&mut self, value: &Value) {
+        resp::encode(value, &mut self.outbuf);
+    }
+
+    /// Writes out and empties `outbuf`, if there is anything in it.
+    async fn flush(&mut self) -> std::io::Result<()> {
+        if !self.outbuf.is_empty() {
+            self.stream.write_all(&self.outbuf).await?;
+            self.outbuf.clear();
+        }
+        Ok(())
+    }
+
+    /// Input this client holds, as MAX_QUERY_BUF counts it.
+    fn held(&self) -> usize {
+        let in_multi = self.transaction.as_ref().map_or(0, |t| t.bytes);
+        self.inbuf.len() + self.queued.bytes() + in_multi
+    }
+}
+
 async fn handle_client(
-    mut stream: TcpStream,
+    stream: TcpStream,
     tx: mpsc::Sender<Request>,
 ) -> std::io::Result<()> {
-    let mut inbuf = BytesMut::with_capacity(4096);
-    let mut outbuf = BytesMut::with_capacity(4096);
-    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Value>();
-    let mut queued = Pending::new();
-    let mut transaction: Option<Transaction> = None;
+    let mut conn = Conn::new(stream);
     loop {
-        parse_into(&mut inbuf, &mut queued);
-        while let Some((item, size)) = queued.pop() {
+        parse_into(&mut conn.inbuf, &mut conn.queued);
+        while let Some((item, size)) = conn.queued.pop() {
             match item {
                 Queued::ProtocolError(err) => {
-                    resp::encode(&err, &mut outbuf);
-                    stream.write_all(&outbuf).await?;
+                    conn.reply(&err);
+                    conn.flush().await?;
                     return Ok(());
                 }
 
                 Queued::Run(Command::Multi) => {
-                    let reply = if transaction.is_some() {
+                    let reply = if conn.transaction.is_some() {
                         Value::Error(CommandError::NestedMulti.to_resp())
                     } else {
-                        transaction = Some(Transaction::default());
+                        conn.transaction = Some(Transaction::default());
                         Value::SimpleString(Bytes::from_static(b"OK"))
                     };
-                    resp::encode(&reply, &mut outbuf);
+                    conn.reply(&reply);
                 }
 
-                Queued::Run(Command::Exec) => match transaction.take() {
-                    None => resp::encode(&Value::Error(CommandError::ExecWithoutMulti.to_resp()), &mut outbuf),
-                    Some(t) if t.failed => resp::encode(&Value::Error(CommandError::ExecAbort.to_resp()), &mut outbuf),
+                Queued::Run(Command::Exec) => match conn.transaction.take() {
+                    None => conn.reply(&Value::Error(CommandError::ExecWithoutMulti.to_resp())),
+                    Some(t) if t.failed => conn.reply(&Value::Error(CommandError::ExecAbort.to_resp())),
                     Some(t) => {
-                        if tx.send(Request::Exec { cmds: t.queued, reply: reply_tx.clone() }).await.is_err() {
+                        let request = Request::Exec { cmds: t.queued, reply: conn.reply_tx.clone() };
+                        if tx.send(request).await.is_err() {
                             return Ok(()); // keyspace task is gone
                         }
-                        match reply_rx.recv().await {
-                            Some(v) => resp::encode(&v, &mut outbuf),
+                        match conn.reply_rx.recv().await {
+                            Some(v) => conn.reply(&v),
                             None => return Ok(()),
                         }
-                    },
-                }
+                    }
+                },
 
                 Queued::Run(Command::Discard) => {
-                    let reply = match transaction.take() {
+                    let reply = match conn.transaction.take() {
                         Some(_) => Value::SimpleString(Bytes::from_static(b"OK")),
                         None => Value::Error(CommandError::DiscardWithoutMulti.to_resp()),
                     };
-                    resp::encode(&reply, &mut outbuf);
+                    conn.reply(&reply);
                 }
 
                 // A rejected EXEC ends any open transaction, as Redis's
                 // execCommandAbort does. Above the guard, so it is never queued.
                 Queued::Error(e @ CommandError::ExecRejected(_)) => {
-                    transaction = None;
-                    resp::encode(&Value::Error(e.to_resp()), &mut outbuf);
+                    conn.transaction = None;
+                    conn.reply(&Value::Error(e.to_resp()));
                 }
 
                 // Any other item while a transaction is open: queue it. The
                 // guard has just checked for Some, so the unwrap cannot fail.
-                item if transaction.is_some() => {
-                    let reply = queue_in(transaction.as_mut().unwrap(), item, size);
-                    resp::encode(&reply, &mut outbuf);
+                item if conn.transaction.is_some() => {
+                    let reply = queue_in(conn.transaction.as_mut().unwrap(), item, size);
+                    conn.reply(&reply);
                 }
 
                 Queued::Run(cmd) => {
@@ -168,49 +216,45 @@ async fn handle_client(
                     // pipelined `PING` then `BLPOP k 0` gets its +PONG
                     // immediately. Flushing here rather than after the
                     // drain loop is what reproduces that.
-                    if deadline.is_some() && !outbuf.is_empty() {
-                        stream.write_all(&outbuf).await?;
-                        outbuf.clear();
+                    if deadline.is_some() {
+                        conn.flush().await?;
                     }
 
-                    if tx.send(Request::Run { cmd, reply: reply_tx.clone(), id }).await.is_err(){
+                    let request = Request::Run { cmd, reply: conn.reply_tx.clone(), id };
+                    if tx.send(request).await.is_err() {
                         return Ok(()); // keyspace task is gone
                     }
 
                     let received = match deadline {
                         Some(BlockSpec { timeout, on_timeout }) => {
-                            wait_parked(&mut stream, &mut inbuf, &mut reply_rx, &tx, id, timeout, on_timeout, &mut queued)
-                                .await?
+                            wait_parked(&mut conn, &tx, id, timeout, on_timeout).await?
                         }
-                        None => reply_rx.recv().await,
+                        None => conn.reply_rx.recv().await,
                     };
 
                     match received {
-                        Some(v) => resp::encode(&v, &mut outbuf),
+                        Some(v) => conn.reply(&v),
                         None => return Ok(()), // client left, or every sender dropped
                     }
                 }
-                Queued::Error(err) => {
-                    resp::encode(&Value::Error(err.to_resp()), &mut outbuf)
-                }
+
+                Queued::Error(err) => conn.reply(&Value::Error(err.to_resp())),
             }
-            if outbuf.len() >= OUTBUF_FLUSH_AT {
-                stream.write_all(&outbuf).await?;
-                outbuf.clear();
+
+            // A deep pipeline of large replies would otherwise grow outbuf
+            // without limit. Redis bounds this with client-output-buffer-limit;
+            // this is the crude version.
+            if conn.outbuf.len() >= OUTBUF_FLUSH_AT {
+                conn.flush().await?;
             }
         }
 
-        if !outbuf.is_empty() {
-            stream.write_all(&outbuf).await?;
-            outbuf.clear();
-        }
-
-        inbuf.reserve(4096);
-        if stream.read_buf(&mut inbuf).await? == 0 {
+        conn.flush().await?;
+        conn.inbuf.reserve(4096);
+        if conn.stream.read_buf(&mut conn.inbuf).await? == 0 {
             return Ok(());
         }
-        let in_multi = transaction.as_ref().map_or(0, |t| t.bytes);
-        if inbuf.len() + queued.bytes() + in_multi > MAX_QUERY_BUF {
+        if conn.held() > MAX_QUERY_BUF {
             return Err(query_buf_limit());
         }
     }
@@ -222,16 +266,13 @@ async fn handle_client(
 /// keys. The `is_closed` check in `serve_waiters` stays as a backstop. The
 /// cleanup lives here rather than in each exit so a `?` cannot skip it.
 async fn wait_parked(
-    stream: &mut TcpStream,
-    inbuf: &mut BytesMut,
-    reply_rx: &mut mpsc::UnboundedReceiver<Value>,
+    conn: &mut Conn,
     tx: &mpsc::Sender<Request>,
     id: u64,
     timeout: Option<Duration>,
     on_timeout: Value,
-    queued: &mut Pending
 ) -> std::io::Result<Option<Value>> {
-    let result = wait_for_reply(stream, inbuf, reply_rx, tx, id, timeout, on_timeout, queued).await;
+    let result = wait_for_reply(conn, tx, id, timeout, on_timeout).await;
     if !matches!(result, Ok(Some(_))) {
         let _ = tx.send(Request::Gone { id }).await;
     }
@@ -242,14 +283,11 @@ async fn wait_parked(
 /// returns None. Commands that arrive meanwhile are parsed into `queued` but
 /// not run until the reply is in.
 async fn wait_for_reply(
-    stream: &mut TcpStream,
-    inbuf: &mut BytesMut,
-    reply_rx: &mut mpsc::UnboundedReceiver<Value>,
+    conn: &mut Conn,
     tx: &mpsc::Sender<Request>,
     id: u64,
     timeout: Option<Duration>,
     on_timeout: Value,
-    queued: &mut Pending
 ) -> std::io::Result<Option<Value>> {
     // A pinned sleep inside the select rather than a timeout around it, so the
     // socket is still watched while the keyspace task settles the Unpark.
@@ -258,17 +296,18 @@ async fn wait_for_reply(
     let mut on_timeout = timeout.map(|_| on_timeout); // Some while the timer is armed
 
     loop {
-        inbuf.reserve(4096);
+        conn.inbuf.reserve(4096);
+        // The branches borrow different fields of conn, which Rust allows at once.
         tokio::select! {
-            reply = reply_rx.recv() => return Ok(reply),
-            read = stream.read_buf(inbuf) => {
+            reply = conn.reply_rx.recv() => return Ok(reply),
+            read = conn.stream.read_buf(&mut conn.inbuf) => {
                 if read? == 0 {
                     return Ok(None);
                 }
-                if inbuf.len() + queued.bytes() > MAX_QUERY_BUF {
+                if conn.held() > MAX_QUERY_BUF {
                     return Err(query_buf_limit());
                 }
-                parse_into(inbuf, queued);
+                parse_into(&mut conn.inbuf, &mut conn.queued);
             }
             () = &mut timer, if on_timeout.is_some() => {
                 // Do not write the timeout reply here. A push may already have
