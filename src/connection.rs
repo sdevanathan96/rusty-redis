@@ -40,6 +40,11 @@ fn query_buf_limit() -> std::io::Error {
     std::io::Error::other("closing client that reached max query buffer length")
 }
 
+/// One id per connection, for its whole life. The keyspace task knows a
+/// client only by this number: its watches, and its parked command if it has
+/// one. Reusing it for every parked command is safe because a connection parks
+/// at most one at a time, and its `Unpark` or `Gone` reaches the keyspace task
+/// before its next `Run`.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 fn next_id() -> u64 {
@@ -51,6 +56,7 @@ fn next_id() -> u64 {
 /// piece as an argument, and the flat event loop pub/sub needs (4.8) has one
 /// place to grow.
 struct Conn {
+    id: u64,
     stream: TcpStream,
     inbuf: BytesMut,
     outbuf: BytesMut,
@@ -66,6 +72,7 @@ impl Conn {
     fn new(stream: TcpStream) -> Self {
         let (reply_tx, reply_rx) = mpsc::unbounded_channel();
         Conn {
+            id: next_id(),
             stream,
             inbuf: BytesMut::with_capacity(READ_CHUNK),
             outbuf: BytesMut::with_capacity(READ_CHUNK),
@@ -129,6 +136,7 @@ pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std:
                         let request = Request::Exec {
                             cmds: t.commands,
                             reply: conn.reply_tx.clone(),
+                            conn: conn.id,
                         };
                         if tx.send(request).await.is_err() {
                             return Ok(()); // keyspace task is gone
@@ -163,7 +171,6 @@ pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std:
                 }
 
                 Parsed::Run(cmd) => {
-                    let id = next_id(); // AtomicU64 fetch_add
                     let deadline = cmd.meta().blocks;
 
                     // Anything already encoded belongs to commands that
@@ -180,7 +187,7 @@ pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std:
                     let request = Request::Run {
                         cmd,
                         reply: conn.reply_tx.clone(),
-                        id,
+                        conn: conn.id,
                     };
                     if tx.send(request).await.is_err() {
                         return Ok(()); // keyspace task is gone
@@ -190,7 +197,7 @@ pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std:
                         Some(BlockSpec {
                             timeout,
                             on_timeout,
-                        }) => wait_parked(&mut conn, &tx, id, timeout, on_timeout).await?,
+                        }) => wait_parked(&mut conn, &tx, timeout, on_timeout).await?,
                         None => conn.reply_rx.recv().await,
                     };
 
@@ -230,13 +237,12 @@ pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std:
 async fn wait_parked(
     conn: &mut Conn,
     tx: &mpsc::Sender<Request>,
-    id: u64,
     timeout: Option<Duration>,
     on_timeout: Value,
 ) -> std::io::Result<Option<Value>> {
-    let result = wait_for_reply(conn, tx, id, timeout, on_timeout).await;
+    let result = wait_for_reply(conn, tx, timeout, on_timeout).await;
     if !matches!(result, Ok(Some(_))) {
-        let _ = tx.send(Request::Gone { id }).await;
+        let _ = tx.send(Request::Gone { conn: conn.id }).await;
     }
     result
 }
@@ -247,7 +253,6 @@ async fn wait_parked(
 async fn wait_for_reply(
     conn: &mut Conn,
     tx: &mpsc::Sender<Request>,
-    id: u64,
     timeout: Option<Duration>,
     on_timeout: Value,
 ) -> std::io::Result<Option<Value>> {
@@ -276,7 +281,11 @@ async fn wait_for_reply(
                 // served this waiter; the keyspace task decides and sends
                 // exactly one more message either way.
                 let on_timeout = on_timeout.take().expect("guarded by the branch condition");
-                if tx.send(Request::Unpark { id, on_timeout }).await.is_err() {
+                let unpark = Request::Unpark {
+                    conn: conn.id,
+                    on_timeout,
+                };
+                if tx.send(unpark).await.is_err() {
                     return Ok(None);
                 }
             }

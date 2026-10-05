@@ -382,7 +382,7 @@ pub(super) fn xadd(
     ))
 }
 
-pub(super) fn xtrim(key: &[u8], trim: &Trim, db: &mut Db) -> Result<Outcome, CommandError> {
+pub(super) fn xtrim(key: &Bytes, trim: &Trim, db: &mut Db) -> Result<Outcome, CommandError> {
     Ok(Outcome::Reply(Value::Integer(db.xtrim(key, trim)? as i64)))
 }
 
@@ -459,6 +459,6 @@ pub(super) fn xread(
     })
 }
 
-pub(super) fn xdel(key: &[u8], ids: &[EntryId], db: &mut Db) -> Result<Outcome, CommandError> {
+pub(super) fn xdel(key: &Bytes, ids: &[EntryId], db: &mut Db) -> Result<Outcome, CommandError> {
     Ok(Outcome::Reply(Value::Integer(db.xdel(key, ids)? as i64)))
 }

@@ -36,22 +36,29 @@ impl Db {
 
     pub fn push(&mut self, key: Bytes, values: Vec<Bytes>, end: End) -> Result<usize, WrongType> {
         self.reap(&key);
-        push_to(&mut self.map, key, values, end)
+        let len = push_to(&mut self.map, key.clone(), values, end)?;
+        self.mark_modified(key);
+        Ok(len)
     }
 
     pub fn pop(
         &mut self,
-        key: &[u8],
+        key: &Bytes,
         count: Option<usize>,
         end: End,
     ) -> Result<Option<Vec<Bytes>>, WrongType> {
         self.reap(key);
-        pop_from(&mut self.map, key, count.unwrap_or(1), end)
+        let popped = pop_from(&mut self.map, key, count.unwrap_or(1), end)?;
+        // A count of 0 pops nothing from an existing list, so changes nothing.
+        if popped.as_ref().is_some_and(|v| !v.is_empty()) {
+            self.mark_modified(key.clone());
+        }
+        Ok(popped)
     }
 
     pub fn lmove(
         &mut self,
-        src: &[u8],
+        src: &Bytes,
         dst: Bytes,
         from: End,
         to: End,
@@ -76,7 +83,9 @@ impl Db {
             },
         };
 
-        push_to(&mut self.map, dst, vec![popped.clone()], to)?;
+        push_to(&mut self.map, dst.clone(), vec![popped.clone()], to)?;
+        self.mark_modified(dst);
+        self.mark_modified(src.clone());
         Ok(Some(popped))
     }
 }

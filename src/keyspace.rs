@@ -1,3 +1,5 @@
+mod watchers;
+
 use std::collections::VecDeque;
 
 use bytes::Bytes;
@@ -7,30 +9,40 @@ use crate::command::execute;
 use crate::command::{Command, CommandError, Outcome};
 use crate::db::Db;
 use crate::resp::Value;
+use watchers::Watches;
 
 pub type ReplyTx = mpsc::UnboundedSender<Value>;
 
+/// What a connection asks of the keyspace task. `conn` is the connection's
+/// id, fixed for its life: the only way this task knows a client.
 pub enum Request {
+    /// Run one command. It replies on `reply`, or parks as a waiter.
     Run {
         cmd: Command,
         reply: ReplyTx,
-        id: u64,
+        conn: u64,
     },
-    Unpark {
-        id: u64,
-        on_timeout: Value,
-    },
-    Gone {
-        id: u64,
-    },
+    /// The parked command's timer fired. Reply `on_timeout` unless a write
+    /// already served it.
+    Unpark { conn: u64, on_timeout: Value },
+    /// The connection stopped waiting without a reply: drop its waiter.
+    Gone { conn: u64 },
+    /// Run a MULTI queue as one step, unless a watched key changed.
     Exec {
         cmds: Vec<Result<Command, CommandError>>,
         reply: ReplyTx,
+        conn: u64,
     },
+    /// Watch `keys` for this connection's next EXEC. No reply is needed: the
+    /// channel is FIFO, so anything the client sends after its `+OK` is
+    /// handled after this.
+    Watch { conn: u64, keys: Vec<Bytes> },
+    /// Drop every watch the connection holds. No reply, for the same reason.
+    Unwatch { conn: u64 },
 }
 
 struct Waiter {
-    id: u64,
+    conn: u64,
     reply: ReplyTx,
     keys: Vec<Bytes>,
     retry: Command,
@@ -38,8 +50,23 @@ struct Waiter {
 
 pub async fn keyspace_task(mut db: Db, mut rx: mpsc::Receiver<Request>) {
     let mut waiters: VecDeque<Waiter> = VecDeque::new();
+    let mut watches = Watches::default();
     while let Some(req) = rx.recv().await {
-        handle(req, &mut db, &mut waiters);
+        process(req, &mut db, &mut waiters, &mut watches);
+    }
+}
+
+/// One request, then every key it changed reported to WATCH, including keys
+/// changed by waiters it served. The task's loop and the tests both come
+/// through here.
+fn process(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>, watches: &mut Watches) {
+    handle(req, db, waiters, watches);
+    // Taken even when nobody watches: nothing else empties the list.
+    let modified = db.take_modified();
+    if !watches.is_empty() {
+        for key in &modified {
+            watches.touch(key);
+        }
     }
 }
 
@@ -77,17 +104,17 @@ fn serve_waiters(db: &mut Db, waiters: &mut VecDeque<Waiter>, key: &Bytes) -> Ve
     fed
 }
 
-fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>) {
+fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>, watches: &mut Watches) {
     match req {
-        Request::Run { cmd, reply, id } => {
-            let touched = cmd.meta().feeds;
+        Request::Run { cmd, reply, conn } => {
+            let fed = cmd.meta().feeds;
             match execute(cmd, db) {
                 Ok(Outcome::Reply(v)) => {
                     let _ = reply.send(v);
                 }
                 Ok(Outcome::Block { keys, retry }) => {
                     waiters.push_back(Waiter {
-                        id,
+                        conn,
                         reply,
                         keys,
                         retry,
@@ -100,30 +127,37 @@ fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>) {
             // No round cap needed: every serve removes a waiter and none
             // are added mid cascade, so this ends. A cap could only
             // abandon parked clients.
-            wake(db, waiters, touched);
+            wake(db, waiters, fed);
         }
-        Request::Unpark { id, on_timeout } => {
-            if let Some(i) = waiters.iter().position(|w| w.id == id)
+        Request::Unpark { conn, on_timeout } => {
+            if let Some(i) = waiters.iter().position(|w| w.conn == conn)
                 && let Some(w) = waiters.remove(i)
             {
                 let _ = w.reply.send(on_timeout);
             }
         }
-        Request::Gone { id } => {
-            if let Some(i) = waiters.iter().position(|w| w.id == id) {
+        Request::Gone { conn } => {
+            if let Some(i) = waiters.iter().position(|w| w.conn == conn) {
                 waiters.remove(i);
             }
         }
-        Request::Exec { cmds, reply } => {
+        Request::Exec { cmds, reply, conn } => {
+            // EXEC ends the connection's watches whether or not it runs.
+            let aborted = watches.aborts(conn, db);
+            watches.unwatch(conn);
+            if aborted {
+                let _ = reply.send(Value::NullArray);
+                return;
+            }
             let mut replies = Vec::with_capacity(cmds.len());
-            let mut touched = Vec::new();
+            let mut fed = Vec::new();
             for item in cmds {
                 // by value: each command is moved out
                 let value = match item {
                     Err(e) => Value::Error(e.to_resp()),
                     Ok(cmd) => {
                         let meta = cmd.meta(); // before execute, which takes cmd
-                        touched.extend(meta.feeds);
+                        fed.extend(meta.feeds);
                         match execute(cmd, db) {
                             Ok(Outcome::Reply(v)) => v,
                             // Nothing parks inside EXEC: answer as if it had timed out.
@@ -137,15 +171,24 @@ fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>) {
                 replies.push(value);
             }
             let _ = reply.send(Value::Array(replies));
-            wake(db, waiters, touched); // only now, so nothing is served mid-transaction
+            wake(db, waiters, fed); // only now, so nothing is served mid-transaction
+        }
+        Request::Watch { conn, keys } => {
+            for key in keys {
+                let deadline = db.deadline(&key);
+                watches.watch(conn, key, deadline);
+            }
+        }
+        Request::Unwatch { conn } => {
+            watches.unwatch(conn);
         }
     }
 }
 
 /// Serves every waiter the written keys can now satisfy, including the chain
 /// of wakeups a BLMOVE can start.
-fn wake(db: &mut Db, waiters: &mut VecDeque<Waiter>, touched: Vec<Bytes>) {
-    let mut pending: VecDeque<Bytes> = touched.into();
+fn wake(db: &mut Db, waiters: &mut VecDeque<Waiter>, fed: Vec<Bytes>) {
+    let mut pending: VecDeque<Bytes> = fed.into();
     while let Some(key) = pending.pop_front() {
         pending.extend(serve_waiters(db, waiters, &key));
     }
@@ -159,6 +202,61 @@ mod tests {
     use crate::command::test_support::cmd_ok;
     use crate::db::TestClock;
 
+    /// The keyspace task's state, fed one request at a time through
+    /// `process`, exactly as the task's loop does.
+    struct Keyspace {
+        clock: Arc<TestClock>,
+        db: Db,
+        waiters: VecDeque<Waiter>,
+        watches: Watches,
+    }
+
+    impl Keyspace {
+        fn new() -> Self {
+            let clock = Arc::new(TestClock::new());
+            Keyspace {
+                db: Db::with_clock(clock.clone()),
+                clock,
+                waiters: VecDeque::new(),
+                watches: Watches::default(),
+            }
+        }
+
+        fn send(&mut self, req: Request) {
+            process(req, &mut self.db, &mut self.waiters, &mut self.watches);
+        }
+
+        /// Runs a command that does not park, and returns its reply.
+        fn run(&mut self, conn: u64, parts: &[&str]) -> Value {
+            let (reply, mut rx) = mpsc::unbounded_channel();
+            self.send(Request::Run {
+                cmd: cmd(parts),
+                reply,
+                conn,
+            });
+            rx.try_recv()
+                .expect("a command that does not park replies at once")
+        }
+
+        fn watch(&mut self, conn: u64, keys: &[&'static str]) {
+            let keys = keys.iter().map(|k| Bytes::from_static(k.as_bytes()));
+            self.send(Request::Watch {
+                conn,
+                keys: keys.collect(),
+            });
+        }
+
+        fn exec(&mut self, conn: u64, cmds: &[&[&str]]) -> Value {
+            let (reply, mut rx) = mpsc::unbounded_channel();
+            self.send(Request::Exec {
+                cmds: cmds.iter().map(|parts| Ok(cmd(parts))).collect(),
+                reply,
+                conn,
+            });
+            rx.try_recv().expect("EXEC always replies at once")
+        }
+    }
+
     fn blpop_forever(key: &str) -> Command {
         let raw = format!(
             "*3\r\n$5\r\nBLPOP\r\n${}\r\n{}\r\n$1\r\n0\r\n",
@@ -170,42 +268,32 @@ mod tests {
 
     #[test]
     fn gone_removes_the_waiter_at_once() {
-        let mut db = Db::with_clock(Arc::new(TestClock::new()));
-        let mut waiters = VecDeque::new();
+        let mut ks = Keyspace::new();
         let (reply, _rx) = mpsc::unbounded_channel();
 
-        handle(
-            Request::Run {
-                cmd: blpop_forever("k"),
-                reply,
-                id: 7,
-            },
-            &mut db,
-            &mut waiters,
-        );
-        assert_eq!(waiters.len(), 1, "BLPOP on an empty list parks");
+        ks.send(Request::Run {
+            cmd: blpop_forever("k"),
+            reply,
+            conn: 7,
+        });
+        assert_eq!(ks.waiters.len(), 1, "BLPOP on an empty list parks");
 
-        handle(Request::Gone { id: 7 }, &mut db, &mut waiters);
-        assert!(waiters.is_empty(), "without waiting for a write to k");
+        ks.send(Request::Gone { conn: 7 });
+        assert!(ks.waiters.is_empty(), "without waiting for a write to k");
     }
 
     #[test]
     fn gone_for_an_unknown_id_changes_nothing() {
-        let mut db = Db::with_clock(Arc::new(TestClock::new()));
-        let mut waiters = VecDeque::new();
+        let mut ks = Keyspace::new();
         let (reply, _rx) = mpsc::unbounded_channel();
 
-        handle(
-            Request::Run {
-                cmd: blpop_forever("k"),
-                reply,
-                id: 7,
-            },
-            &mut db,
-            &mut waiters,
-        );
-        handle(Request::Gone { id: 8 }, &mut db, &mut waiters);
-        assert_eq!(waiters.len(), 1, "a stale or duplicate Gone is harmless");
+        ks.send(Request::Run {
+            cmd: blpop_forever("k"),
+            reply,
+            conn: 7,
+        });
+        ks.send(Request::Gone { conn: 8 });
+        assert_eq!(ks.waiters.len(), 1, "a stale or duplicate Gone is harmless");
     }
 
     /// A command from its arguments, through the real parser.
@@ -223,27 +311,22 @@ mod tests {
 
     #[test]
     fn exec_answers_a_blocking_command_with_its_timeout_reply() {
-        let mut db = Db::with_clock(Arc::new(TestClock::new()));
-        let mut waiters = VecDeque::new();
+        let mut ks = Keyspace::new();
         let (reply, mut rx) = mpsc::unbounded_channel();
 
-        handle(
-            Request::Exec {
-                cmds: vec![Ok(blpop_forever("k"))],
-                reply,
-            },
-            &mut db,
-            &mut waiters,
-        );
+        ks.send(Request::Exec {
+            cmds: vec![Ok(blpop_forever("k"))],
+            reply,
+            conn: 1,
+        });
 
         assert_eq!(rx.try_recv().unwrap(), Value::Array(vec![Value::NullArray]));
-        assert!(waiters.is_empty(), "nothing parks inside EXEC");
+        assert!(ks.waiters.is_empty(), "nothing parks inside EXEC");
     }
 
     #[test]
     fn exec_puts_each_error_in_its_slot_and_runs_the_rest() {
-        let mut db = Db::with_clock(Arc::new(TestClock::new()));
-        let mut waiters = VecDeque::new();
+        let mut ks = Keyspace::new();
         let (reply, mut rx) = mpsc::unbounded_channel();
         let cmds = vec![
             Err(CommandError::Syntax),
@@ -251,7 +334,11 @@ mod tests {
             Ok(cmd(&["GET", "k"])),
         ];
 
-        handle(Request::Exec { cmds, reply }, &mut db, &mut waiters);
+        ks.send(Request::Exec {
+            cmds,
+            reply,
+            conn: 1,
+        });
 
         let ok = Value::SimpleString(Bytes::from_static(b"OK"));
         let syntax = Value::Error(CommandError::Syntax.to_resp());
@@ -263,23 +350,22 @@ mod tests {
 
     #[test]
     fn exec_wakes_waiters_only_after_the_whole_transaction() {
-        let mut db = Db::with_clock(Arc::new(TestClock::new()));
-        let mut waiters = VecDeque::new();
+        let mut ks = Keyspace::new();
         let (waiter_reply, mut waiter_rx) = mpsc::unbounded_channel();
-        handle(
-            Request::Run {
-                cmd: blpop_forever("k"),
-                reply: waiter_reply,
-                id: 1,
-            },
-            &mut db,
-            &mut waiters,
-        );
-        assert_eq!(waiters.len(), 1);
+        ks.send(Request::Run {
+            cmd: blpop_forever("k"),
+            reply: waiter_reply,
+            conn: 1,
+        });
+        assert_eq!(ks.waiters.len(), 1);
 
         let (reply, mut rx) = mpsc::unbounded_channel();
         let cmds = vec![Ok(cmd(&["RPUSH", "k", "x", "y"])), Ok(cmd(&["LLEN", "k"]))];
-        handle(Request::Exec { cmds, reply }, &mut db, &mut waiters);
+        ks.send(Request::Exec {
+            cmds,
+            reply,
+            conn: 2,
+        });
 
         // LLEN inside the transaction still sees both: nobody was served yet.
         assert_eq!(
@@ -290,6 +376,140 @@ mod tests {
             waiter_rx.try_recv().unwrap(),
             Value::Array(vec![bulk("k"), bulk("x")])
         );
-        assert!(waiters.is_empty());
+        assert!(ks.waiters.is_empty());
+    }
+
+    // WATCH. Every scenario here was checked against Redis 8.10.1 first.
+
+    fn pong() -> Value {
+        Value::SimpleString(Bytes::from_static(b"PONG"))
+    }
+
+    fn ran(replies: Vec<Value>) -> Value {
+        Value::Array(replies)
+    }
+
+    #[test]
+    fn a_write_by_another_connection_aborts_exec() {
+        let mut ks = Keyspace::new();
+        ks.watch(1, &["k"]);
+        ks.run(2, &["SET", "k", "theirs"]);
+        assert_eq!(ks.exec(1, &[&["SET", "k", "mine"]]), Value::NullArray);
+        assert_eq!(
+            ks.run(2, &["GET", "k"]),
+            bulk("theirs"),
+            "nothing in it ran"
+        );
+    }
+
+    #[test]
+    fn exec_runs_when_nothing_wrote_the_watched_key() {
+        let mut ks = Keyspace::new();
+        ks.watch(1, &["k"]);
+        ks.run(2, &["GET", "k"]);
+        ks.run(2, &["SET", "other", "v"]);
+        assert_eq!(ks.exec(1, &[&["PING"]]), ran(vec![pong()]));
+    }
+
+    #[test]
+    fn a_write_that_changes_nothing_does_not_abort() {
+        let mut ks = Keyspace::new();
+        ks.run(2, &["SET", "s", "text"]);
+        ks.watch(1, &["k", "s"]);
+        ks.run(2, &["DEL", "k"]);
+        ks.run(2, &["LPOP", "k"]);
+        ks.run(2, &["LPUSH", "s", "x"]); // WRONGTYPE
+        ks.run(2, &["INCR", "s"]); // not an integer
+        assert_eq!(ks.exec(1, &[&["PING"]]), ran(vec![pong()]));
+    }
+
+    #[test]
+    fn a_key_that_expires_after_watch_aborts_exec() {
+        let mut ks = Keyspace::new();
+        ks.run(2, &["SET", "k", "v", "PX", "100"]);
+        ks.watch(1, &["k"]);
+        ks.clock.advance_ms(100);
+        assert_eq!(ks.exec(1, &[&["PING"]]), Value::NullArray);
+    }
+
+    #[test]
+    fn a_key_with_a_ttl_still_live_at_exec_does_not_abort() {
+        let mut ks = Keyspace::new();
+        ks.run(2, &["SET", "k", "v", "PX", "100"]);
+        ks.watch(1, &["k"]);
+        ks.clock.advance_ms(99);
+        assert_eq!(ks.exec(1, &[&["PING"]]), ran(vec![pong()]));
+    }
+
+    #[test]
+    fn a_key_already_expired_at_watch_counts_as_absent() {
+        let mut ks = Keyspace::new();
+        ks.run(2, &["SET", "k", "v", "PX", "100"]);
+        ks.clock.advance_ms(100);
+        ks.watch(1, &["k"]);
+        ks.run(2, &["GET", "k"]); // reaps it: not a change
+        assert_eq!(ks.exec(1, &[&["PING"]]), ran(vec![pong()]));
+    }
+
+    #[test]
+    fn a_waiter_served_by_a_write_counts_as_a_write() {
+        // BLMOVE parks on src; the push serves it, which moves the element
+        // into dst. Nobody wrote dst directly, but it changed.
+        let mut ks = Keyspace::new();
+        let (reply, _rx) = mpsc::unbounded_channel();
+        ks.send(Request::Run {
+            cmd: cmd(&["BLMOVE", "src", "dst", "LEFT", "RIGHT", "0"]),
+            reply,
+            conn: 3,
+        });
+        ks.watch(1, &["dst"]);
+        ks.run(2, &["RPUSH", "src", "x"]);
+        assert!(ks.waiters.is_empty(), "the push served the waiter");
+        assert_eq!(ks.exec(1, &[&["PING"]]), Value::NullArray);
+    }
+
+    #[test]
+    fn unwatch_forgets_earlier_writes() {
+        let mut ks = Keyspace::new();
+        ks.watch(1, &["k"]);
+        ks.run(2, &["SET", "k", "v"]);
+        ks.send(Request::Unwatch { conn: 1 });
+        assert_eq!(ks.exec(1, &[&["PING"]]), ran(vec![pong()]));
+    }
+
+    #[test]
+    fn exec_ends_the_watch_even_when_it_aborts() {
+        let mut ks = Keyspace::new();
+        ks.watch(1, &["k"]);
+        ks.run(2, &["SET", "k", "1"]);
+        assert_eq!(ks.exec(1, &[&["PING"]]), Value::NullArray);
+        ks.run(2, &["SET", "k", "2"]);
+        assert_eq!(
+            ks.exec(1, &[&["PING"]]),
+            ran(vec![pong()]),
+            "no longer watched"
+        );
+    }
+
+    #[test]
+    fn one_write_aborts_every_watcher_of_the_key() {
+        let mut ks = Keyspace::new();
+        ks.watch(1, &["k"]);
+        ks.watch(2, &["k"]);
+        ks.run(3, &["SET", "k", "v"]);
+        assert_eq!(ks.exec(1, &[&["PING"]]), Value::NullArray);
+        assert_eq!(ks.exec(2, &[&["PING"]]), Value::NullArray);
+    }
+
+    #[test]
+    fn ending_every_watch_leaves_the_table_empty() {
+        let mut ks = Keyspace::new();
+        ks.watch(1, &["a", "b"]);
+        ks.watch(1, &["a"]); // twice is harmless
+        ks.watch(2, &["a"]);
+        ks.send(Request::Unwatch { conn: 1 });
+        assert!(!ks.watches.is_empty(), "conn 2 still watches a");
+        ks.exec(2, &[&["PING"]]);
+        assert!(ks.watches.is_empty(), "no key or connection left behind");
     }
 }

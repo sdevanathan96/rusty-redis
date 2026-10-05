@@ -116,6 +116,10 @@ impl Data {
 pub struct Db {
     map: HashMap<Bytes, Entry>,
     clock: Arc<dyn Clock>,
+    /// Keys changed since the keyspace task last took them, for WATCH. May
+    /// repeat a key. Lazy expiry never adds to it: `reap_if_expired` cannot
+    /// reach it.
+    modified: Vec<Bytes>,
 }
 
 impl Db {
@@ -128,6 +132,32 @@ impl Db {
     fn reap(&mut self, key: &[u8]) {
         let now = self.clock.now();
         reap_if_expired(&mut self.map, key, now);
+    }
+
+    /// Records that `key` changed. Call it only once the change has happened:
+    /// a write that fails or finds nothing to do changes nothing, and must
+    /// not abort anyone's WATCH.
+    fn mark_modified(&mut self, key: Bytes) {
+        self.modified.push(key);
+    }
+
+    /// Every key changed since the last call, emptying the list.
+    pub fn take_modified(&mut self) -> Vec<Bytes> {
+        std::mem::take(&mut self.modified)
+    }
+
+    /// When a live key expires. `None` if it is absent, already expired, or
+    /// has no TTL. Reaping here is not a change, so it is not marked.
+    pub fn deadline(&mut self, key: &[u8]) -> Option<Instant> {
+        self.reap(key);
+        self.map.get(key).and_then(|e| e.expires_at)
+    }
+
+    /// Whether `deadline` is past on this database's clock, by the same rule
+    /// as `Entry::is_expired`, so a key that reads as gone also counts as
+    /// expired here.
+    pub fn has_passed(&self, deadline: Instant) -> bool {
+        self.clock.now() >= deadline
     }
 
     /// The stored value, if the key is live. Reap first; every public method
@@ -153,16 +183,19 @@ impl Db {
         Db {
             map: HashMap::new(),
             clock,
+            modified: Vec::new(),
         }
     }
 
-    pub fn delete(&mut self, key: &[u8]) -> bool {
+    pub fn delete(&mut self, key: &Bytes) -> bool {
         let now = self.clock.now();
-        // An expired entry counts as absent, so removing it returns false.
-        match self.map.remove(key) {
-            Some(entry) => !entry.is_expired(now),
-            None => false,
+        // An expired entry counts as absent, so removing it returns false
+        // and changes nothing.
+        let removed = self.map.remove(key).is_some_and(|e| !e.is_expired(now));
+        if removed {
+            self.mark_modified(key.clone());
         }
+        removed
     }
 
     /// Counts entries still in the map, including ones past their deadline that
@@ -300,7 +333,10 @@ mod tests {
         )
         .unwrap();
         clock.advance(Duration::from_millis(10));
-        assert!(!db.delete(b"k"), "expired key counts as absent");
+        assert!(
+            !db.delete(&Bytes::from_static(b"k")),
+            "expired key counts as absent"
+        );
         assert_eq!(db.len(), 0, "but it is still removed");
     }
 
@@ -465,5 +501,134 @@ mod tests {
             Ok(None),
             "the deadline from SET still applies"
         );
+    }
+}
+
+/// What each write reports for WATCH. A key appears only when the write
+/// changed something, matching what aborts a watcher in Redis 8.10.1.
+#[cfg(test)]
+mod modified_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+
+    use super::{Db, End, EntryId, IdSpec, Mode, RefPolicy, TestClock, Trim, TrimBy};
+
+    fn fixture() -> (Arc<TestClock>, Db) {
+        let clock = Arc::new(TestClock::new());
+        let db = Db::with_clock(clock.clone());
+        (clock, db)
+    }
+
+    fn k(key: &'static [u8]) -> Bytes {
+        Bytes::from_static(key)
+    }
+
+    fn xadd(db: &mut Db, key: &'static [u8], ms: u64, nomkstream: bool) -> bool {
+        let id = IdSpec::Explicit(EntryId { ms, seq: 0 });
+        db.xadd(k(key), id, vec![(k(b"f"), k(b"v"))], None, nomkstream)
+            .is_ok_and(|added| added.is_some())
+    }
+
+    fn max_len(n: usize) -> Trim {
+        Trim {
+            by: TrimBy::MaxLen(n),
+            mode: Mode::Exact,
+            refs: RefPolicy::KeepRef,
+        }
+    }
+
+    #[test]
+    fn writes_that_change_something_report_their_key() {
+        let (_clock, mut db) = fixture();
+        db.set(k(b"s"), k(b"v"), None).unwrap();
+        assert_eq!(db.take_modified(), vec![k(b"s")], "set");
+
+        db.incr(k(b"n")).unwrap();
+        db.incr(k(b"n")).unwrap();
+        assert_eq!(
+            db.take_modified(),
+            vec![k(b"n"), k(b"n")],
+            "incr, new then existing"
+        );
+
+        db.push(k(b"l"), vec![k(b"a"), k(b"b")], End::Right)
+            .unwrap();
+        db.pop(&k(b"l"), None, End::Left).unwrap();
+        assert_eq!(db.take_modified(), vec![k(b"l"), k(b"l")], "push then pop");
+
+        assert!(xadd(&mut db, b"x", 1, false));
+        assert!(xadd(&mut db, b"x", 2, false));
+        db.xdel(&k(b"x"), &[EntryId { ms: 1, seq: 0 }]).unwrap();
+        db.xtrim(&k(b"x"), &max_len(0)).unwrap();
+        assert_eq!(
+            db.take_modified(),
+            vec![k(b"x"); 4],
+            "xadd twice, xdel, xtrim"
+        );
+
+        assert!(db.delete(&k(b"s")));
+        assert_eq!(db.take_modified(), vec![k(b"s")], "delete");
+    }
+
+    #[test]
+    fn writes_that_change_nothing_report_nothing() {
+        let (_clock, mut db) = fixture();
+        db.set(k(b"s"), k(b"text"), None).unwrap();
+        db.push(k(b"l"), vec![k(b"a")], End::Right).unwrap();
+        assert!(xadd(&mut db, b"x", 5, false));
+        db.take_modified();
+
+        assert!(!db.delete(&k(b"missing")));
+        assert_eq!(db.pop(&k(b"missing"), None, End::Left), Ok(None));
+        assert_eq!(db.pop(&k(b"l"), Some(0), End::Left), Ok(Some(vec![])));
+        assert_eq!(
+            db.lmove(&k(b"missing"), k(b"l"), End::Left, End::Right),
+            Ok(None)
+        );
+        assert!(
+            db.push(k(b"s"), vec![k(b"a")], End::Left).is_err(),
+            "WRONGTYPE"
+        );
+        assert!(db.incr(k(b"s")).is_err(), "not an integer");
+        let overflowing = Some(Duration::from_millis(i64::MAX as u64));
+        assert!(db.set(k(b"s"), k(b"v"), overflowing).is_err());
+        assert!(!xadd(&mut db, b"missing", 1, true), "NOMKSTREAM");
+        assert!(!xadd(&mut db, b"x", 1, false), "id too small");
+        assert_eq!(db.xdel(&k(b"x"), &[EntryId { ms: 9, seq: 0 }]), Ok(0));
+        assert_eq!(db.xtrim(&k(b"x"), &max_len(5)), Ok(0));
+
+        assert_eq!(db.take_modified(), Vec::<Bytes>::new());
+    }
+
+    #[test]
+    fn lmove_reports_both_keys() {
+        let (_clock, mut db) = fixture();
+        db.push(k(b"src"), vec![k(b"a")], End::Right).unwrap();
+        db.take_modified();
+        db.lmove(&k(b"src"), k(b"dst"), End::Left, End::Right)
+            .unwrap();
+        assert_eq!(db.take_modified(), vec![k(b"dst"), k(b"src")]);
+    }
+
+    #[test]
+    fn lazy_expiry_reports_nothing() {
+        let (clock, mut db) = fixture();
+        db.set(k(b"k"), k(b"v"), Some(Duration::from_millis(10)))
+            .unwrap();
+        db.take_modified();
+        clock.advance(Duration::from_millis(10));
+        assert_eq!(db.get(b"k"), Ok(None), "reaped here");
+        assert!(!db.delete(&k(b"k")));
+        assert_eq!(db.take_modified(), Vec::<Bytes>::new());
+    }
+
+    #[test]
+    fn take_modified_empties_the_list() {
+        let (_clock, mut db) = fixture();
+        db.set(k(b"k"), k(b"v"), None).unwrap();
+        assert_eq!(db.take_modified(), vec![k(b"k")]);
+        assert_eq!(db.take_modified(), Vec::<Bytes>::new());
     }
 }

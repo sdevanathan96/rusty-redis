@@ -87,12 +87,13 @@ impl Db {
             None => None,
         };
         self.map.insert(
-            key,
+            key.clone(),
             Entry {
                 data: Data::String(Str::from_bytes(value)),
                 expires_at,
             },
         );
+        self.mark_modified(key);
         Ok(())
     }
 
@@ -111,18 +112,21 @@ impl Db {
         match self.data_mut(&key) {
             None => {
                 self.map.insert(
-                    key,
+                    key.clone(),
                     Entry {
                         data: Data::String(Str::Integer(1)),
                         expires_at: None,
                     },
                 );
+                self.mark_modified(key);
                 Ok(1)
             }
             Some(d) => {
                 let value = d.as_integer_mut()?;
                 *value = value.checked_add(1).ok_or(IncrError::Overflow)?;
-                Ok(*value)
+                let n = *value; // last use of the borrow from data_mut
+                self.mark_modified(key);
+                Ok(n)
             }
         }
     }

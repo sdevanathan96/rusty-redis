@@ -220,7 +220,7 @@ impl Db {
             return Ok(None);
         }
 
-        let entry = self.map.entry(key).or_insert_with(|| Entry {
+        let entry = self.map.entry(key.clone()).or_insert_with(|| Entry {
             data: Data::Stream(Stream::default()),
             expires_at: None,
         });
@@ -238,6 +238,7 @@ impl Db {
         if let Some(t) = &trim {
             stream.trim(t);
         }
+        self.mark_modified(key);
         Ok(Some(entry_id))
     }
 
@@ -288,7 +289,7 @@ impl Db {
         }
     }
 
-    pub fn xdel(&mut self, key: &[u8], ids: &[EntryId]) -> Result<usize, WrongType> {
+    pub fn xdel(&mut self, key: &Bytes, ids: &[EntryId]) -> Result<usize, WrongType> {
         self.reap(key);
         let stream = match self.data_mut(key) {
             None => return Ok(0),
@@ -298,18 +299,25 @@ impl Db {
         for &id in ids {
             n += stream.delete(id);
         }
+        if n > 0 {
+            self.mark_modified(key.clone());
+        }
         Ok(n)
     }
 
     /// A missing key is 0 and stays missing. An emptied stream keeps its key
     /// and its last id, as in Redis.
-    pub fn xtrim(&mut self, key: &[u8], trim: &Trim) -> Result<usize, WrongType> {
+    pub fn xtrim(&mut self, key: &Bytes, trim: &Trim) -> Result<usize, WrongType> {
         self.reap(key);
         let stream = match self.data_mut(key) {
             None => return Ok(0),
             Some(d) => d.as_stream_mut()?,
         };
-        Ok(stream.trim(trim))
+        let count = stream.trim(trim);
+        if count > 0 {
+            self.mark_modified(key.clone());
+        }
+        Ok(count)
     }
 }
 
