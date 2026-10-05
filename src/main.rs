@@ -80,6 +80,10 @@ async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<Request>) -> std::i
 /// the drain loop.
 const OUTBUF_FLUSH_AT: usize = 64 * 1024;
 
+/// Starting size of both buffers, and the room reserved in `inbuf` before each
+/// read.
+const READ_CHUNK: usize = 4096;
+
 /// Close the connection once the input a client holds passes this: unparsed
 /// bytes in `inbuf`, commands parsed into `queued` but not yet run, and
 /// commands waiting in an open MULTI. Same value and same rule as Redis's
@@ -113,8 +117,8 @@ impl Conn {
         let (reply_tx, reply_rx) = mpsc::unbounded_channel();
         Conn {
             stream,
-            inbuf: BytesMut::with_capacity(4096),
-            outbuf: BytesMut::with_capacity(4096),
+            inbuf: BytesMut::with_capacity(READ_CHUNK),
+            outbuf: BytesMut::with_capacity(READ_CHUNK),
             reply_tx,
             reply_rx,
             queued: Pending::new(),
@@ -257,7 +261,7 @@ async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std::io:
         }
 
         conn.flush().await?;
-        conn.inbuf.reserve(4096);
+        conn.inbuf.reserve(READ_CHUNK);
         if conn.stream.read_buf(&mut conn.inbuf).await? == 0 {
             return Ok(());
         }
@@ -303,7 +307,7 @@ async fn wait_for_reply(
     let mut on_timeout = timeout.map(|_| on_timeout); // Some while the timer is armed
 
     loop {
-        conn.inbuf.reserve(4096);
+        conn.inbuf.reserve(READ_CHUNK);
         // The branches borrow different fields of conn, which Rust allows at once.
         tokio::select! {
             reply = conn.reply_rx.recv() => return Ok(reply),

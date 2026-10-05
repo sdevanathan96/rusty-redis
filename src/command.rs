@@ -456,11 +456,6 @@ fn parse_i64(raw: &[u8]) -> Result<i64, CommandError> {
     strict_i64(raw).ok_or(CommandError::NotAnInteger)
 }
 
-// fn parse_u64(raw: &[u8]) -> Result<u64, CommandError> {
-//     let text = std::str::from_utf8(raw).map_err(|_| CommandError::InvalidStreamId)?;
-//     text.parse().map_err(|_| CommandError::InvalidStreamId)
-// }
-
 fn parse_end(raw: &[u8]) -> Result<End, CommandError> {
     match raw.to_ascii_uppercase().as_slice() {
         b"LEFT" => Ok(End::Left),

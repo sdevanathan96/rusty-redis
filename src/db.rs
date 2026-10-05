@@ -360,14 +360,6 @@ impl Db {
         to: End,
     ) -> Result<Option<Bytes>, WrongType> {
         self.reap(src);
-        // self.reap(src);
-        // let src_ready = match self.data(src) {
-        //     None => false,
-        //     Some(d) => !d.as_list()?.is_empty(),
-        // };
-        // if !src_ready {
-        //     return Ok(None);
-        // }
         if self
             .data(src)
             .map(Data::as_list)
@@ -601,14 +593,11 @@ impl Default for Db {
     }
 }
 
-/// One offset, read by both clocks.
-///
-/// The previous version kept `now` and `base_ms` as independent counters, so a
-/// test could advance monotonic time while stream ids stayed frozen, or the
-/// reverse. It also started the wall clock at zero, which hides every behavior
-/// that depends on how close `mstime()` is to `i64::MAX`, including the PX
-/// overflow in `Db::set`: at epoch zero no i64 argument can push the sum past
-/// the limit, so the case is untestable.
+/// One offset, read by both clocks, so a test can never move monotonic time
+/// while stream ids stay frozen, or the reverse. The wall clock starts at a
+/// plausible time rather than zero, because behavior that depends on how close
+/// `mstime()` is to `i64::MAX`, such as the PX overflow in `Db::set`, cannot
+/// happen at epoch zero.
 #[cfg(test)]
 pub struct TestClock {
     start: Instant,

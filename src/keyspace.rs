@@ -60,15 +60,17 @@ fn serve_waiters(db: &mut Db, waiters: &mut VecDeque<Waiter>, key: &Bytes) -> Ve
         match execute(waiters[i].retry.clone(), db) {
             Ok(Outcome::Reply(v)) => {
                 fed.extend(waiters[i].retry.meta().feeds);
-                let w = waiters.remove(i).unwrap();
-                let _ = w.reply.send(v);
+                if let Some(w) = waiters.remove(i) {
+                    let _ = w.reply.send(v);
+                }
             }
             Ok(Outcome::Block { .. }) => {
                 i += 1;
             }
             Err(e) => {
-                let w = waiters.remove(i).unwrap();
-                let _ = w.reply.send(Value::Error(e.to_resp()));
+                if let Some(w) = waiters.remove(i) {
+                    let _ = w.reply.send(Value::Error(e.to_resp()));
+                }
             }
         }
     }
@@ -101,8 +103,9 @@ fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>) {
             wake(db, waiters, touched);
         }
         Request::Unpark { id, on_timeout } => {
-            if let Some(i) = waiters.iter().position(|w| w.id == id) {
-                let w = waiters.remove(i).unwrap();
+            if let Some(i) = waiters.iter().position(|w| w.id == id)
+                && let Some(w) = waiters.remove(i)
+            {
                 let _ = w.reply.send(on_timeout);
             }
         }
