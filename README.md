@@ -147,67 +147,93 @@ flowchart TD
 
 subgraph group_transport["TCP and RESP"]
   node_main["Startup and accept loop<br/>[main.rs]"]
-  node_server["Client connections<br/>[connection.rs]"]
+  node_connection["Client connections<br/>[connection.rs]"]
   node_resp["RESP codec<br/>[resp.rs]"]
+  node_pending["Pending requests<br/>[pending.rs]"]
 end
 
 subgraph group_execution["Command Execution"]
   node_command["Command parsing and execution<br/>[command.rs]"]
+  node_args["Argument parsing<br/>[args.rs]"]
+  node_errors["Command errors<br/>[error.rs]"]
   node_generic["Generic commands<br/>[generic.rs]"]
   node_strings["String commands<br/>[string.rs]"]
   node_lists["List commands<br/>[list.rs]"]
   node_streams["Stream commands<br/>[stream.rs]"]
   node_config["Server configuration<br/>[config.rs]"]
-  node_integerparse["Strict integer parsing<br/>[int.rs]"]
+  node_integers["Strict integer parsing<br/>[int.rs]"]
 end
 
 subgraph group_coordination["Keyspace Coordination"]
-  node_keyspace["Keyspace owner and waiters<br/>[keyspace.rs]"]
+  node_keyspace["Keyspace task and waiters<br/>[keyspace.rs]"]
 end
 
 subgraph group_storage["In-Memory Storage"]
-  node_db[("In-memory database<br/>[db.rs]")]
-  node_streammodel["Stream entries and IDs<br/>[stream.rs]"]
+  node_db[("Database and key expiry<br/>[db.rs]")]
+  node_dbstrings["String storage<br/>[string.rs]"]
+  node_dblists["List storage<br/>[list.rs]"]
+  node_dbstreams["Stream storage<br/>[stream.rs]"]
+  node_clock["Expiry clock<br/>[clock.rs]"]
+end
+
+subgraph group_transaction["Transactions"]
+  node_transactions["Transaction queue<br/>[transaction.rs]"]
 end
 
 node_client(("Redis client"))
 
 node_client -->|"connects"| node_main
-node_main -->|"spawns one per client"| node_server
-node_client -->|"sends requests"| node_server
-node_server -->|"parses frames"| node_resp
-node_server -->|"parses commands"| node_command
-node_server -->|"submits requests"| node_keyspace
+node_client -->|"sends requests"| node_connection
+node_main -->|"spawns clients"| node_connection
 node_main -->|"reads flags"| node_config
+node_connection -->|"encodes replies"| node_resp
+node_connection -->|"queues parsed requests"| node_pending
+node_pending -->|"parses frames"| node_resp
+node_pending -->|"parses commands"| node_command
+node_connection -->|"submits requests"| node_keyspace
 node_keyspace -->|"executes commands"| node_command
 node_command -->|"dispatches"| node_generic
 node_command -->|"dispatches"| node_strings
 node_command -->|"dispatches"| node_lists
 node_command -->|"dispatches"| node_streams
+node_command -->|"uses parsers"| node_args
+node_command -->|"error replies"| node_errors
+node_args -->|"parses integers"| node_integers
+node_config -->|"parses numeric flags"| node_integers
 node_generic -->|"reads and writes"| node_db
 node_strings -->|"reads and writes"| node_db
 node_lists -->|"reads and writes"| node_db
 node_streams -->|"reads and writes"| node_db
-node_db -->|"uses stream model"| node_streammodel
-node_command -->|"uses parsing"| node_integerparse
-node_config -->|"uses parsing"| node_integerparse
-node_server -->|"encodes replies"| node_resp
-node_keyspace -->|"returns replies"| node_server
-node_server -->|"sends replies"| node_client
+node_db -->|"delegates storage"| node_dbstrings
+node_db -->|"delegates storage"| node_dblists
+node_db -->|"delegates storage"| node_dbstreams
+node_db -->|"uses clock"| node_clock
+node_connection -->|"queues MULTI commands"| node_transactions
+node_transactions -->|"holds parsed items"| node_pending
+node_keyspace -->|"owns database"| node_db
+node_keyspace -->|"returns replies"| node_connection
+node_connection -->|"sends replies"| node_client
 
 click node_main "https://github.com/sdevanathan96/rusty-redis/blob/main/src/main.rs"
-click node_server "https://github.com/sdevanathan96/rusty-redis/blob/main/src/connection.rs"
+click node_connection "https://github.com/sdevanathan96/rusty-redis/blob/main/src/connection.rs"
 click node_resp "https://github.com/sdevanathan96/rusty-redis/blob/main/src/resp.rs"
+click node_pending "https://github.com/sdevanathan96/rusty-redis/blob/main/src/connection/pending.rs"
 click node_command "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command.rs"
+click node_args "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/args.rs"
+click node_errors "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/error.rs"
 click node_generic "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/generic.rs"
 click node_strings "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/string.rs"
 click node_lists "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/list.rs"
 click node_streams "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/stream.rs"
+click node_config "https://github.com/sdevanathan96/rusty-redis/blob/main/src/config.rs"
+click node_integers "https://github.com/sdevanathan96/rusty-redis/blob/main/src/int.rs"
 click node_keyspace "https://github.com/sdevanathan96/rusty-redis/blob/main/src/keyspace.rs"
 click node_db "https://github.com/sdevanathan96/rusty-redis/blob/main/src/db.rs"
-click node_streammodel "https://github.com/sdevanathan96/rusty-redis/blob/main/src/db/stream.rs"
-click node_config "https://github.com/sdevanathan96/rusty-redis/blob/main/src/config.rs"
-click node_integerparse "https://github.com/sdevanathan96/rusty-redis/blob/main/src/int.rs"
+click node_dbstrings "https://github.com/sdevanathan96/rusty-redis/blob/main/src/db/string.rs"
+click node_dblists "https://github.com/sdevanathan96/rusty-redis/blob/main/src/db/list.rs"
+click node_dbstreams "https://github.com/sdevanathan96/rusty-redis/blob/main/src/db/stream.rs"
+click node_clock "https://github.com/sdevanathan96/rusty-redis/blob/main/src/db/clock.rs"
+click node_transactions "https://github.com/sdevanathan96/rusty-redis/blob/main/src/connection/transaction.rs"
 
 classDef toneNeutral fill:#f8fafc,stroke:#334155,stroke-width:1.5px,color:#0f172a
 classDef toneBlue fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#172554
@@ -216,10 +242,11 @@ classDef toneMint fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#14532d
 classDef toneRose fill:#ffe4e6,stroke:#e11d48,stroke-width:1.5px,color:#881337
 classDef toneIndigo fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#312e81
 classDef toneTeal fill:#ccfbf1,stroke:#0f766e,stroke-width:1.5px,color:#134e4a
-class node_main,node_server,node_resp toneBlue
-class node_command,node_generic,node_strings,node_lists,node_streams,node_config,node_integerparse,node_client toneAmber
+class node_main,node_connection,node_resp,node_pending toneBlue
+class node_command,node_args,node_errors,node_generic,node_strings,node_lists,node_streams,node_config,node_integers,node_client toneAmber
 class node_keyspace toneMint
-class node_db,node_streammodel toneRose
+class node_db,node_dbstrings,node_dblists,node_dbstreams,node_clock toneRose
+class node_transactions toneIndigo
 ```
 
 ## Layout
