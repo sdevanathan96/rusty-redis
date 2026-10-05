@@ -146,7 +146,8 @@ cargo +nightly fuzz run parse
 flowchart TD
 
 subgraph group_transport["TCP and RESP"]
-  node_server["TCP server<br/>[main.rs]"]
+  node_main["Startup and accept loop<br/>[main.rs]"]
+  node_server["Client connections<br/>[connection.rs]"]
   node_resp["RESP codec<br/>[resp.rs]"]
 end
 
@@ -154,7 +155,6 @@ subgraph group_execution["Command Execution"]
   node_command["Command parsing and execution<br/>[command.rs]"]
   node_generic["Generic commands<br/>[generic.rs]"]
   node_strings["String commands<br/>[string.rs]"]
-  node_integers["Integer commands<br/>[integer.rs]"]
   node_lists["List commands<br/>[list.rs]"]
   node_streams["Stream commands<br/>[stream.rs]"]
   node_config["Server configuration<br/>[config.rs]"]
@@ -172,20 +172,20 @@ end
 
 node_client(("Redis client"))
 
+node_client -->|"connects"| node_main
+node_main -->|"spawns one per client"| node_server
 node_client -->|"sends requests"| node_server
 node_server -->|"parses frames"| node_resp
 node_server -->|"parses commands"| node_command
 node_server -->|"submits requests"| node_keyspace
-node_server -->|"reads flags"| node_config
+node_main -->|"reads flags"| node_config
 node_keyspace -->|"executes commands"| node_command
 node_command -->|"dispatches"| node_generic
 node_command -->|"dispatches"| node_strings
-node_command -->|"dispatches"| node_integers
 node_command -->|"dispatches"| node_lists
 node_command -->|"dispatches"| node_streams
 node_generic -->|"reads and writes"| node_db
 node_strings -->|"reads and writes"| node_db
-node_integers -->|"reads and writes"| node_db
 node_lists -->|"reads and writes"| node_db
 node_streams -->|"reads and writes"| node_db
 node_db -->|"uses stream model"| node_streammodel
@@ -195,12 +195,12 @@ node_server -->|"encodes replies"| node_resp
 node_keyspace -->|"returns replies"| node_server
 node_server -->|"sends replies"| node_client
 
-click node_server "https://github.com/sdevanathan96/rusty-redis/blob/main/src/main.rs"
+click node_main "https://github.com/sdevanathan96/rusty-redis/blob/main/src/main.rs"
+click node_server "https://github.com/sdevanathan96/rusty-redis/blob/main/src/connection.rs"
 click node_resp "https://github.com/sdevanathan96/rusty-redis/blob/main/src/resp.rs"
 click node_command "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command.rs"
 click node_generic "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/generic.rs"
 click node_strings "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/string.rs"
-click node_integers "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/integer.rs"
 click node_lists "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/list.rs"
 click node_streams "https://github.com/sdevanathan96/rusty-redis/blob/main/src/command/stream.rs"
 click node_keyspace "https://github.com/sdevanathan96/rusty-redis/blob/main/src/keyspace.rs"
@@ -216,8 +216,8 @@ classDef toneMint fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#14532d
 classDef toneRose fill:#ffe4e6,stroke:#e11d48,stroke-width:1.5px,color:#881337
 classDef toneIndigo fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#312e81
 classDef toneTeal fill:#ccfbf1,stroke:#0f766e,stroke-width:1.5px,color:#134e4a
-class node_server,node_resp toneBlue
-class node_command,node_generic,node_strings,node_integers,node_lists,node_streams,node_config,node_integerparse,node_client toneAmber
+class node_main,node_server,node_resp toneBlue
+class node_command,node_generic,node_strings,node_lists,node_streams,node_config,node_integerparse,node_client toneAmber
 class node_keyspace toneMint
 class node_db,node_streammodel toneRose
 ```
@@ -226,14 +226,17 @@ class node_db,node_streammodel toneRose
 
 ```
 src/
-  main.rs        TCP accept loop and per-connection handling
+  main.rs        startup and the TCP accept loop
+  connection.rs  one client: reading, pipelining, parked waits, writing
+  connection/    parsed-but-not-run queue, MULTI transaction
   config.rs      startup flags (--port)
   resp.rs        RESP parser and encoder
   int.rs         strict integer parsing, shared by commands and flags
-  command.rs     request -> Command parsing, error replies
-  command/       per-group parsers (generic, string, integer, list, stream)
+  command.rs     request -> Command parsing, and execution
+  command/       error replies, shared argument parsers, and one file per
+                 command group (generic, string, list, stream)
   db.rs          in-memory data store and expiry
-  db/stream.rs   stream entries and IDs
+  db/            clocks, and each data type's storage (string, list, stream)
   keyspace.rs    single task owning the keyspace; blocking-command wakeups
 test.sh          differential tests against redis-server
 bench/           benchmark against redis-server, and its reports

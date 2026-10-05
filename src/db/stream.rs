@@ -1,3 +1,4 @@
+use super::{Data, Db, Entry, WrongType};
 use bytes::Bytes;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -196,6 +197,120 @@ pub enum IdSpec {
     Explicit(EntryId),
     AutoSeq(u64), // ms given, seq to be generated
     Auto,         // both generated
+}
+
+/// The stream methods of `Db`, next to the stream they work on.
+impl Db {
+    /// Appends, then trims, in that order, so `MAXLEN 0` removes the entry just
+    /// added. `None` means NOMKSTREAM found no key, and nothing was created. A
+    /// failed append returns before anything is trimmed.
+    pub fn xadd(
+        &mut self,
+        key: Bytes,
+        spec: IdSpec,
+        fields: Vec<(Bytes, Bytes)>,
+        trim: Option<Trim>,
+        nomkstream: bool,
+    ) -> Result<Option<EntryId>, XaddError> {
+        self.reap(&key);
+        let now_ms = self.clock.now_ms();
+
+        // Before or_insert_with, which would create the key.
+        if nomkstream && !self.map.contains_key(&key) {
+            return Ok(None);
+        }
+
+        let entry = self.map.entry(key).or_insert_with(|| Entry {
+            data: Data::Stream(Stream::default()),
+            expires_at: None,
+        });
+
+        let stream = match &mut entry.data {
+            Data::Stream(s) => s,
+            _ => return Err(XaddError::WrongType),
+        };
+
+        let entry_id = match spec {
+            IdSpec::Explicit(id) => stream.append(id, fields),
+            IdSpec::AutoSeq(ms) => stream.append_auto_seq(ms, fields),
+            IdSpec::Auto => stream.append_auto(now_ms, fields),
+        }?;
+        if let Some(t) = &trim {
+            stream.trim(t);
+        }
+        Ok(Some(entry_id))
+    }
+
+    pub fn xlen(&mut self, key: &[u8]) -> Result<usize, WrongType> {
+        self.reap(key);
+        self.data(key).map_or(Ok(0), |s| Ok(s.as_stream()?.len()))
+    }
+
+    pub fn xrange(
+        &mut self,
+        key: &[u8],
+        start: EntryId,
+        end: EntryId,
+        count: Option<usize>,
+    ) -> Result<Option<&[StreamEntry]>, WrongType> {
+        self.reap(key);
+        match self.data(key) {
+            None => Ok(None),
+            Some(d) => Ok(Some(d.as_stream()?.range(start, end, count))),
+        }
+    }
+
+    pub fn stream_last_id(&mut self, key: &[u8]) -> Result<EntryId, WrongType> {
+        self.reap(key);
+        self.data(key).map_or(Ok(EntryId { ms: 0, seq: 0 }), |s| {
+            let stream = s.as_stream()?;
+            Ok(stream.last_id())
+        })
+    }
+
+    pub fn xlast(&mut self, key: &[u8]) -> Result<Option<&[StreamEntry]>, WrongType> {
+        self.reap(key);
+        self.data(key)
+            .map(|d| Ok(d.as_stream()?.last_slice()))
+            .transpose()
+    }
+
+    pub fn xrange_after(
+        &mut self,
+        key: &[u8],
+        after: EntryId,
+        count: Option<usize>,
+    ) -> Result<Option<&[StreamEntry]>, WrongType> {
+        self.reap(key);
+        match self.data(key) {
+            None => Ok(None),
+            Some(d) => Ok(Some(d.as_stream()?.range_after(after, count))),
+        }
+    }
+
+    pub fn xdel(&mut self, key: &[u8], ids: &[EntryId]) -> Result<usize, WrongType> {
+        self.reap(key);
+        let stream = match self.data_mut(key) {
+            None => return Ok(0),
+            Some(d) => d.as_stream_mut()?,
+        };
+        let mut n = 0usize;
+        for &id in ids {
+            n += stream.delete(id);
+        }
+        Ok(n)
+    }
+
+    /// A missing key is 0 and stays missing. An emptied stream keeps its key
+    /// and its last id, as in Redis.
+    pub fn xtrim(&mut self, key: &[u8], trim: &Trim) -> Result<usize, WrongType> {
+        self.reap(key);
+        let stream = match self.data_mut(key) {
+            None => return Ok(0),
+            Some(d) => d.as_stream_mut()?,
+        };
+        Ok(stream.trim(trim))
+    }
 }
 
 #[cfg(test)]

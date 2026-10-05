@@ -1,7 +1,8 @@
 use bytes::Bytes;
 
 use crate::{
-    command::{Blocking, Command, CommandError, Outcome, lenient_u64, parse_block, parse_i64},
+    command::args::{lenient_u64, parse_block, parse_i64},
+    command::{Blocking, Command, CommandError, Outcome},
     db::{Db, EntryId, IdSpec, Mode, ReadFrom, RefPolicy, StreamEntry, Trim, TrimBy},
     resp::Value,
 };
@@ -210,7 +211,7 @@ pub(super) fn try_parse(
         b"XREAD" => xread_command(rest, name),
         b"XDEL" => xdel_command(rest, name),
         b"XTRIM" => xtrim_command(rest, name),
-        _ => return None, // not a Stream command
+        _ => return None, // not a stream command
     })
 }
 

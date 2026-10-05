@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use super::{Command, CommandError, ExpiryUnit, expiry_arg};
+use super::args::{ExpiryUnit, expiry_arg};
+use super::{Command, CommandError};
 use crate::db::Db;
 use crate::resp::Value;
 
@@ -14,7 +15,8 @@ pub(super) fn try_parse(
     Some(match upper {
         b"GET" => get_command(rest, name),
         b"SET" => set_command(rest, name),
-        _ => return None, // not a list command
+        b"INCR" => incr_command(rest, name),
+        _ => return None, // not a string command
     })
 }
 
@@ -24,6 +26,7 @@ fn get_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
         _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
+
 fn set_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     let (key, value) = match rest {
         [k, v, ..] => (k.clone(), v.clone()),
@@ -55,6 +58,13 @@ fn set_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     Ok(Command::Set { key, value, expiry })
 }
 
+fn incr_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
+    match rest {
+        [key] => Ok(Command::Incr { key: key.clone() }),
+        _ => Err(CommandError::WrongArity(name.clone())),
+    }
+}
+
 pub(super) fn get(key: &Bytes, db: &mut Db) -> Result<Value, CommandError> {
     Ok(match db.get(key)? {
         Some(v) => Value::BulkString(v),
@@ -71,6 +81,10 @@ pub(super) fn set(
     db.set(key, value, expiry)
         .map_err(|_| CommandError::InvalidExpiry(Bytes::from_static(b"set")))?;
     Ok(Value::SimpleString(Bytes::from_static(b"OK")))
+}
+
+pub(super) fn incr(key: &Bytes, db: &mut Db) -> Result<Value, CommandError> {
+    Ok(Value::Integer(db.incr(key.clone())?))
 }
 
 #[cfg(test)]

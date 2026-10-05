@@ -17,9 +17,8 @@ pub(super) fn try_parse(
         b"EXISTS" => exists_command(rest, name),
         b"MULTI" => no_args(rest, name, Command::Multi),
         // A rejected EXEC is EXECABORT in Redis, not the plain arity error.
-        b"EXEC" => {
-            no_args(rest, name, Command::Exec).map_err(|e| CommandError::ExecRejected(Box::new(e)))
-        }
+        b"EXEC" => no_args(rest, name, Command::Exec)
+            .map_err(|e| CommandError::ExecAbortRejected(Box::new(e))),
         b"DISCARD" => no_args(rest, name, Command::Discard),
         _ => return None,
     })
