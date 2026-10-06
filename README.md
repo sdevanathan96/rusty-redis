@@ -74,8 +74,8 @@ and diffs the replies byte for byte. Real Redis is the oracle, so no expected
 reply is written down anywhere. Start this server first, with `./run.sh` or,
 if 6379 is taken, `./target/release/rusty-redis --port 6400` plus
 `MINE=6400`. If nothing answers on port 6380 (`REAL`), the script starts a
-throwaway `redis-server` there and stops it afterwards. A full run takes about
-three minutes.
+throwaway `redis-server` there and stops it afterwards. A full run takes about a
+minute and a half.
 
 It needs `redis-cli`, `redis-server`, `nc`, `xxd`, `python3`, and a `timeout`
 binary (`brew install coreutils` on macOS). Because error replies are compared

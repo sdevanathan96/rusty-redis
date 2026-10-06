@@ -65,160 +65,20 @@ else
     alive "$REAL" || { echo "${RED}reference server failed to start${OFF}"; exit 1; }
 fi
 
-BLOCK_PY=$(mktemp)
+TMP=$(mktemp -d)
+CONN_PY="$TMP/conn.py"
 
 cleanup() {
-    rm -f "$BLOCK_PY"
-    rm -f "$BLOCK2_PY"
-    rm -f "$CONN_PY"
+    rm -rf "$TMP"
     [ "$OUR_REDIS" = 1 ] && redis-cli -p "$REAL" SHUTDOWN NOSAVE >/dev/null 2>&1
     return 0
 }
 trap cleanup EXIT
 
-# Driver for two-connection scenarios. Lives in a temp file rather than a
-# heredoc inside a function, because nesting quotes that deep is how the
-# previous version silently lost half its code.
-cat > "$BLOCK_PY" <<'PYEOF'
-import socket, sys, threading, time
-
-port      = int(sys.argv[1])
-tag       = sys.argv[2]
-delay     = float(sys.argv[3])
-setup     = sys.argv[4]          # new, "" for none
-blocking  = sys.argv[5]
-meanwhile = sys.argv[6]
-
-def sub(s):
-    return s.replace("{K3}", tag + "c").replace("{K2}", tag + "b").replace("{K}", tag + "a")
-
-def frame(spec):
-    """One RESP array from a pipe-separated argument list. Lengths are computed
-    from the substituted bytes, so a placeholder can never disagree with its
-    length prefix."""
-    parts = [sub(p).encode() for p in spec.split("|")]
-    out = b"*%d\r\n" % len(parts)
-    for p in parts:
-        out += b"$%d\r\n%s\r\n" % (len(p), p)
-    return out
-
-def frames(spec):
-    return b"".join(frame(c) for c in spec.split(";"))
-
-def drain(s, first, quiet):
-    """Everything s receives: waits up to `first` seconds for anything at all,
-    then stops after `quiet` seconds of silence or when the server closes. Only
-    `first` decides whether a missing or late reply is caught; `quiet` just
-    ends the wait once the answer is in."""
-    buf = b""
-    s.settimeout(max(first, 0.05))
-    try:
-        while True:
-            c = s.recv(4096)
-            if not c:
-                break
-            buf += c
-            s.settimeout(quiet)
-    except socket.timeout:
-        pass
-    return buf
-
-if setup:
-    s = socket.create_connection(("127.0.0.1", port))
-    s.sendall(frames(setup))
-    drain(s, 1.0, 0.2)
-    s.close()
-
-blocked = socket.create_connection(("127.0.0.1", port))
-blocked.sendall(frame(blocking))
-deadline = time.time() + delay + 3.0
-
-def other():
-    time.sleep(delay)
-    s = socket.create_connection(("127.0.0.1", port))
-    s.sendall(frames(meanwhile))
-    drain(s, 1.0, 0.2)
-    s.close()
-
-t = threading.Thread(target=other)
-t.start()
-
-# Read only once the other connection is done, so anything its commands cause
-# on this one, such as an element wrongly handed over after a timeout, is
-# already buffered. The reply itself still gets until the old deadline.
-t.join()
-buf = drain(blocked, deadline - time.time(), 0.3)
-sys.stdout.write(repr(buf))
-PYEOF
-
-
-BLOCK2_PY=$(mktemp)
-# add to the cleanup trap: rm -f "$BLOCK2_PY"
-cat > "$BLOCK2_PY" <<'PYEOF'
-import socket, sys, time
-
-port    = int(sys.argv[1])
-tag     = sys.argv[2]
-delay   = float(sys.argv[3])
-b1, b2  = sys.argv[4], sys.argv[5]
-trigger = sys.argv[6]
-
-def sub(s):
-    return s.replace("{K3}", tag + "c").replace("{K2}", tag + "b").replace("{K}", tag + "a")
-
-def frame(spec):
-    parts = [sub(p).encode() for p in spec.split("|")]
-    out = b"*%d\r\n" % len(parts)
-    for p in parts:
-        out += b"$%d\r\n%s\r\n" % (len(p), p)
-    return out
-
-def frames(spec):
-    return b"".join(frame(c) for c in spec.split(";"))
-
-def drain(s, first, quiet):
-    """Same as in BLOCK_PY: `first` catches a missing or late reply, `quiet`
-    only ends the wait once the answer is in."""
-    buf = b""
-    s.settimeout(max(first, 0.05))
-    try:
-        while True:
-            c = s.recv(4096)
-            if not c:
-                break
-            buf += c
-            s.settimeout(quiet)
-    except socket.timeout:
-        pass
-    return buf
-
-def park(spec):
-    s = socket.create_connection(("127.0.0.1", port))
-    s.sendall(frame(spec))
-    return s, time.time() + delay + 3.0
-
-s1, d1 = park(b1)
-time.sleep(0.3)                 # b1 must park before b2 arrives, for FIFO order
-s2, d2 = park(b2)
-time.sleep(0.3)
-
-time.sleep(delay)
-s = socket.create_connection(("127.0.0.1", port))
-s.sendall(frames(trigger))
-drain(s, 1.0, 0.2)
-s.close()
-
-# Replies wait in each socket's buffer, so reading them after the trigger loses
-# nothing, and each still gets until its own deadline.
-first = drain(s1, d1 - time.time(), 0.3)
-second = drain(s2, d2 - time.time(), 0.3)
-sys.stdout.write("first=%r second=%r" % (first, second))
-PYEOF
-
 # Driver for scripted multi-connection scenarios. Each argument after the tag
-# is one step: "<conn> send <cmds>", "<conn> read", "<conn> close", or
-# "sleep <secs>". A connection opens on its first send.
-CONN_PY=$(mktemp)
+# is one step: "<conn> send <cmds>", "<conn> read [secs]", "<conn> close", or
+# "sleep <secs>". A connection opens on its first send. It lives in a file
+# because quotes nested inside a function once silently lost half its code.
 cat > "$CONN_PY" <<'PYEOF'
 import socket, sys, time
 
@@ -239,7 +99,7 @@ def frame(spec):
 def frames(spec):
     return b"".join(frame(c) for c in spec.split(";"))
 
-conns = {}
+conns, sent = {}, {}
 for step in steps:
     words = step.split(" ", 2)
     if words[0] == "sleep":
@@ -250,11 +110,14 @@ for step in steps:
         if name not in conns:
             conns[name] = socket.create_connection(("127.0.0.1", port))
         conns[name].sendall(frames(words[2]))
+        sent[name] = time.monotonic()
     elif action == "read":
-        # Waits 0.5s for anything, so b'' means nothing arrived in that time,
-        # then stops after 0.2s of quiet once something has.
+        # Waits 0.5s for anything, or with secs until secs after this
+        # connection's last send, so b'' means nothing arrived in that time.
+        # Then stops after 0.2s of quiet once something has.
         s = conns[name]
-        s.settimeout(0.5)
+        wait = sent[name] + float(words[2]) - time.monotonic() if len(words) > 2 else 0.5
+        s.settimeout(max(wait, 0.05))
         buf = b""
         try:
             while True:
@@ -320,28 +183,40 @@ run_seq() {
     printf '%s' "$out"
 }
 
+# Runs "$1 <port> ${@:2}" against both servers at once, into OUT_MINE and
+# OUT_REAL. Like $(...), reading them back strips trailing newlines.
+on_both() {
+    "$1" "$MINE" "${@:2}" > "$TMP/mine" &
+    local pid=$!
+    "$1" "$REAL" "${@:2}" > "$TMP/real"
+    wait "$pid"
+    OUT_MINE=$(<"$TMP/mine")
+    OUT_REAL=$(<"$TMP/real")
+}
+
 scenario() {
     local name="$1"; shift
     skip_filtered "$name" && return
-    local tag="r${RUN}s${N}k"
-    report "$name" "" \
-        "$(run_seq "$MINE" "$tag" "$@")" \
-        "$(run_seq "$REAL" "$tag" "$@")" \
-        "yours (:$MINE)" "redis (:$REAL)"
+    on_both run_seq "r${RUN}s${N}k" "$@"
+    report "$name" "" "$OUT_MINE" "$OUT_REAL" "yours (:$MINE)" "redis (:$REAL)"
 }
 
 # Sends raw bytes to both servers and diffs the reply bytes, for framing
 # behaviour that redis-cli hides. $2 is a python bytes literal.
+raw_run() {
+    python3 -c "import sys;sys.stdout.buffer.write($2)" | nc -w 1 127.0.0.1 "$1" | xxd
+}
+
 raw_scenario() {
     local name="$1" payload="$2"
     skip_filtered "$name" && return
-    local a b
-    a=$(python3 -c "import sys;sys.stdout.buffer.write($payload)" | nc -w 1 127.0.0.1 "$MINE" | xxd)
-    b=$(python3 -c "import sys;sys.stdout.buffer.write($payload)" | nc -w 1 127.0.0.1 "$REAL" | xxd)
-    report "$name" " ${DIM}(raw)${OFF}" "$a" "$b" "yours" "redis"
+    on_both raw_run "$payload"
+    report "$name" " ${DIM}(raw)${OFF}" "$OUT_MINE" "$OUT_REAL" "yours" "redis"
 }
 
 # Two writes with a pause between them, so one command spans two reads.
+split_run() { python3 -c "$2" "$1" 2>&1; }
+
 split_scenario() {
     local name="$1" first="$2" second="$3"
     skip_filtered "$name" && return
@@ -363,47 +238,18 @@ except socket.timeout:
     pass
 sys.stdout.write(repr(buf))
 '
-    report "$name" " ${DIM}(split)${OFF}" \
-        "$(python3 -c "$script" "$MINE" 2>&1)" \
-        "$(python3 -c "$script" "$REAL" 2>&1)" \
-        "yours" "redis"
+    on_both split_run "$script"
+    report "$name" " ${DIM}(split)${OFF}" "$OUT_MINE" "$OUT_REAL" "yours" "redis"
 }
 
-# One connection issues a blocking command; a second acts after $2 seconds.
-# Commands are pipe-separated argument lists, semicolon-separated for several.
-#   $1 name  $2 delay  $3 setup (or "")  $4 blocking cmd  $5 what the other conn does
-block_scenario() {
-    local name="$1" delay="$2" setup="$3" blocking="$4" meanwhile="$5"
-    skip_filtered "$name" && return
-    local tag="r${RUN}s${N}k"
-    report "$name" " ${DIM}(block)${OFF}" \
-        "$(python3 "$BLOCK_PY" "$MINE" "$tag" "$delay" "$setup" "$blocking" "$meanwhile" 2>&1)" \
-        "$(python3 "$BLOCK_PY" "$REAL" "$tag" "$delay" "$setup" "$blocking" "$meanwhile" 2>&1)" \
-        "yours" "redis"
-}
+# Named connections driven step by step, as described above CONN_PY.
+conn_run() { python3 "$CONN_PY" "$@" 2>&1; }
 
-# Two connections block, then a third acts. Diffs both blocked clients' replies.
-#   $1 name  $2 delay  $3 first blocking cmd  $4 second blocking cmd  $5 trigger
-block2_scenario() {
-    local name="$1" delay="$2" b1="$3" b2="$4" trigger="$5"
-    skip_filtered "$name" && return
-    local tag="r${RUN}s${N}k"
-    report "$name" " ${DIM}(block2)${OFF}" \
-        "$(python3 "$BLOCK2_PY" "$MINE" "$tag" "$delay" "$b1" "$b2" "$trigger" 2>&1)" \
-        "$(python3 "$BLOCK2_PY" "$REAL" "$tag" "$delay" "$b1" "$b2" "$trigger" 2>&1)" \
-        "yours" "redis"
-}
-
-# Named connections driven step by step, for a connection that acts or
-# disconnects while another is parked. Steps are described above CONN_PY.
 conn_scenario() {
     local name="$1"; shift
     skip_filtered "$name" && return
-    local tag="r${RUN}s${N}k"
-    report "$name" " ${DIM}(conns)${OFF}" \
-        "$(python3 "$CONN_PY" "$MINE" "$tag" "$@" 2>&1)" \
-        "$(python3 "$CONN_PY" "$REAL" "$tag" "$@" 2>&1)" \
-        "yours" "redis"
+    on_both conn_run "r${RUN}s${N}k" "$@"
+    report "$name" " ${DIM}(conns)${OFF}" "$OUT_MINE" "$OUT_REAL" "yours" "redis"
 }
 
 section() { printf '\n%s== %s%s\n' "$DIM" "$1" "$OFF"; }
@@ -734,101 +580,93 @@ if [ "${STRICT:-0}" = 1 ]; then
 fi
 
 section "blocking"
+# Client a parks and b acts after a pause. "a read N" gives a's reply until N
+# seconds after a sent, which is 3s after the pause.
 # A push arrives while a client is parked. The reply must be [key, element].
-block_scenario "blpop woken by a later push" 0.5 "" \
-    "BLPOP|{K}|0" \
-    "RPUSH|{K}|a"
+conn_scenario "blpop woken by a later push" \
+    "a send BLPOP|{K}|0" "sleep 0.5" "b send RPUSH|{K}|a" "b read" "a read 3.5"
 
-block_scenario "brpop takes from the tail" 0.5 "" \
-    "BRPOP|{K}|0" \
-    "RPUSH|{K}|a|b"
+conn_scenario "brpop takes from the tail" \
+    "a send BRPOP|{K}|0" "sleep 0.5" "b send RPUSH|{K}|a|b" "b read" "a read 3.5"
 
 # Nothing arrives. The reply must be the null ARRAY, *-1, not $-1.
-block_scenario "blpop times out with a null array" 2.5 "" \
-    "BLPOP|{K}|1" \
-    "PING"
+conn_scenario "blpop times out with a null array" \
+    "a send BLPOP|{K}|1" "sleep 2.5" "b send PING" "b read" "a read 5.5"
 
 # The list already has data, so this must not block at all.
-block_scenario "blpop returns immediately when data exists" 1.5 "" \
-    "BLPOP|{K}|0" \
-    "PING"
+conn_scenario "blpop returns immediately when data exists" \
+    "a send RPUSH|{K}|a;BLPOP|{K}|0" "a read"
 
 # Multiple keys: the first non-empty one wins, and the reply names it.
-block_scenario "blpop scans past an empty key" 0.5 "" \
-    "BLPOP|{K}|{K2}|0" \
-    "RPUSH|{K2}|x"
+conn_scenario "blpop scans past an empty key" \
+    "a send BLPOP|{K}|{K2}|0" "sleep 0.5" "b send RPUSH|{K2}|x" "b read" "a read 3.5"
 
 # The element must survive a push that lands after the client gave up: the
 # LRANGE must still show it, and the timed-out client must get nothing more.
-# This is the race Unpark settles. A conn_scenario, because block_scenario
-# discards the replies of the commands it runs meanwhile.
+# This is the race Unpark settles.
 conn_scenario "element survives a push after the timeout" \
     "a send BLPOP|{K}|1" "sleep 1.3" "a read" \
     "b send RPUSH|{K}|a;LRANGE|{K}|0|-1" "b read" "a read"
 
 # A waiter blocked on a key that becomes a string gets WRONGTYPE, not silence.
-block_scenario "wrongtype while parked" 0.5 "" \
-    "BLPOP|{K}|2" \
-    "SET|{K}|str"
+conn_scenario "wrongtype while parked" \
+    "a send BLPOP|{K}|2" "sleep 0.5" "b send SET|{K}|str" "b read" "a read 3.5"
 
-block_scenario "blmove woken by a push to the source" 0.5 "" \
-    "BLMOVE|{K}|{K2}|LEFT|RIGHT|0" \
-    "RPUSH|{K}|x;LRANGE|{K2}|0|-1"
+conn_scenario "blmove woken by a push to the source" \
+    "a send BLMOVE|{K}|{K2}|LEFT|RIGHT|0" "sleep 0.5" \
+    "b send RPUSH|{K}|x;LRANGE|{K2}|0|-1" "b read" "a read 3.5"
 
 # Timeout reply must be a null BULK STRING, not a null array.
-block_scenario "blmove times out with a null bulk string" 2.5 "" \
-    "BLMOVE|{K}|{K2}|LEFT|RIGHT|1" \
-    "PING"
+conn_scenario "blmove times out with a null bulk string" \
+    "a send BLMOVE|{K}|{K2}|LEFT|RIGHT|1" "sleep 2.5" "b send PING" "b read" "a read 5.5"
 
 # Destination is a string. Does Redis block or error immediately?
-block_scenario "blmove with a wrongtype destination" 2.5 "" \
-    "BLMOVE|{K}|{K2}|LEFT|RIGHT|1" \
-    "SET|{K2}|str"
+conn_scenario "blmove with a wrongtype destination" \
+    "a send BLMOVE|{K}|{K2}|LEFT|RIGHT|1" "sleep 2.5" \
+    "b send SET|{K2}|str" "b read" "a read 5.5"
 
+# Two clients park, a before b so FIFO order is fixed, then c acts.
+# Each reply gets until 4s after its own client sent.
 # The cascade: one push satisfies a BLMOVE, whose push then satisfies a BLPOP.
-block2_scenario "blmove cascade wakes a waiter on the destination" 1 \
-    "BLMOVE|{K}|{K2}|LEFT|RIGHT|0" \
-    "BLPOP|{K2}|0" \
-    "RPUSH|{K}|x"
+conn_scenario "blmove cascade wakes a waiter on the destination" \
+    "a send BLMOVE|{K}|{K2}|LEFT|RIGHT|0" "sleep 0.3" "b send BLPOP|{K2}|0" "sleep 1.3" \
+    "c send RPUSH|{K}|x" "c read" "a read 4" "b read 4"
 
 # FIFO across two waiters on one key, one element each.
-block2_scenario "two waiters served in block order" 1 \
-    "BLPOP|{K}|0" \
-    "BLPOP|{K}|0" \
-    "RPUSH|{K}|a|b"
+conn_scenario "two waiters served in block order" \
+    "a send BLPOP|{K}|0" "sleep 0.3" "b send BLPOP|{K}|0" "sleep 1.3" \
+    "c send RPUSH|{K}|a|b" "c read" "a read 4" "b read 4"
 
 # One element, two waiters. The second must stay parked and time out.
-block2_scenario "one element serves only the first waiter" 1 \
-    "BLPOP|{K}|0" \
-    "BLPOP|{K}|2" \
-    "RPUSH|{K}|only"
+conn_scenario "one element serves only the first waiter" \
+    "a send BLPOP|{K}|0" "sleep 0.3" "b send BLPOP|{K}|2" "sleep 1.3" \
+    "c send RPUSH|{K}|only" "c read" "a read 4" "b read 4"
 
-block2_scenario "xread serves waiters with different ids" 1 \
-    "XREAD|BLOCK|0|STREAMS|{K}|9-9" \
-    "XREAD|BLOCK|0|STREAMS|{K}|0-0" \
-    "XADD|{K}|5-0|f|v"
+conn_scenario "xread serves waiters with different ids" \
+    "a send XREAD|BLOCK|0|STREAMS|{K}|9-9" "sleep 0.3" \
+    "b send XREAD|BLOCK|0|STREAMS|{K}|0-0" "sleep 1.3" \
+    "c send XADD|{K}|5-0|f|v" "c read" "a read 4" "b read 4"
 
-block_scenario "xread blocks then wakes on xadd" 0.5 "" \
-    "XREAD|BLOCK|0|STREAMS|{K}|0" \
-    "XADD|{K}|5-0|f|v"
+conn_scenario "xread blocks then wakes on xadd" \
+    "a send XREAD|BLOCK|0|STREAMS|{K}|0" "sleep 0.5" \
+    "b send XADD|{K}|5-0|f|v" "b read" "a read 3.5"
 
-block_scenario "xread times out with a null array" 2.5 "" \
-    "XREAD|BLOCK|1000|STREAMS|{K}|0" \
-    "PING"
+conn_scenario "xread times out with a null array" \
+    "a send XREAD|BLOCK|1000|STREAMS|{K}|0" "sleep 2.5" "b send PING" "b read" "a read 5.5"
 
-block_scenario "xread blocks on one of several streams" 0.5 "" \
-    "XREAD|BLOCK|0|STREAMS|{K}|{K2}|0|0" \
-    "XADD|{K2}|5-0|f|v"
+conn_scenario "xread blocks on one of several streams" \
+    "a send XREAD|BLOCK|0|STREAMS|{K}|{K2}|0|0" "sleep 0.5" \
+    "b send XADD|{K2}|5-0|f|v" "b read" "a read 3.5"
 
-block_scenario "xread dollar skips pre-existing entries" 0.5 \
-    "XADD|{K}|1-0|old|1" \
-    "XREAD|BLOCK|0|STREAMS|{K}|\$" \
-    "XADD|{K}|5-0|new|2"
+conn_scenario "xread dollar skips pre-existing entries" \
+    "b send XADD|{K}|1-0|old|1" "b read" \
+    "a send XREAD|BLOCK|0|STREAMS|{K}|\$" "sleep 0.5" \
+    "b send XADD|{K}|5-0|new|2" "b read" "a read 3.5"
 
-block2_scenario "xread fans out to all waiters" 1 \
-    "XREAD|BLOCK|0|STREAMS|{K}|0-0" \
-    "XREAD|BLOCK|0|STREAMS|{K}|0-0" \
-    "XADD|{K}|5-0|f|v"
+conn_scenario "xread fans out to all waiters" \
+    "a send XREAD|BLOCK|0|STREAMS|{K}|0-0" "sleep 0.3" \
+    "b send XREAD|BLOCK|0|STREAMS|{K}|0-0" "sleep 1.3" \
+    "c send XADD|{K}|5-0|f|v" "c read" "a read 4" "b read 4"
 
 section "protocol framing"
 raw_scenario "pipelined commands in one packet" \
