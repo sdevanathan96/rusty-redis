@@ -12,3 +12,4 @@ target/
 # Working plan and oracle probe, kept local
 /PLAN.md
 /probe.sh
+/dump.rdb
