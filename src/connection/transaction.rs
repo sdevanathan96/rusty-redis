@@ -1,5 +1,4 @@
-//! An open MULTI: the commands held for EXEC, and the rule for which errors
-//! fail the transaction as they are queued.
+//! An open MULTI and what it queues.
 
 use bytes::Bytes;
 
@@ -7,23 +6,18 @@ use super::pending::Parsed;
 use crate::command::{Command, CommandError};
 use crate::resp::Value;
 
-/// An open MULTI. `None` on the connection means no transaction is open.
 #[derive(Default)]
 pub(super) struct Transaction {
-    /// Parse errors other than a wrong argument count are held as `Err` and
-    /// answered by EXEC in their slot, as Redis does.
+    /// Most parse errors are queued too, and EXEC replies them in their slot.
     pub(super) commands: Vec<Result<Command, CommandError>>,
-    /// A queue-time error happened; EXEC answers EXECABORT.
+    /// EXEC will reply EXECABORT.
     pub(super) failed: bool,
-    /// Wire bytes of everything in `commands`, counted toward MAX_QUERY_BUF.
-    /// No parked wait needs it: nothing parks while a transaction is open.
+    /// Wire bytes of `commands`, for MAX_QUERY_BUF.
     pub(super) bytes: usize,
 }
 
-/// Queues one item inside MULTI and returns the immediate reply. Only an
-/// unknown command and a wrong argument count fail at queue time, which marks
-/// the transaction; every other error waits for EXEC. `size` is the item's
-/// length on the wire, counted only if the item is actually queued.
+/// Queues one item and returns its reply. Only an unknown command or a wrong
+/// argument count fails the transaction now; other errors wait for EXEC.
 pub(super) fn queue_in(transaction: &mut Transaction, item: Parsed, size: usize) -> Value {
     let queued_reply = Value::SimpleString(Bytes::from_static(b"QUEUED"));
     match item {
@@ -45,8 +39,7 @@ pub(super) fn queue_in(transaction: &mut Transaction, item: Parsed, size: usize)
             transaction.bytes += size;
             queued_reply
         }
-        // Never reached: the drain loop handles protocol errors before
-        // queue_in, since broken framing closes the connection either way.
+        // Never reached: protocol errors close the connection first.
         Parsed::ProtocolError(e) => e,
     }
 }

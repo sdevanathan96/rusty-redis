@@ -1,17 +1,10 @@
-// src/resp.rs
-use bytes::Bytes;
-use std::convert::From;
+//! RESP2: a two pass parser and the encoder.
 
-/// One RESP value, parameterized by how its payloads are stored.
-///
-/// The two instantiations below are the same grammar at two stages: a `Frame`
-/// points into the read buffer with offsets, a `Value` owns refcounted slices
-/// of it. Keeping them as separate enums meant every new variant had to be
-/// added twice and bridged by hand, and RESP3 adds a map while pub/sub adds
-/// push messages.
-///
-/// They stay distinct types, so a `Frame` can still never be handed to
-/// `encode`. Only the duplication is gone.
+use bytes::Bytes;
+
+/// One RESP value, generic over how payloads are stored: a `Frame` holds
+/// offsets into the read buffer, a `Value` owns slices of it. One enum keeps
+/// the two in step, while the two types keep a `Frame` out of `encode`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Node<S> {
     SimpleString(S),
@@ -23,17 +16,12 @@ pub enum Node<S> {
     NullArray,
 }
 
-/// Pass one output: offsets into the buffer that was parsed.
 pub type Frame = Node<Span>;
-
-/// Pass two output: owned slices, cheap to clone, safe to outlive the read.
 pub type Value = Node<Bytes>;
 
 impl<S> Node<S> {
-    /// Rebuild the tree with every payload converted.
-    ///
-    /// `f` is taken by reference so the recursive call can reuse it rather
-    /// than requiring `Copy` or cloning a closure per array element.
+    /// Rebuilds the tree with every payload converted. `f` is borrowed so each
+    /// recursive call can reuse it.
     pub fn map<T>(self, f: &impl Fn(S) -> T) -> Node<T> {
         match self {
             Node::SimpleString(s) => Node::SimpleString(f(s)),
@@ -48,12 +36,16 @@ impl<S> Node<S> {
 }
 
 impl Node<Span> {
-    /// Materialize every span against the buffer the frame was parsed from.
-    ///
-    /// The spans are absolute to that buffer and `split_to` cuts from index
-    /// zero, which is the invariant the whole two pass design rests on.
+    /// Resolves every span against the buffer the frame was parsed from. The
+    /// spans count from the start of that buffer.
     pub fn into_value(self, buf: &Bytes) -> Value {
         self.map(&|s| s.as_bytes(buf))
+    }
+}
+
+impl Value {
+    pub fn ok() -> Value {
+        Value::SimpleString(Bytes::from_static(b"OK"))
     }
 }
 
@@ -64,23 +56,15 @@ pub struct Span {
 }
 
 impl Span {
-    /// Get a lifetime appropriate slice of the underlying buffer.
-    ///
-    /// Constant time.
-    #[inline]
     fn as_slice<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
         &buf[self.start..self.end]
     }
 
-    /// Get a Bytes object representing the appropriate slice
-    /// of bytes.
-    ///
-    /// Constant time.
-    #[inline]
     fn as_bytes(&self, buf: &Bytes) -> Bytes {
         buf.slice(self.start..self.end)
     }
 }
+
 pub type RedisResult = Result<Option<(usize, Frame)>, RespError>;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -96,20 +80,17 @@ pub enum RespError {
 impl RespError {
     pub fn to_resp(&self) -> Bytes {
         match self {
-            RespError::UnknownType(b) => Bytes::from(
-                format!("ERR Protocol error: unexpected type byte 0x{b:02x}").into_bytes(),
-            ),
+            RespError::UnknownType(b) => Bytes::from(format!(
+                "ERR Protocol error: unexpected type byte 0x{b:02x}"
+            )),
             RespError::BadInteger => Bytes::from_static(b"ERR Protocol error: invalid integer"),
             RespError::BadLength(n) => {
-                Bytes::from(format!("ERR Protocol error: invalid length {n}").into_bytes())
+                Bytes::from(format!("ERR Protocol error: invalid length {n}"))
             }
             RespError::BadTerminator => Bytes::from_static(b"ERR Protocol error: expected CRLF"),
             RespError::TooDeep => Bytes::from_static(b"ERR Protocol error: nested arrays too deep"),
-            // Redis's wording for the same condition is either "too big mbulk
-            // count string" or "too big inline request" depending on where it
-            // hit. Both close the connection, and so does this. VERIFY on 6380
-            // if you want the exact strings; a raw_scenario can send 70KB with
-            // no CRLF.
+            // Redis says this or "too big mbulk count string", depending on
+            // where the line was; both close the connection.
             RespError::TooLongLine => {
                 Bytes::from_static(b"ERR Protocol error: too big inline request")
             }
@@ -117,15 +98,10 @@ impl RespError {
     }
 }
 
-#[derive(Default)]
-pub struct RespParser;
-
 const MAX_DEPTH: usize = 32;
 
-/// Returns:
-///   Ok(Some((n, value))) - parsed a value occupying the first n bytes
-///   Ok(None)             - incomplete, caller should read more bytes
-///   Err(e)               - malformed, caller should close the connection
+/// `Ok(Some((n, frame)))` for a frame in the first `n` bytes, `Ok(None)` if
+/// incomplete, `Err` if malformed, which closes the connection.
 pub fn parse(input: &[u8]) -> RedisResult {
     parse_for(input, 0, 0)
 }
@@ -143,38 +119,21 @@ fn parse_for(input: &[u8], pos: usize, depth: usize) -> RedisResult {
         b':' => integer(input, pos + 1),
         b'$' => bulk_string(input, pos + 1),
         b'*' => array(input, pos + 1, depth),
-        // everything below is stage 6
-        // b'_' => null(input, pos + 1),
-        // b'#' => boolean(input, pos + 1),
-        // b',' => double(input, pos + 1),
-        // b'%' => map(input, pos + 1),
-        // b'~' => set(input, pos + 1),
-        // b'>' => push(input, pos + 1),
         other => Err(RespError::UnknownType(other)),
     }
 }
 
-/// Find the next CRLF terminated line starting at `pos`.
-/// Returns the line contents and the index just past the CRLF.
-/// The longest a single protocol line may be, matching Redis's
-/// PROTO_INLINE_MAX_SIZE. Bulk payloads never come through here, only headers,
-/// so this is generous for anything legitimate.
-///
-/// Without it a client can open a connection, send `+` and then gigabytes with
-/// no CRLF, and every parse attempt returns Ok(None) while inbuf grows without
-/// limit. The bulk length cap does not help: the header line that carries the
-/// length is itself unbounded.
+/// Redis's PROTO_INLINE_MAX_SIZE. Only headers are lines, never payloads, and
+/// without a cap a line with no CRLF would grow `inbuf` forever.
 const MAX_LINE_LEN: usize = 64 * 1024;
 
+/// The CRLF terminated line at `pos`, and the index just past the CRLF.
 fn line(input: &[u8], pos: usize) -> Result<Option<(Span, usize)>, RespError> {
-    let rest = match input.get(pos..) {
-        Some(r) => r,
-        None => return Ok(None), // cursor past the end, need more bytes
+    let Some(rest) = input.get(pos..) else {
+        return Ok(None);
     };
     let cr = match rest.iter().position(|&b| b == b'\r') {
         Some(i) => i,
-        // No CR yet. If more than a legal line's worth of bytes have already
-        // arrived without one, no amount of waiting will produce a valid frame.
         None if rest.len() > MAX_LINE_LEN => return Err(RespError::TooLongLine),
         None => return Ok(None),
     };
@@ -197,29 +156,22 @@ fn line(input: &[u8], pos: usize) -> Result<Option<(Span, usize)>, RespError> {
 }
 
 fn bulk_string(input: &[u8], pos: usize) -> RedisResult {
-    let (len_bytes, data_start) = match line(input, pos)? {
-        Some(v) => v,
-        None => return Ok(None),
+    const MAX_BULK_LEN: i64 = 512 * 1024 * 1024; // Redis's proto-max-bulk-len
+
+    let Some((len_bytes, data_start)) = line(input, pos)? else {
+        return Ok(None);
     };
-
     let len: i64 = parse_int(input, len_bytes)?;
-
     if len == -1 {
         return Ok(Some((data_start, Frame::NullBulkString)));
     }
-    if len < 0 {
+    if !(0..=MAX_BULK_LEN).contains(&len) {
         return Err(RespError::BadLength(len));
     }
-
-    // payload: taken blind, never scanned
-    const MAX_BULK_LEN: i64 = 512 * 1024 * 1024; // proto-max-bulk-len
-
-    if len > MAX_BULK_LEN {
-        return Err(RespError::BadLength(len));
-    }
+    // The payload is taken by length, never scanned.
     let end = data_start + len as usize;
     if input.len() < end + 2 {
-        return Ok(None); // payload or trailing CRLF still in flight
+        return Ok(None);
     }
     if &input[end..end + 2] != b"\r\n" {
         return Err(RespError::BadTerminator);
@@ -240,56 +192,44 @@ fn parse_int(input: &[u8], span: Span) -> Result<i64, RespError> {
 }
 
 fn simple_string(input: &[u8], pos: usize) -> RedisResult {
-    let (span, next) = match line(input, pos)? {
-        Some(v) => v,
-        None => return Ok(None),
+    let Some((span, next)) = line(input, pos)? else {
+        return Ok(None);
     };
     Ok(Some((next, Frame::SimpleString(span))))
 }
 
 fn error(input: &[u8], pos: usize) -> RedisResult {
-    let (line_bytes, next_pos) = match line(input, pos)? {
-        Some(v) => v,
-        None => return Ok(None),
+    let Some((span, next)) = line(input, pos)? else {
+        return Ok(None);
     };
-    Ok(Some((next_pos, Frame::Error(line_bytes))))
+    Ok(Some((next, Frame::Error(span))))
 }
 
 fn integer(input: &[u8], pos: usize) -> RedisResult {
-    let (line_bytes, next_pos) = match line(input, pos)? {
-        Some(v) => v,
-        None => return Ok(None),
+    let Some((span, next)) = line(input, pos)? else {
+        return Ok(None);
     };
-    let integer_val: i64 = parse_int(input, line_bytes)?;
-    Ok(Some((next_pos, Frame::Integer(integer_val))))
+    Ok(Some((next, Frame::Integer(parse_int(input, span)?))))
 }
 
 fn array(input: &[u8], pos: usize, depth: usize) -> RedisResult {
-    let (len_bytes, data_start) = match line(input, pos)? {
-        Some(v) => v,
-        None => return Ok(None),
+    const MAX_ARRAY_LEN: i64 = 1024 * 1024;
+    // `*1000000\r\n` alone must not allocate a million frames, on every retry
+    // of an incomplete parse.
+    const PREALLOC_CAP: usize = 1024;
+
+    let Some((len_bytes, data_start)) = line(input, pos)? else {
+        return Ok(None);
     };
-
     let len: i64 = parse_int(input, len_bytes)?;
-
     if len == -1 {
         return Ok(Some((data_start, Frame::NullArray)));
     }
-    if len < 0 {
+    if !(0..=MAX_ARRAY_LEN).contains(&len) {
         return Err(RespError::BadLength(len));
     }
 
     let mut curr_pos = data_start;
-    const MAX_ARRAY_LEN: i64 = 1024 * 1024;
-
-    if len > MAX_ARRAY_LEN {
-        return Err(RespError::BadLength(len));
-    }
-    // Reserve for the declared length only up to a point. `*1000000\r\n` is
-    // eleven bytes and would otherwise preallocate a million Frames, roughly
-    // 32MB, on every parse attempt, and the parse is retried from byte zero on
-    // every socket read until the array completes.
-    const PREALLOC_CAP: usize = 1024;
     let mut values = Vec::with_capacity((len as usize).min(PREALLOC_CAP));
     for _ in 0..len {
         match parse_for(input, curr_pos, depth + 1)? {
@@ -316,7 +256,7 @@ pub fn encode<B: bytes::BufMut>(value: &Value, out: &mut B) {
             out.put_slice(items.len().to_string().as_bytes());
             out.put_slice(b"\r\n");
             for item in items {
-                encode(item, out); // recursion passes the same B through
+                encode(item, out);
             }
         }
         Value::BulkString(bytes) => {
@@ -345,6 +285,8 @@ pub fn encode<B: bytes::BufMut>(value: &Value, out: &mut B) {
     }
 }
 
+/// A simple string or error must stay one line, so CR and LF become spaces,
+/// as in Redis.
 fn put_line_payload<B: bytes::BufMut>(out: &mut B, bytes: &[u8]) {
     let mut start = 0;
     for (i, &b) in bytes.iter().enumerate() {
@@ -461,16 +403,14 @@ mod resp_parser_tests {
 
     #[test]
     fn test_multiple() {
-        // catches bug 2
         assert_eq!(
             parse(b"$5\r\nhello\r\n"),
             Ok(Some((11, Frame::BulkString(Span { start: 4, end: 9 }))))
         );
 
-        // catches bug 1 and 3, and is the partial array case you asked about
-        assert_eq!(parse(b"*1\r\n"), Ok(None));
+        assert_eq!(parse(b"*1\r\n"), Ok(None), "partial array");
 
-        // the CRLF inside a payload case
+        // CRLF inside a payload is data.
         assert_eq!(
             parse(b"$5\r\na\r\nbc\r\n"),
             Ok(Some((11, Frame::BulkString(Span { start: 4, end: 9 }))))
@@ -595,11 +535,10 @@ mod resp_parser_tests {
             Value::BulkString(Bytes::from_static(b"a\r\nb")), // binary safe, must survive
             Value::BulkString(Bytes::copy_from_slice(&[0, 255, 13, 10])), // arbitrary bytes
             Value::NullBulkString,
-            Value::NullArray, // was missing
+            Value::NullArray,
             Value::Array(vec![]),
             Value::Array(vec![Value::Integer(1), Value::NullBulkString]),
             Value::Array(vec![
-                // nesting was missing
                 Value::Array(vec![Value::SimpleString(Bytes::from_static(b"a"))]),
                 Value::Error(Bytes::from_static(b"ERR nested")),
                 Value::BulkString(Bytes::from_static(b"x\r\ny")),

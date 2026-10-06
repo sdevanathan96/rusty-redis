@@ -1,6 +1,5 @@
-//! Turning a request into a `Command`, and running it against the keyspace.
-//! Each command group parses and runs its own commands in its own file; this
-//! one holds the types they share and the two entry points.
+//! Parsing a request into a `Command`, and running it. Each command group has
+//! its own file.
 
 mod args;
 mod error;
@@ -210,17 +209,11 @@ impl Command {
     }
 }
 
-/// Parses one client request.
+/// `Ok(None)` is an empty array, which gets no reply.
 ///
-///   Ok(Some(cmd)) - run it and reply
-///   Ok(None)      - a valid frame that produces no reply at all (empty array)
-///   Err(e)        - reply with the error
-///
-/// Must stay pure: it reads only the request, never the keyspace or a clock.
-/// Inside MULTI a command is parsed when it is queued but runs at EXEC, so
-/// anything resolved here would reflect the moment of queueing. That is why
-/// `EX` stays a relative `Duration` and `XADD *` and `XREAD $` are resolved by
-/// `execute`. Redis parses at EXEC instead; purity makes the two equivalent.
+/// Must not read the keyspace or a clock: inside MULTI a command is parsed when
+/// queued but runs at EXEC. So `EX` stays relative, and `XADD *` and `XREAD $`
+/// are resolved by `execute`.
 pub fn to_command(v: Value) -> Result<Option<Command>, CommandError> {
     let items = match v {
         Value::Array(items) => items,
@@ -314,17 +307,13 @@ pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError> {
         Command::XTrim { key, trim } => stream::xtrim(&key, &trim, db),
         Command::Incr { key } => Ok(Outcome::Reply(string::incr(&key, db)?)),
         Command::Unknown { name, args } => Err(CommandError::UnknownCommand { name, args }),
-        // Never reached: the connection intercepts these before anything goes
-        // to the keyspace task. An error rather than unreachable!(), because a
-        // panic here would stop the whole server.
+        // The connection handles these. Not unreachable!(): a panic here would
+        // stop the server.
         Command::Multi | Command::Exec | Command::Discard | Command::Watch { .. } => {
             Err(CommandError::HandledByConnection)
         }
-        // Reached only inside EXEC, which has already dropped the watches, so
-        // there is nothing left to do.
-        Command::Unwatch => Ok(Outcome::Reply(Value::SimpleString(Bytes::from_static(
-            b"OK",
-        )))),
+        // Only inside EXEC, which has already dropped the watches.
+        Command::Unwatch => Ok(Outcome::Reply(Value::ok())),
     }
 }
 
@@ -441,8 +430,7 @@ mod command_tests {
         assert!(text.contains("bar"), "{text}");
     }
 
-    /// Checks the encoded bytes, not `to_resp`, because the double-sigil bug
-    /// lived in an inline `format!` that a `to_resp` test could not reach.
+    /// Checks the encoded bytes, where a doubled `-` would show.
     #[test]
     fn error_replies_have_exactly_one_sigil() {
         let mut d = db();

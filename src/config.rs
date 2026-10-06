@@ -22,15 +22,13 @@ impl Default for Config {
     }
 }
 
-/// Every way argv can be wrong. `flag` is the name without its leading `--`,
-/// lowercased, which is how Redis matches it.
+/// `flag` is the name without `--`, lowercased, as Redis matches it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     UnknownFlag {
         flag: String,
     },
-    /// A token before the first `--flag`. Redis would read it as a config
-    /// file path; config files are not supported here.
+    /// A token before the first `--flag`, which Redis reads as a config file.
     UnexpectedArgument {
         value: String,
     },
@@ -47,8 +45,7 @@ pub enum ConfigError {
         min: i64,
         max: i64,
     },
-    /// Port 0, which Redis reads as "no TCP listener". With no unix socket
-    /// either, there is nowhere left to listen.
+    /// Port 0 means no TCP listener, and there is no unix socket either.
     NotListening,
 }
 
@@ -100,9 +97,8 @@ pub fn parse(args: &[String]) -> Result<Config, ConfigError> {
     Ok(config)
 }
 
-/// Splits argv the way Redis does: each `--name` starts a flag, and every token
-/// up to the next `--name` is one of its arguments. So `--port 7000 extra` is
-/// `port` with two arguments, not `port` followed by an unknown `extra`.
+/// Splits argv as Redis does: each `--name` takes every token up to the next
+/// one, so `--port 7000 extra` is `port` with two arguments.
 fn group(args: &[String]) -> Result<Vec<(String, Vec<String>)>, ConfigError> {
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for arg in args {
@@ -117,8 +113,7 @@ fn group(args: &[String]) -> Result<Vec<(String, Vec<String>)>, ConfigError> {
     Ok(groups)
 }
 
-/// Parsed as a strict i64 first and narrowed after, so a value that is not a
-/// number and a number that is not a port fail with different errors.
+/// Not a number and not a valid port are different errors.
 fn port(flag: &str, values: &[String]) -> Result<u16, ConfigError> {
     let [value] = values else {
         return Err(ConfigError::WrongNumberOfArguments {

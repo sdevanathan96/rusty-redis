@@ -6,8 +6,7 @@ use bytes::Bytes;
 
 use super::{Data, Db, Entry, WrongType};
 
-/// Which end of a list an operation acts on. Shared by push, pop, and LMOVE,
-/// which takes two of them.
+/// Which end of a list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum End {
     Left,
@@ -49,7 +48,7 @@ impl Db {
     ) -> Result<Option<Vec<Bytes>>, WrongType> {
         self.reap(key);
         let popped = pop_from(&mut self.map, key, count.unwrap_or(1), end)?;
-        // A count of 0 pops nothing from an existing list, so changes nothing.
+        // `LPOP k 0` pops nothing.
         if popped.as_ref().is_some_and(|v| !v.is_empty()) {
             self.mark_modified(key.clone());
         }
@@ -90,8 +89,7 @@ impl Db {
     }
 }
 
-/// Resolves LRANGE style indexes to a half open range into a list of `len`.
-/// Returns None when the range is empty.
+/// LRANGE indexes as a half open range, or `None` if empty.
 fn resolve_range(len: usize, start: i64, stop: i64) -> Option<(usize, usize)> {
     let len = len as i64;
 

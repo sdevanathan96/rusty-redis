@@ -13,32 +13,36 @@ use watchers::Watches;
 
 pub type ReplyTx = mpsc::UnboundedSender<Value>;
 
-/// What a connection asks of the keyspace task. `conn` is the connection's
-/// id, fixed for its life: the only way this task knows a client.
+/// What a connection asks of the keyspace task. `conn` is the connection's id.
 pub enum Request {
-    /// Run one command. It replies on `reply`, or parks as a waiter.
     Run {
         cmd: Command,
         reply: ReplyTx,
         conn: u64,
     },
-    /// The parked command's timer fired. Reply `on_timeout` unless a write
-    /// already served it.
-    Unpark { conn: u64, on_timeout: Value },
-    /// The connection stopped waiting without a reply: drop its waiter.
-    Gone { conn: u64 },
-    /// Run a MULTI queue as one step, unless a watched key changed.
+    /// The parked command timed out, unless a write served it first.
+    Unpark {
+        conn: u64,
+        on_timeout: Value,
+    },
+    /// The connection left while parked.
+    Gone {
+        conn: u64,
+    },
     Exec {
         cmds: Vec<Result<Command, CommandError>>,
         reply: ReplyTx,
         conn: u64,
     },
-    /// Watch `keys` for this connection's next EXEC. No reply is needed: the
-    /// channel is FIFO, so anything the client sends after its `+OK` is
-    /// handled after this.
-    Watch { conn: u64, keys: Vec<Bytes> },
-    /// Drop every watch the connection holds. No reply, for the same reason.
-    Unwatch { conn: u64 },
+    /// No reply: the channel is FIFO, so the client's next request comes after
+    /// this one anyway. The same goes for `Unwatch`.
+    Watch {
+        conn: u64,
+        keys: Vec<Bytes>,
+    },
+    Unwatch {
+        conn: u64,
+    },
 }
 
 struct Waiter {
@@ -56,12 +60,11 @@ pub async fn keyspace_task(mut db: Db, mut rx: mpsc::Receiver<Request>) {
     }
 }
 
-/// One request, then every key it changed reported to WATCH, including keys
-/// changed by waiters it served. The task's loop and the tests both come
-/// through here.
+/// One request, then the keys it changed, including through waiters it
+/// served, reported to WATCH.
 fn process(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>, watches: &mut Watches) {
     handle(req, db, waiters, watches);
-    // Taken even when nobody watches: nothing else empties the list.
+    // Always taken: nothing else empties it.
     let modified = db.take_modified();
     if !watches.is_empty() {
         for key in &modified {
@@ -124,9 +127,6 @@ fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>, watches: &m
                     let _ = reply.send(Value::Error(e.to_resp()));
                 }
             }
-            // No round cap needed: every serve removes a waiter and none
-            // are added mid cascade, so this ends. A cap could only
-            // abandon parked clients.
             wake(db, waiters, fed);
         }
         Request::Unpark { conn, on_timeout } => {
@@ -142,7 +142,6 @@ fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>, watches: &m
             }
         }
         Request::Exec { cmds, reply, conn } => {
-            // EXEC ends the connection's watches whether or not it runs.
             let aborted = watches.aborts(conn, db);
             watches.unwatch(conn);
             if aborted {
@@ -152,7 +151,6 @@ fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>, watches: &m
             let mut replies = Vec::with_capacity(cmds.len());
             let mut fed = Vec::new();
             for item in cmds {
-                // by value: each command is moved out
                 let value = match item {
                     Err(e) => Value::Error(e.to_resp()),
                     Ok(cmd) => {
@@ -160,7 +158,7 @@ fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>, watches: &m
                         fed.extend(meta.feeds);
                         match execute(cmd, db) {
                             Ok(Outcome::Reply(v)) => v,
-                            // Nothing parks inside EXEC: answer as if it had timed out.
+                            // Nothing parks inside EXEC: reply as if it timed out.
                             Ok(Outcome::Block { .. }) => {
                                 meta.blocks.map_or(Value::NullArray, |b| b.on_timeout)
                             }
@@ -185,8 +183,8 @@ fn handle(req: Request, db: &mut Db, waiters: &mut VecDeque<Waiter>, watches: &m
     }
 }
 
-/// Serves every waiter the written keys can now satisfy, including the chain
-/// of wakeups a BLMOVE can start.
+/// Serves every waiter the written keys can satisfy, following the chain a
+/// BLMOVE can start. It ends: every serve removes a waiter.
 fn wake(db: &mut Db, waiters: &mut VecDeque<Waiter>, fed: Vec<Bytes>) {
     let mut pending: VecDeque<Bytes> = fed.into();
     while let Some(key) = pending.pop_front() {
@@ -202,8 +200,7 @@ mod tests {
     use crate::command::test_support::cmd_ok;
     use crate::db::TestClock;
 
-    /// The keyspace task's state, fed one request at a time through
-    /// `process`, exactly as the task's loop does.
+    /// The task's state, fed through `process` as the task's loop does.
     struct Keyspace {
         clock: Arc<TestClock>,
         db: Db,
@@ -226,7 +223,6 @@ mod tests {
             process(req, &mut self.db, &mut self.waiters, &mut self.watches);
         }
 
-        /// Runs a command that does not park, and returns its reply.
         fn run(&mut self, conn: u64, parts: &[&str]) -> Value {
             let (reply, mut rx) = mpsc::unbounded_channel();
             self.send(Request::Run {
@@ -296,7 +292,6 @@ mod tests {
         assert_eq!(ks.waiters.len(), 1, "a stale or duplicate Gone is harmless");
     }
 
-    /// A command from its arguments, through the real parser.
     fn cmd(parts: &[&str]) -> Command {
         let mut raw = format!("*{}\r\n", parts.len());
         for p in parts {
@@ -340,7 +335,7 @@ mod tests {
             conn: 1,
         });
 
-        let ok = Value::SimpleString(Bytes::from_static(b"OK"));
+        let ok = Value::ok();
         let syntax = Value::Error(CommandError::Syntax.to_resp());
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -367,7 +362,7 @@ mod tests {
             conn: 2,
         });
 
-        // LLEN inside the transaction still sees both: nobody was served yet.
+        // LLEN still sees both: nobody was served yet.
         assert_eq!(
             rx.try_recv().unwrap(),
             Value::Array(vec![Value::Integer(2), Value::Integer(2)])
@@ -379,7 +374,7 @@ mod tests {
         assert!(ks.waiters.is_empty());
     }
 
-    // WATCH. Every scenario here was checked against Redis 8.10.1 first.
+    // WATCH
 
     fn pong() -> Value {
         Value::SimpleString(Bytes::from_static(b"PONG"))
@@ -453,8 +448,7 @@ mod tests {
 
     #[test]
     fn a_waiter_served_by_a_write_counts_as_a_write() {
-        // BLMOVE parks on src; the push serves it, which moves the element
-        // into dst. Nobody wrote dst directly, but it changed.
+        // Nobody writes dst directly; the served BLMOVE does.
         let mut ks = Keyspace::new();
         let (reply, _rx) = mpsc::unbounded_channel();
         ks.send(Request::Run {

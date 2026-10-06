@@ -32,17 +32,14 @@ pub struct Trim {
     pub refs: RefPolicy,
 }
 
-/// `Exact` for `=` or no marker, `Approx` for `~`. A LIMIT exists only with
-/// `~`, so the type cannot hold the combination Redis rejects. `None` is no
-/// limit, which is also what `LIMIT 0` means.
+/// Only `~` can carry a LIMIT. `None` is no limit, as is `LIMIT 0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mode {
     Exact,
     Approx { limit: Option<usize> },
 }
 
-/// What trimming does to consumer group references. Parsed and kept for when
-/// groups exist; with none, all three behave the same.
+/// Kept for consumer groups; without them all three act the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefPolicy {
     KeepRef,
@@ -76,7 +73,6 @@ pub struct Stream {
 }
 
 impl Stream {
-    // explicit id: validate and append
     pub fn append(
         &mut self,
         id: EntryId,
@@ -93,7 +89,6 @@ impl Stream {
         Ok(id)
     }
 
-    // auto sequence: derive the seq from last_id, then append
     pub fn append_auto_seq(
         &mut self,
         ms: u64,
@@ -121,9 +116,8 @@ impl Stream {
         Ok(id)
     }
 
-    /// `*`: use the clock's millisecond, unless the last entry is already ahead
-    /// of the clock, in which case reuse that millisecond so IDs never go
-    /// backwards.
+    /// `*`: the clock's millisecond, or the last entry's if the clock is behind
+    /// it, so ids never go backwards.
     pub fn append_auto(
         &mut self,
         clock_ms: u64,
@@ -181,8 +175,7 @@ impl Stream {
             TrimBy::MaxLen(max_len) => self.entries.len().saturating_sub(max_len),
             TrimBy::MinId(min_id) => self.entries.partition_point(|e| e.id < min_id),
         };
-        // `~` trims exactly here, which keeps Redis's only promise that at
-        // least the threshold remains. Its LIMIT caps the removals.
+        // `~` trims exactly, capped by its LIMIT.
         let count = match trim.mode {
             Mode::Exact | Mode::Approx { limit: None } => count,
             Mode::Approx { limit: Some(limit) } => count.min(limit),
@@ -199,11 +192,9 @@ pub enum IdSpec {
     Auto,         // both generated
 }
 
-/// The stream methods of `Db`, next to the stream they work on.
 impl Db {
-    /// Appends, then trims, in that order, so `MAXLEN 0` removes the entry just
-    /// added. `None` means NOMKSTREAM found no key, and nothing was created. A
-    /// failed append returns before anything is trimmed.
+    /// Appends, then trims, so `MAXLEN 0` removes the new entry. `None` means
+    /// NOMKSTREAM found no key.
     pub fn xadd(
         &mut self,
         key: Bytes,

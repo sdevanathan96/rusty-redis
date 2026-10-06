@@ -1,5 +1,4 @@
-//! Every error a command can answer with, and the exact text Redis sends for
-//! each.
+//! Every error a command can reply with, worded exactly as Redis does.
 
 use bytes::Bytes;
 
@@ -19,8 +18,7 @@ pub enum CommandError {
         name: Bytes,
         args: Vec<Bytes>,
     },
-    /// MULTI, EXEC or DISCARD reached `execute`. The connection handles them,
-    /// so this means a bug, but it still replies with a well formed error.
+    /// A command the connection handles reached `execute`: a bug.
     HandledByConnection,
     TimeoutNotAFloat,
     TimeoutNotAnInteger,
@@ -37,14 +35,11 @@ pub enum CommandError {
     LimitNegative,
     LimitWithoutStrategy,
     NestedMulti,
-    /// Refused without marking the transaction, unlike an arity error.
     WatchInsideMulti,
     ExecAbortPreviousErrors,
     ExecWithoutMulti,
     DiscardWithoutMulti,
-    /// EXEC itself was rejected before running, for now only for a wrong
-    /// argument count. Redis answers every such rejection with EXECABORT,
-    /// inside MULTI or not, and discards any open transaction.
+    /// EXEC with arguments: EXECABORT, inside MULTI or not.
     ExecAbortRejected(Box<CommandError>),
 }
 
@@ -75,8 +70,7 @@ impl From<XaddError> for CommandError {
 }
 
 impl CommandError {
-    /// The message body only. No leading '-' and no trailing CRLF: those belong
-    /// to `resp::encode` when it writes a `Value::Error`.
+    /// The message only; `resp::encode` adds the `-` and CRLF.
     pub fn to_resp(&self) -> Bytes {
         match self {
             CommandError::NotAnArray => {
@@ -174,18 +168,13 @@ impl CommandError {
     }
 }
 
-/// Redis lowercases the command name in arity and expiry errors even when the
-/// client sent it uppercase, but quotes it verbatim in "unknown command".
+/// Arity and expiry errors lowercase the name; "unknown command" does not.
 fn lower(name: &[u8]) -> String {
     String::from_utf8_lossy(name).to_lowercase()
 }
 
-/// Renders client supplied bytes for an error message. Escapes so the message
-/// reads clearly, truncates so a huge argument cannot fill the reply.
-///
-/// `resp::encode` already guarantees a single frame by substituting CR and LF,
-/// but escaping here keeps the message readable instead of mangled to spaces,
-/// and escaping the quote stops a client closing it and appending its own text.
+/// Client bytes in an error message: escaped, so a quote cannot end the
+/// string early, and truncated.
 fn quote(bytes: &[u8]) -> String {
     const MAX: usize = 64;
     let mut s = String::new();

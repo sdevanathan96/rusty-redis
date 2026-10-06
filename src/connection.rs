@@ -1,6 +1,5 @@
-//! One client connection: reading and parsing requests, the parked wait for
-//! blocking commands, MULTI, and writing replies. The keyspace task runs the
-//! commands; everything here is per client.
+//! One client connection: parsing requests, parked waits, MULTI and WATCH,
+//! and writing replies. The keyspace task runs the commands.
 
 mod pending;
 mod transaction;
@@ -8,7 +7,7 @@ mod transaction;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -20,54 +19,40 @@ use crate::resp::{self, Value};
 use pending::{Parsed, Pending, parse_into};
 use transaction::{Transaction, queue_in};
 
-/// Flush the reply buffer once it passes this, instead of only at the end of
-/// the drain loop.
+/// Flush replies early once this many bytes are waiting.
 const OUTBUF_FLUSH_AT: usize = 64 * 1024;
 
-/// Starting size of both buffers, and the room reserved in `inbuf` before each
-/// read.
+/// Initial buffer size, and the room reserved before each read.
 const READ_CHUNK: usize = 4096;
 
-/// Close the connection once the input a client holds passes this: unparsed
-/// bytes in `inbuf`, commands parsed into `pending` but not yet run, and
-/// commands waiting in an open MULTI. Same value and same rule as Redis's
-/// client-query-buffer-limit, which also counts the MULTI queue
-/// (`argv_len_sums`): checked after every read, parked or not, and the client
-/// gets no reply.
+/// Redis's client-query-buffer-limit: close a client holding more input than
+/// this, counting unparsed bytes, parsed commands and the MULTI queue.
 const MAX_QUERY_BUF: usize = 1024 * 1024 * 1024;
 
 fn query_buf_limit() -> std::io::Error {
     std::io::Error::other("closing client that reached max query buffer length")
 }
 
-/// One id per connection, for its whole life. The keyspace task knows a
-/// client only by this number: its watches, and its parked command if it has
-/// one. Reusing it for every parked command is safe because a connection parks
-/// at most one at a time, and its `Unpark` or `Gone` reaches the keyspace task
-/// before its next `Run`.
+/// The keyspace task knows a client only by this id. A connection parks one
+/// command at a time, so the same id names its waiter.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Everything one client connection owns. One struct rather than separate
-/// locals, so the parked wait borrows it as a whole instead of taking each
-/// piece as an argument, and the flat event loop pub/sub needs (4.8) has one
-/// place to grow.
 struct Conn {
     id: u64,
     stream: TcpStream,
     inbuf: BytesMut,
     outbuf: BytesMut,
-    /// This connection's mailbox: every reply from the keyspace task arrives
-    /// on `reply_rx`, and a clone of `reply_tx` goes with each request.
+    /// Replies from the keyspace task; a clone of `reply_tx` goes with each
+    /// request.
     reply_tx: mpsc::UnboundedSender<Value>,
     reply_rx: mpsc::UnboundedReceiver<Value>,
     pending: Pending,
     transaction: Option<Transaction>,
-    /// The keyspace task holds watches for this connection. Lets UNWATCH,
-    /// DISCARD and disconnect skip the request when there are none.
+    /// Whether the keyspace task holds watches for this connection.
     watching: bool,
 }
 
@@ -87,12 +72,11 @@ impl Conn {
         }
     }
 
-    /// Encodes a reply into `outbuf`. Nothing is sent until `flush`.
+    /// Buffers a reply; `flush` sends it.
     fn reply(&mut self, value: &Value) {
         resp::encode(value, &mut self.outbuf);
     }
 
-    /// Writes out and empties `outbuf`, if there is anything in it.
     async fn flush(&mut self) -> std::io::Result<()> {
         if !self.outbuf.is_empty() {
             self.stream.write_all(&self.outbuf).await?;
@@ -107,8 +91,8 @@ impl Conn {
         self.inbuf.len() + self.pending.bytes() + in_multi
     }
 
-    /// Drops this connection's watches, if it has any. If the keyspace task
-    /// is gone, the watches went with it, so a failed send needs no handling.
+    /// A failed send needs no handling: the watches went with the keyspace
+    /// task.
     async fn unwatch(&mut self, tx: &mpsc::Sender<Request>) {
         if self.watching {
             self.watching = false;
@@ -117,9 +101,8 @@ impl Conn {
     }
 }
 
-/// Serves one client until it disconnects. `tx` reaches the keyspace task.
-/// However the connection ends, its watches go with it. The cleanup lives
-/// here rather than at each exit so a `?` cannot skip it, as in `wait_parked`.
+/// Serves one client until it disconnects, then drops its watches however
+/// `serve` returned.
 pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std::io::Result<()> {
     let mut conn = Conn::new(stream);
     let result = serve(&mut conn, &tx).await;
@@ -127,7 +110,6 @@ pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std:
     result
 }
 
-/// Reads, parses, and acts on each request in the order it arrived.
 async fn serve(conn: &mut Conn, tx: &mpsc::Sender<Request>) -> std::io::Result<()> {
     loop {
         parse_into(&mut conn.inbuf, &mut conn.pending);
@@ -144,7 +126,7 @@ async fn serve(conn: &mut Conn, tx: &mpsc::Sender<Request>) -> std::io::Result<(
                         Value::Error(CommandError::NestedMulti.to_resp())
                     } else {
                         conn.transaction = Some(Transaction::default());
-                        Value::SimpleString(Bytes::from_static(b"OK"))
+                        Value::ok()
                     };
                     conn.reply(&reply);
                 }
@@ -165,7 +147,7 @@ async fn serve(conn: &mut Conn, tx: &mpsc::Sender<Request>) -> std::io::Result<(
                         if tx.send(request).await.is_err() {
                             return Ok(()); // keyspace task is gone
                         }
-                        conn.watching = false; // the keyspace task drops them as it runs this
+                        conn.watching = false; // Exec drops them
                         match conn.reply_rx.recv().await {
                             Some(v) => conn.reply(&v),
                             None => return Ok(()),
@@ -177,25 +159,22 @@ async fn serve(conn: &mut Conn, tx: &mpsc::Sender<Request>) -> std::io::Result<(
                     let reply = match conn.transaction.take() {
                         Some(_) => {
                             conn.unwatch(tx).await;
-                            Value::SimpleString(Bytes::from_static(b"OK"))
+                            Value::ok()
                         }
-                        // Without MULTI the watches stay, as in Redis.
+                        // Without MULTI the watches stay.
                         None => Value::Error(CommandError::DiscardWithoutMulti.to_resp()),
                     };
                     conn.reply(&reply);
                 }
 
-                // A rejected EXEC ends any open transaction and the watches,
-                // inside MULTI or not, as Redis's execCommandAbort does. Above
-                // the guard, so it is never queued.
+                // Ends the transaction and the watches, inside MULTI or not.
                 Parsed::Error(e @ CommandError::ExecAbortRejected(_)) => {
                     conn.unwatch(tx).await;
                     conn.transaction = None;
                     conn.reply(&Value::Error(e.to_resp()));
                 }
 
-                // Above the guard: inside MULTI, WATCH is refused rather than
-                // queued, and the transaction is not marked failed.
+                // Inside MULTI, refused without failing the transaction.
                 Parsed::Run(Command::Watch { keys }) => {
                     if conn.transaction.is_some() {
                         conn.reply(&Value::Error(CommandError::WatchInsideMulti.to_resp()));
@@ -208,34 +187,24 @@ async fn serve(conn: &mut Conn, tx: &mpsc::Sender<Request>) -> std::io::Result<(
                             return Ok(()); // keyspace task is gone
                         }
                         conn.watching = true;
-                        conn.reply(&Value::SimpleString(Bytes::from_static(b"OK")));
+                        conn.reply(&Value::ok());
                     }
                 }
 
-                // Any other item while a transaction is open: queue it. The
-                // guard has just checked for Some, so the unwrap cannot fail.
+                // Inside MULTI, everything else is queued.
                 item if conn.transaction.is_some() => {
                     let reply = queue_in(conn.transaction.as_mut().unwrap(), item, size);
                     conn.reply(&reply);
                 }
 
-                // Below the guard, so only reached outside MULTI. Inside, it is
-                // queued, and EXEC has dropped the watches by the time it runs.
                 Parsed::Run(Command::Unwatch) => {
                     conn.unwatch(tx).await;
-                    conn.reply(&Value::SimpleString(Bytes::from_static(b"OK")));
+                    conn.reply(&Value::ok());
                 }
 
                 Parsed::Run(cmd) => {
                     let deadline = cmd.meta().blocks;
-
-                    // Anything already encoded belongs to commands that
-                    // came before this one in the same packet, and they
-                    // are not waiting on it. Real Redis writes those
-                    // replies out and leaves the client blocked, so a
-                    // pipelined `PING` then `BLPOP k 0` gets its +PONG
-                    // immediately. Flushing here rather than after the
-                    // drain loop is what reproduces that.
+                    // Earlier pipelined replies go out before parking, as in Redis.
                     if deadline.is_some() {
                         conn.flush().await?;
                     }
@@ -259,16 +228,13 @@ async fn serve(conn: &mut Conn, tx: &mpsc::Sender<Request>) -> std::io::Result<(
 
                     match received {
                         Some(v) => conn.reply(&v),
-                        None => return Ok(()), // client left, or every sender dropped
+                        None => return Ok(()),
                     }
                 }
 
                 Parsed::Error(err) => conn.reply(&Value::Error(err.to_resp())),
             }
 
-            // A deep pipeline of large replies would otherwise grow outbuf
-            // without limit. Redis bounds this with client-output-buffer-limit;
-            // this is the crude version.
             if conn.outbuf.len() >= OUTBUF_FLUSH_AT {
                 conn.flush().await?;
             }
@@ -285,11 +251,8 @@ async fn serve(conn: &mut Conn, tx: &mpsc::Sender<Request>) -> std::io::Result<(
     }
 }
 
-/// Waits for a parked command's reply. On every exit without one (EOF, a read
-/// error, the query buffer limit) it tells the keyspace task the waiter is
-/// gone, so the waiter is removed at once instead of on the next write to its
-/// keys. The `is_closed` check in `serve_waiters` stays as a backstop. The
-/// cleanup lives here rather than in each exit so a `?` cannot skip it.
+/// Waits for a parked command's reply. Any exit without one removes the
+/// waiter, so a `?` cannot leave it behind.
 async fn wait_parked(
     conn: &mut Conn,
     tx: &mpsc::Sender<Request>,
@@ -303,24 +266,20 @@ async fn wait_parked(
     result
 }
 
-/// The wait itself: the reply, the socket, and the timer at once. On EOF it
-/// returns None. Commands that arrive meanwhile are parsed into `pending` but
-/// not run until the reply is in.
+/// Waits on the reply, the socket and the timer together. Input that arrives
+/// meanwhile is parsed but not run.
 async fn wait_for_reply(
     conn: &mut Conn,
     tx: &mpsc::Sender<Request>,
     timeout: Option<Duration>,
     on_timeout: Value,
 ) -> std::io::Result<Option<Value>> {
-    // A pinned sleep inside the select rather than a timeout around it, so the
-    // socket is still watched while the keyspace task settles the Unpark.
     let timer = sleep(timeout.unwrap_or_default());
     tokio::pin!(timer);
-    let mut on_timeout = timeout.map(|_| on_timeout); // Some while the timer is armed
+    let mut on_timeout = timeout.map(|_| on_timeout); // None: no timer, or it fired
 
     loop {
         conn.inbuf.reserve(READ_CHUNK);
-        // The branches borrow different fields of conn, which Rust allows at once.
         tokio::select! {
             reply = conn.reply_rx.recv() => return Ok(reply),
             read = conn.stream.read_buf(&mut conn.inbuf) => {
@@ -333,9 +292,8 @@ async fn wait_for_reply(
                 parse_into(&mut conn.inbuf, &mut conn.pending);
             }
             () = &mut timer, if on_timeout.is_some() => {
-                // Do not write the timeout reply here. A push may already have
-                // served this waiter; the keyspace task decides and sends
-                // exactly one more message either way.
+                // The keyspace task sends the reply: a push may have served
+                // the waiter already.
                 let on_timeout = on_timeout.take().expect("guarded by the branch condition");
                 let unpark = Request::Unpark {
                     conn: conn.id,

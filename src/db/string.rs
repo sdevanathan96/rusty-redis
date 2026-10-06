@@ -7,8 +7,6 @@ use bytes::Bytes;
 use super::{Data, Db, Entry, WrongType};
 use crate::int::strict_i64;
 
-/// Why INCR failed. A type of its own, so every other accessor goes on
-/// returning plain `WrongType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IncrError {
     WrongType,
@@ -20,9 +18,8 @@ pub enum IncrError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidExpireTime;
 
-/// A string's value, stored the way Redis encodes it. `Integer` holds only what
-/// `strict_i64` accepts, which is the canonical form, so turning it back into
-/// bytes gives exactly what the client wrote: `010` stays `Raw`.
+/// A string, encoded as Redis does. Only canonical integers become `Integer`,
+/// so `010` stays `Raw` and reads back exactly as written.
 #[derive(Debug, Clone)]
 pub(super) enum Str {
     Raw(Bytes),
@@ -37,8 +34,6 @@ impl Str {
         }
     }
 
-    /// Owned, because an `Integer` has no bytes to lend. Cheap for `Raw`, a
-    /// reference count bump; an `Integer` is formatted.
     fn to_bytes(&self) -> Bytes {
         match self {
             Str::Raw(bytes) => bytes.clone(),
@@ -48,9 +43,9 @@ impl Str {
 }
 
 impl Db {
-    /// ttl is relative. The absolute deadline is computed here, once, because
-    /// this is the only layer that owns a clock. Fails, writing nothing, if
-    /// that deadline overflows.
+    /// Fails, writing nothing, if the deadline overflows Redis's i64 of
+    /// milliseconds. Linux Redis rejects that; Homebrew's build compiles the
+    /// check out.
     pub fn set(
         &mut self,
         key: Bytes,
@@ -59,31 +54,11 @@ impl Db {
     ) -> Result<(), InvalidExpireTime> {
         let now = self.clock.now();
         let now_ms = self.clock.now_ms();
-        // Two separate hazards here.
-        //
-        // First, `now + d` panics: Instant's Add impl is
-        // `checked_add(..).expect(..)`, and this runs inside the keyspace
-        // task, where a panic takes down every connection in the process.
-        //
-        // Second, Redis computes the deadline as `mstime() + ms` in a signed
-        // 64 bit integer and replies "invalid expire time" when the sum
-        // overflows. Duration and Instant have far more headroom than an i64
-        // of milliseconds, so that boundary has to be reproduced by hand.
-        //
-        // Redis detects the overflow with `if (ms <= 0)` after the addition,
-        // which relies on signed wraparound, undefined behaviour in C. Some
-        // builds (Homebrew on macOS, at least) compile the check out: they
-        // reply OK and store a deadline in the past, so the next read finds
-        // the key gone. The Linux build keeps the check, and that is what this
-        // matches.
-        //
-        // The boundary depends on the current wall clock, exactly as it
-        // does in Redis, so it cannot be pinned to a constant.
         let expires_at = match ttl {
             Some(d) if now_ms as i128 + d.as_millis() as i128 > i64::MAX as i128 => {
                 return Err(InvalidExpireTime);
             }
-            Some(d) => Some(now.checked_add(d).unwrap_or(now)),
+            Some(d) => Some(now.checked_add(d).unwrap_or(now)), // `+` would panic
             None => None,
         };
         self.map.insert(
@@ -105,8 +80,8 @@ impl Db {
         }
     }
 
-    /// INCR. A missing key starts from 0, so it becomes 1 with no expiry. An
-    /// existing value changes in place, which keeps its TTL, as Redis does.
+    /// A missing key starts at 0. An existing one changes in place, keeping its
+    /// TTL.
     pub fn incr(&mut self, key: Bytes) -> Result<i64, IncrError> {
         self.reap(&key);
         match self.data_mut(&key) {
@@ -124,7 +99,7 @@ impl Db {
             Some(d) => {
                 let value = d.as_integer_mut()?;
                 *value = value.checked_add(1).ok_or(IncrError::Overflow)?;
-                let n = *value; // last use of the borrow from data_mut
+                let n = *value;
                 self.mark_modified(key);
                 Ok(n)
             }

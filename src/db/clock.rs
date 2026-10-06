@@ -26,11 +26,9 @@ impl Clock for SystemClock {
     }
 }
 
-/// One offset, read by both clocks, so a test can never move monotonic time
-/// while stream ids stay frozen, or the reverse. The wall clock starts at a
-/// plausible time rather than zero, because behavior that depends on how close
-/// `mstime()` is to `i64::MAX`, such as the PX overflow in `Db::set`, cannot
-/// happen at epoch zero.
+/// Both clocks read one offset, so they always move together. The wall clock
+/// starts at a realistic time, not zero, so the PX overflow in `Db::set` can
+/// happen.
 #[cfg(test)]
 pub struct TestClock {
     start: Instant,

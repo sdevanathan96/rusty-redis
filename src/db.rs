@@ -1,6 +1,5 @@
-//! The keyspace: every key's value and expiry, owned by the keyspace task.
-//! Each data type keeps its `Db` methods in its own file; this one holds what
-//! they all share.
+//! Every key's value and expiry, owned by the keyspace task. Each data type's
+//! `Db` methods live in its own file.
 
 mod clock;
 mod list;
@@ -40,7 +39,6 @@ impl Entry {
     }
 }
 
-// private: the storage
 #[derive(Debug, Clone)]
 enum Data {
     String(Str),
@@ -49,9 +47,6 @@ enum Data {
 }
 
 impl Data {
-    // One line each, and they live next to the enum rather than being spelled
-    // out inside six nearly identical Db methods. A new variant adds one of
-    // these, not two Db methods.
     fn as_str(&self) -> Result<&Str, WrongType> {
         match self {
             Data::String(s) => Ok(s),
@@ -85,7 +80,6 @@ impl Data {
     }
 }
 
-// public: the tag only
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     String,
@@ -116,52 +110,41 @@ impl Data {
 pub struct Db {
     map: HashMap<Bytes, Entry>,
     clock: Arc<dyn Clock>,
-    /// Keys changed since the keyspace task last took them, for WATCH. May
-    /// repeat a key. Lazy expiry never adds to it: `reap_if_expired` cannot
-    /// reach it.
+    /// Keys changed since the last `take_modified`, for WATCH. Lazy expiry
+    /// never adds to it: `reap_if_expired` cannot reach it.
     modified: Vec<Bytes>,
 }
 
 impl Db {
-    /// Drop the key if its deadline has passed.
-    ///
-    /// Split out from reading on purpose. Reaping needs `&mut self`, so while
-    /// the two were fused every accessor took `&mut self` and could not lend
-    /// anything past the call. That is the only reason `xrange` cloned every
-    /// entry it returned.
+    /// Separate from reading, so reads can take `&self` and lend what they
+    /// return.
     fn reap(&mut self, key: &[u8]) {
         let now = self.clock.now();
         reap_if_expired(&mut self.map, key, now);
     }
 
-    /// Records that `key` changed. Call it only once the change has happened:
-    /// a write that fails or finds nothing to do changes nothing, and must
-    /// not abort anyone's WATCH.
+    /// Call only after a real change: a write that fails or does nothing must
+    /// not abort a WATCH.
     fn mark_modified(&mut self, key: Bytes) {
         self.modified.push(key);
     }
 
-    /// Every key changed since the last call, emptying the list.
     pub fn take_modified(&mut self) -> Vec<Bytes> {
         std::mem::take(&mut self.modified)
     }
 
-    /// When a live key expires. `None` if it is absent, already expired, or
-    /// has no TTL. Reaping here is not a change, so it is not marked.
+    /// When a live key expires: `None` if it is absent or has no TTL.
     pub fn deadline(&mut self, key: &[u8]) -> Option<Instant> {
         self.reap(key);
         self.map.get(key).and_then(|e| e.expires_at)
     }
 
-    /// Whether `deadline` is past on this database's clock, by the same rule
-    /// as `Entry::is_expired`, so a key that reads as gone also counts as
-    /// expired here.
+    /// The same rule as `Entry::is_expired`.
     pub fn has_passed(&self, deadline: Instant) -> bool {
         self.clock.now() >= deadline
     }
 
-    /// The stored value, if the key is live. Reap first; every public method
-    /// below does so on its first line.
+    /// Callers reap first.
     fn data(&self, key: &[u8]) -> Option<&Data> {
         self.map.get(key).map(|e| &e.data)
     }
@@ -189,8 +172,7 @@ impl Db {
 
     pub fn delete(&mut self, key: &Bytes) -> bool {
         let now = self.clock.now();
-        // An expired entry counts as absent, so removing it returns false
-        // and changes nothing.
+        // An expired entry counts as absent.
         let removed = self.map.remove(key).is_some_and(|e| !e.is_expired(now));
         if removed {
             self.mark_modified(key.clone());
@@ -198,8 +180,7 @@ impl Db {
         removed
     }
 
-    /// Counts entries still in the map, including ones past their deadline that
-    /// have not been lazily reaped. Debug and test use only.
+    /// Includes expired entries not yet reaped. For tests.
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -215,8 +196,7 @@ impl Db {
     }
 }
 
-/// Removes the entry at `key` if its deadline has passed. Every accessor calls
-/// this first, so a write path never appends to a stale value.
+/// Every accessor calls this first, so no write lands on an expired value.
 fn reap_if_expired(map: &mut HashMap<Bytes, Entry>, key: &[u8], now: Instant) {
     let expired = map.get(key).is_some_and(|e| e.is_expired(now));
     if expired {
@@ -357,8 +337,7 @@ mod tests {
 
     #[test]
     fn px_that_overflows_the_redis_deadline_is_rejected() {
-        // Redis replies "invalid expire time" because mstime() + i64::MAX
-        // overflows, and it bails out before touching the key.
+        // mstime() + i64::MAX overflows, and the key is left alone.
         let clock = Arc::new(TestClock::new());
         let mut db = Db::with_clock(clock.clone());
         db.set(Bytes::from_static(b"k"), Bytes::from_static(b"old"), None)
@@ -380,9 +359,7 @@ mod tests {
 
     #[test]
     fn px_just_under_the_boundary_still_lives() {
-        // The boundary is i64::MAX minus the current wall clock, so an
-        // argument a little below it must survive. This is the assertion that
-        // fails if TestClock ever goes back to a zero wall clock.
+        // Just under i64::MAX minus the wall clock must still work.
         let clock = Arc::new(TestClock::new());
         let mut db = Db::with_clock(clock.clone());
         let just_under = i64::MAX as u64 - clock.now_ms() - 1;
@@ -504,8 +481,7 @@ mod tests {
     }
 }
 
-/// What each write reports for WATCH. A key appears only when the write
-/// changed something, matching what aborts a watcher in Redis 8.10.1.
+/// A write reports its key for WATCH only if it changed something.
 #[cfg(test)]
 mod modified_tests {
     use std::sync::Arc;

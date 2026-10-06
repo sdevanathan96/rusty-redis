@@ -80,7 +80,7 @@ pub(super) fn set(
 ) -> Result<Value, CommandError> {
     db.set(key, value, expiry)
         .map_err(|_| CommandError::InvalidExpiry(Bytes::from_static(b"set")))?;
-    Ok(Value::SimpleString(Bytes::from_static(b"OK")))
+    Ok(Value::ok())
 }
 
 pub(super) fn incr(key: &Bytes, db: &mut Db) -> Result<Value, CommandError> {
@@ -104,8 +104,6 @@ mod string_tests {
         );
     }
 
-    /// The bug an `nc` test cannot see: EX 1 and PX 1 both look alive a
-    /// millisecond later.
     #[test]
     fn ex_is_seconds_px_is_millis() {
         let ex = cmd_ok(b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$1\r\n1\r\n");

@@ -39,25 +39,21 @@ fn push_command(rest: &[Bytes], name: &Bytes, from: End) -> Result<Command, Comm
 }
 
 fn pop_command(rest: &[Bytes], name: &Bytes, from: End) -> Result<Command, CommandError> {
-    // Arity first, so `LPOP k abc extra` reports WrongArity rather than a parse
-    // error on an argument that should not be there at all.
     let (key, raw_count) = match rest {
         [key] => (key, None),
         [key, c] => (key, Some(c)),
         _ => return Err(CommandError::WrongArity(name.clone())),
     };
 
+    // Not a number and negative share one message.
     let count = match raw_count {
         None => None,
-        Some(raw) => {
-            // Redis uses one message for both a non numeric count and a
-            // negative one, unlike the expiry arguments above.
-            let n = parse_i64(raw).map_err(|_| CommandError::OutOfRange)?;
-            if n < 0 {
-                return Err(CommandError::OutOfRange);
-            }
-            Some(n as usize)
-        }
+        Some(raw) => Some(
+            parse_i64(raw)
+                .ok()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or(CommandError::OutOfRange)?,
+        ),
     };
 
     Ok(Command::Pop {
@@ -231,8 +227,6 @@ mod list_tests {
     use super::super::test_support::{cmd, cmd_ok};
     use super::*;
 
-    /// Unlike the expiry arguments, a pop count uses one message for both a
-    /// non numeric value and a negative one.
     #[test]
     fn pop_count_errors_use_out_of_range() {
         assert!(matches!(

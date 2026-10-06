@@ -17,8 +17,8 @@ struct TrimOptions {
 }
 
 impl TrimOptions {
-    /// If `args[i]` starts a trim option, consume it and return how many
-    /// tokens it used. `Ok(None)` means `args[i]` is not a trim option.
+    /// How many tokens the trim option at `args[i]` used, or `None` if it is
+    /// not one.
     fn take(&mut self, args: &[Bytes], i: usize) -> Result<Option<usize>, CommandError> {
         let more = args.len() - i - 1; // tokens after this one
         let upper = args[i].to_ascii_uppercase();
@@ -53,8 +53,7 @@ impl TrimOptions {
                 self.limit = Some(n as usize);
                 Ok(Some(2))
             }
-            // Consumer group options. Only one may appear, anywhere among the
-            // trim options.
+            // At most one, anywhere among the trim options.
             b"KEEPREF" | b"DELREF" | b"ACKED" => {
                 if self.refs.is_some() {
                     return Err(CommandError::Syntax);
@@ -70,11 +69,10 @@ impl TrimOptions {
         }
     }
 
-    /// Check the combination once every option has been read. `None` means
-    /// no MAXLEN or MINID was given.
+    /// Judges the combination once all options are read, since LIMIT may come
+    /// first. `None`: no MAXLEN or MINID.
     fn finish(self) -> Result<Option<Trim>, CommandError> {
         let Some(by) = self.by else {
-            // No MAXLEN or MINID. A LIMIT on its own has nothing to limit.
             if self.limit.is_some() {
                 return Err(CommandError::LimitWithoutStrategy);
             }
@@ -116,8 +114,8 @@ fn parse_xadd_id(raw: &[u8]) -> Result<IdSpec, CommandError> {
     }
 }
 
-/// `default_seq` is what a bare millisecond gets: 0 for a start bound,
-/// u64::MAX for an end bound, so `XRANGE k 5 5` spans all of millisecond 5.
+/// A bare millisecond gets `default_seq`: 0 to start, u64::MAX to end, so
+/// `XRANGE k 5 5` spans all of millisecond 5.
 fn parse_bound(raw: &[u8], default_seq: u64) -> Result<EntryId, CommandError> {
     let text = std::str::from_utf8(raw).map_err(|_| CommandError::InvalidStreamId)?;
     match text.split_once('-') {
@@ -164,8 +162,7 @@ fn parse_read_from(raw: &[u8]) -> Result<ReadFrom, CommandError> {
 fn arg_after(args: &[Bytes], i: usize) -> Result<&Bytes, CommandError> {
     args.get(i + 1).ok_or(CommandError::Syntax)
 }
-/// Field/value pairs from a flat argument list. At least one pair, and the
-/// count must be even.
+/// At least one field/value pair.
 fn parse_fields(args: &[Bytes], name: &Bytes) -> Result<Vec<(Bytes, Bytes)>, CommandError> {
     if args.is_empty() || !args.len().is_multiple_of(2) {
         return Err(CommandError::WrongArity(name.clone()));
@@ -253,7 +250,6 @@ fn xadd_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
 
 fn xtrim_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     if rest.len() < 3 {
-        // key, MAXLEN|MINID, threshold at the very least
         return Err(CommandError::WrongArity(name.clone()));
     }
     let mut opts = TrimOptions::default();
@@ -305,8 +301,7 @@ fn xrange_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError>
 }
 
 fn xread_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
-    // STREAMS is the last option, so everything before it is flags and
-    // everything after is N keys followed by N ids.
+    // Options, then STREAMS, then N keys and N ids.
     if rest.len() < 3 {
         return Err(CommandError::WrongArity(name.clone()));
     }
@@ -315,7 +310,6 @@ fn xread_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> 
     let mut i = 0;
     let streams_at = loop {
         if i >= rest.len() {
-            // ran out of arguments without ever seeing STREAMS
             return Err(CommandError::WrongArity(name.clone()));
         }
         match rest[i].to_ascii_uppercase().as_slice() {
@@ -353,16 +347,14 @@ fn xread_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> 
 
 fn xdel_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
     match rest {
-        // Redis arity for XDEL is -3: name, key, and at least one id. Without
-        // the guard, `[key, ids @ ..]` also matches a bare `XDEL k` and replies :0.
-        [key, ids @ ..] if !ids.is_empty() => Ok(Command::XDel {
+        [] | [_] => Err(CommandError::WrongArity(name.clone())),
+        [key, ids @ ..] => Ok(Command::XDel {
             key: key.clone(),
             ids: ids
                 .iter()
                 .map(|id| parse_bound(id, 0))
                 .collect::<Result<_, CommandError>>()?,
         }),
-        _ => Err(CommandError::WrongArity(name.clone())),
     }
 }
 
