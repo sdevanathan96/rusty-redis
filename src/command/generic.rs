@@ -123,36 +123,21 @@ pub(super) fn exists(keys: Vec<Bytes>, db: &mut Db) -> Result<Value, CommandErro
 
 #[cfg(test)]
 mod generic_tests {
-    use super::super::test_support::cmd_ok;
     use super::*;
+    use crate::test_support::{b, cmd_ok};
 
     #[test]
     fn ping_and_echo_reply_with_different_types() {
         // bare PING is a simple string, PING <msg> is a bulk string
-        assert_eq!(
-            ping(None).unwrap(),
-            Value::SimpleString(Bytes::from_static(b"PONG"))
-        );
-        assert_eq!(
-            ping(Some(Bytes::from_static(b"his"))).unwrap(),
-            Value::BulkString(Bytes::from_static(b"his"))
-        );
-        assert_eq!(
-            echo(Bytes::from_static(b"hi")).unwrap(),
-            Value::BulkString(Bytes::from_static(b"hi"))
-        );
+        assert_eq!(ping(None).unwrap(), Value::SimpleString(b("PONG")));
+        assert_eq!(ping(Some(b("his"))).unwrap(), Value::BulkString(b("his")));
+        assert_eq!(echo(b("hi")).unwrap(), Value::BulkString(b("hi")));
     }
 
     #[test]
     fn command_ping_echo_works() {
-        assert_eq!(cmd_ok(b"*1\r\n$4\r\nPING\r\n"), Command::Ping(None));
-        assert_eq!(
-            cmd_ok(b"*2\r\n$4\r\nping\r\n$2\r\nhi\r\n"),
-            Command::Ping(Some(Bytes::from_static(b"hi")))
-        );
-        assert_eq!(
-            cmd_ok(b"*2\r\n$4\r\nECHO\r\n$4\r\necho\r\n"),
-            Command::Echo(Bytes::from_static(b"echo"))
-        );
+        assert_eq!(cmd_ok(&["PING"]), Command::Ping(None));
+        assert_eq!(cmd_ok(&["ping", "hi"]), Command::Ping(Some(b("hi"))));
+        assert_eq!(cmd_ok(&["ECHO", "echo"]), Command::Echo(b("echo")));
     }
 }

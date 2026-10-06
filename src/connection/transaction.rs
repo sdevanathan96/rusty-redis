@@ -1,9 +1,11 @@
-//! An open MULTI and what it queues.
+//! MULTI, EXEC, DISCARD and WATCH for one connection.
 
 use bytes::Bytes;
 
+use super::Conn;
 use super::pending::Parsed;
 use crate::command::{Command, CommandError};
+use crate::keyspace::Request;
 use crate::resp::Value;
 
 #[derive(Default)]
@@ -44,18 +46,93 @@ pub(super) fn queue_in(transaction: &mut Transaction, item: Parsed, size: usize)
     }
 }
 
+/// Methods that talk to the keyspace task return `None` if it is gone.
+impl Conn {
+    pub(super) fn multi(&mut self) -> Value {
+        if self.transaction.is_some() {
+            return Value::Error(CommandError::NestedMulti.to_resp());
+        }
+        self.transaction = Some(Transaction::default());
+        Value::ok()
+    }
+
+    pub(super) async fn exec(&mut self) -> Option<Value> {
+        let Some(t) = self.transaction.take() else {
+            return Some(Value::Error(CommandError::ExecWithoutMulti.to_resp()));
+        };
+        if t.failed {
+            self.unwatch().await;
+            let abort = CommandError::ExecAbortPreviousErrors;
+            return Some(Value::Error(abort.to_resp()));
+        }
+        let request = Request::Exec {
+            cmds: t.commands,
+            reply: self.reply_tx.clone(),
+            conn: self.id,
+        };
+        self.tx.send(request).await.ok()?;
+        self.watching = false; // Exec drops them
+        self.reply_rx.recv().await
+    }
+
+    pub(super) async fn discard(&mut self) -> Value {
+        if self.transaction.take().is_none() {
+            // Without MULTI the watches stay.
+            return Value::Error(CommandError::DiscardWithoutMulti.to_resp());
+        }
+        self.unwatch().await;
+        Value::ok()
+    }
+
+    /// EXEC with arguments ends the transaction and the watches, inside MULTI
+    /// or not.
+    pub(super) async fn reject_exec(&mut self, e: CommandError) -> Value {
+        self.transaction = None;
+        self.unwatch().await;
+        Value::Error(e.to_resp())
+    }
+
+    pub(super) async fn watch(&mut self, keys: Vec<Bytes>) -> Option<Value> {
+        if self.transaction.is_some() {
+            // Refused without failing the transaction.
+            return Some(Value::Error(CommandError::WatchInsideMulti.to_resp()));
+        }
+        let request = Request::Watch {
+            conn: self.id,
+            keys,
+        };
+        self.tx.send(request).await.ok()?;
+        self.watching = true;
+        Some(Value::ok())
+    }
+
+    /// A failed send needs no handling: the watches went with the keyspace
+    /// task.
+    pub(super) async fn unwatch(&mut self) {
+        if self.watching {
+            self.watching = false;
+            let _ = self.tx.send(Request::Unwatch { conn: self.id }).await;
+        }
+    }
+
+    /// Only called inside MULTI.
+    pub(super) fn queue(&mut self, item: Parsed, size: usize) -> Value {
+        let transaction = self.transaction.as_mut().expect("inside MULTI");
+        queue_in(transaction, item, size)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::to_command;
+    use crate::test_support::{b, cmd_ok};
 
     fn ping() -> Command {
-        let request = Value::Array(vec![Value::BulkString(Bytes::from_static(b"PING"))]);
-        to_command(request).unwrap().unwrap()
+        cmd_ok(&["PING"])
     }
 
     fn queued_reply() -> Value {
-        Value::SimpleString(Bytes::from_static(b"QUEUED"))
+        Value::SimpleString(b("QUEUED"))
     }
 
     #[test]
@@ -77,11 +154,11 @@ mod tests {
     #[test]
     fn queue_time_failures_mark_the_transaction_and_hold_nothing() {
         let mut t = Transaction::default();
-        let arity = CommandError::WrongArity(Bytes::from_static(b"get"));
+        let arity = CommandError::WrongArity(b("get"));
         let reply = queue_in(&mut t, Parsed::Error(arity.clone()), 9);
         assert_eq!(reply, Value::Error(arity.to_resp()));
         let unknown = Command::Unknown {
-            name: Bytes::from_static(b"NOSUCH"),
+            name: b("NOSUCH"),
             args: vec![],
         };
         assert!(matches!(

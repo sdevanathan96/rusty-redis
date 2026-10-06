@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use crate::{
     command::args::{lenient_u64, parse_block, parse_i64},
-    command::{Blocking, Command, CommandError, Outcome},
+    command::{Command, CommandError, Outcome, Timeout},
     db::{Db, EntryId, IdSpec, Mode, ReadFrom, RefPolicy, StreamEntry, Trim, TrimBy},
     resp::Value,
 };
@@ -306,7 +306,7 @@ fn xread_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> 
         return Err(CommandError::WrongArity(name.clone()));
     }
     let mut count = None;
-    let mut block = Blocking::No;
+    let mut block = None;
     let mut i = 0;
     let streams_at = loop {
         if i >= rest.len() {
@@ -319,7 +319,7 @@ fn xread_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> 
                 i += 2;
             }
             b"BLOCK" => {
-                block = parse_block(arg_after(rest, i)?)?;
+                block = Some(parse_block(arg_after(rest, i)?)?);
                 i += 2;
             }
             _ => return Err(CommandError::Syntax),
@@ -340,7 +340,7 @@ fn xread_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> 
 
     Ok(Command::XRead {
         count,
-        timeout: block,
+        block,
         streams,
     })
 }
@@ -399,7 +399,7 @@ pub(super) fn xrange(
 
 pub(super) fn xread(
     count: Option<i64>,
-    timeout: Blocking,
+    block: Option<Timeout>,
     streams: Vec<(Bytes, ReadFrom)>,
     db: &mut Db,
 ) -> Result<Outcome, CommandError> {
@@ -424,7 +424,7 @@ pub(super) fn xread(
     if !out.is_empty() {
         return Ok(Outcome::Reply(build_xread_reply(out)));
     }
-    if matches!(timeout, Blocking::No) {
+    if block.is_none() {
         return Ok(Outcome::Reply(Value::NullArray));
     }
 
@@ -445,7 +445,7 @@ pub(super) fn xread(
         keys,
         retry: Command::XRead {
             count,
-            timeout,
+            block,
             streams: resolved,
         },
     })

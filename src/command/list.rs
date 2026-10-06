@@ -1,9 +1,7 @@
-use std::time::Duration;
-
 use bytes::Bytes;
 
 use super::args::{parse_end, parse_i64, parse_timeout};
-use super::{Command, CommandError, Outcome};
+use super::{Command, CommandError, Outcome, Timeout};
 use crate::db::{Db, End};
 use crate::resp::Value;
 
@@ -146,7 +144,7 @@ pub(super) fn pop(
 pub(super) fn bpop(
     keys: Vec<Bytes>,
     from: End,
-    timeout: Option<Duration>,
+    timeout: Timeout,
     db: &mut Db,
 ) -> Result<Outcome, CommandError> {
     for key in &keys {
@@ -204,7 +202,7 @@ pub(super) fn blmove(
     dst: Bytes,
     from: End,
     to: End,
-    timeout: Option<Duration>,
+    timeout: Timeout,
     db: &mut Db,
 ) -> Result<Outcome, CommandError> {
     match db.lmove(&src, dst.clone(), from, to)? {
@@ -224,22 +222,22 @@ pub(super) fn blmove(
 
 #[cfg(test)]
 mod list_tests {
-    use super::super::test_support::{cmd, cmd_ok};
     use super::*;
+    use crate::test_support::{b, cmd, cmd_ok};
 
     #[test]
     fn pop_count_errors_use_out_of_range() {
         assert!(matches!(
-            cmd(b"*3\r\n$4\r\nLPOP\r\n$1\r\nk\r\n$3\r\nabc\r\n"),
+            cmd(&["LPOP", "k", "abc"]),
             Err(CommandError::OutOfRange)
         ));
         assert!(matches!(
-            cmd(b"*3\r\n$4\r\nLPOP\r\n$1\r\nk\r\n$2\r\n-1\r\n"),
+            cmd(&["LPOP", "k", "-1"]),
             Err(CommandError::OutOfRange)
         ));
         // arity is checked before the count is parsed
         assert!(matches!(
-            cmd(b"*4\r\n$4\r\nLPOP\r\n$1\r\nk\r\n$3\r\nabc\r\n$1\r\nx\r\n"),
+            cmd(&["LPOP", "k", "abc", "x"]),
             Err(CommandError::WrongArity(_))
         ));
     }
@@ -247,11 +245,11 @@ mod list_tests {
     #[test]
     fn bare_pop_and_pop_one_are_different_commands() {
         // `LPOP k` replies with a bulk string, `LPOP k 1` with an array.
-        match cmd_ok(b"*2\r\n$4\r\nLPOP\r\n$1\r\nk\r\n") {
+        match cmd_ok(&["LPOP", "k"]) {
             Command::Pop { count, .. } => assert_eq!(count, None),
             other => panic!("{other:?}"),
         }
-        match cmd_ok(b"*3\r\n$4\r\nLPOP\r\n$1\r\nk\r\n$1\r\n1\r\n") {
+        match cmd_ok(&["LPOP", "k", "1"]) {
             Command::Pop { count, .. } => assert_eq!(count, Some(1)),
             other => panic!("{other:?}"),
         }
@@ -260,16 +258,16 @@ mod list_tests {
     #[test]
     fn lmove_directions_are_case_insensitive() {
         assert_eq!(
-            cmd_ok(b"*5\r\n$5\r\nlmove\r\n$1\r\na\r\n$1\r\nb\r\n$4\r\nleft\r\n$5\r\nright\r\n"),
+            cmd_ok(&["lmove", "a", "b", "left", "right"]),
             Command::LMove {
-                src: Bytes::from_static(b"a"),
-                dst: Bytes::from_static(b"b"),
+                src: b("a"),
+                dst: b("b"),
                 from: End::Left,
                 to: End::Right,
             }
         );
         assert!(matches!(
-            cmd(b"*5\r\n$5\r\nLMOVE\r\n$1\r\na\r\n$1\r\nb\r\n$8\r\nSIDEWAYS\r\n$5\r\nRIGHT\r\n"),
+            cmd(&["LMOVE", "a", "b", "SIDEWAYS", "RIGHT"]),
             Err(CommandError::Syntax)
         ));
     }

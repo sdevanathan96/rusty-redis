@@ -212,17 +212,12 @@ impl Default for Db {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use bytes::Bytes;
 
     use super::{Clock, Db, End, IncrError, InvalidExpireTime, TestClock};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    fn fixture() -> (Arc<TestClock>, Db) {
-        let clock = Arc::new(TestClock::new());
-        let db = Db::with_clock(clock.clone());
-        (clock, db)
-    }
+    use crate::test_support::{b, db_and_clock};
 
     #[test]
     fn test_clock_advances() {
@@ -234,31 +229,22 @@ mod tests {
 
     #[test]
     fn set_then_get() {
-        let (_clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None)
-            .unwrap();
-        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))));
+        let (_clock, mut db) = db_and_clock();
+        db.set(b("k"), b("v"), None).unwrap();
+        assert_eq!(db.get(b"k"), Ok(Some(b("v"))));
         assert_eq!(db.get(b"missing"), Ok(None));
     }
 
     #[test]
     fn key_expires_exactly_at_deadline() {
-        let (clock, mut db) = fixture();
-        db.set(
-            Bytes::from_static(b"k"),
-            Bytes::from_static(b"v"),
-            Some(Duration::from_millis(100)),
-        )
-        .unwrap();
+        let (clock, mut db) = db_and_clock();
+        db.set(b("k"), b("v"), Some(Duration::from_millis(100)))
+            .unwrap();
 
-        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))));
+        assert_eq!(db.get(b"k"), Ok(Some(b("v"))));
 
         clock.advance(Duration::from_millis(99));
-        assert_eq!(
-            db.get(b"k"),
-            Ok(Some(Bytes::from_static(b"v"))),
-            "not yet expired"
-        );
+        assert_eq!(db.get(b"k"), Ok(Some(b("v"))), "not yet expired");
 
         clock.advance(Duration::from_millis(1));
         assert_eq!(
@@ -270,28 +256,19 @@ mod tests {
 
     #[test]
     fn no_expiry_never_expires() {
-        let (clock, mut db) = fixture();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None)
-            .unwrap();
+        let (clock, mut db) = db_and_clock();
+        db.set(b("k"), b("v"), None).unwrap();
         clock.advance(Duration::from_secs(86_400 * 365));
-        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))));
+        assert_eq!(db.get(b"k"), Ok(Some(b("v"))));
     }
 
     #[test]
     fn get_reaps_the_expired_entry() {
-        let (clock, mut db) = fixture();
-        db.set(
-            Bytes::from_static(b"a"),
-            Bytes::from_static(b"v"),
-            Some(Duration::from_millis(100)),
-        )
-        .unwrap();
-        db.set(
-            Bytes::from_static(b"b"),
-            Bytes::from_static(b"v"),
-            Some(Duration::from_millis(50)),
-        )
-        .unwrap();
+        let (clock, mut db) = db_and_clock();
+        db.set(b("a"), b("v"), Some(Duration::from_millis(100)))
+            .unwrap();
+        db.set(b("b"), b("v"), Some(Duration::from_millis(50)))
+            .unwrap();
         assert_eq!(db.len(), 2);
 
         clock.advance(Duration::from_millis(99));
@@ -305,73 +282,46 @@ mod tests {
 
     #[test]
     fn delete_reports_false_for_expired_key() {
-        let (clock, mut db) = fixture();
-        db.set(
-            Bytes::from_static(b"k"),
-            Bytes::from_static(b"v"),
-            Some(Duration::from_millis(10)),
-        )
-        .unwrap();
+        let (clock, mut db) = db_and_clock();
+        db.set(b("k"), b("v"), Some(Duration::from_millis(10)))
+            .unwrap();
         clock.advance(Duration::from_millis(10));
-        assert!(
-            !db.delete(&Bytes::from_static(b"k")),
-            "expired key counts as absent"
-        );
+        assert!(!db.delete(&b("k")), "expired key counts as absent");
         assert_eq!(db.len(), 0, "but it is still removed");
     }
 
     #[test]
     fn overwriting_clears_the_old_ttl() {
-        let (clock, mut db) = fixture();
-        db.set(
-            Bytes::from_static(b"k"),
-            Bytes::from_static(b"v1"),
-            Some(Duration::from_millis(10)),
-        )
-        .unwrap();
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"v2"), None)
+        let (clock, mut db) = db_and_clock();
+        db.set(b("k"), b("v1"), Some(Duration::from_millis(10)))
             .unwrap();
+        db.set(b("k"), b("v2"), None).unwrap();
         clock.advance(Duration::from_secs(1));
-        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v2"))));
+        assert_eq!(db.get(b"k"), Ok(Some(b("v2"))));
     }
 
     #[test]
     fn px_that_overflows_the_redis_deadline_is_rejected() {
         // mstime() + i64::MAX overflows, and the key is left alone.
-        let clock = Arc::new(TestClock::new());
-        let mut db = Db::with_clock(clock.clone());
-        db.set(Bytes::from_static(b"k"), Bytes::from_static(b"old"), None)
-            .unwrap();
+        let (_clock, mut db) = db_and_clock();
+        db.set(b("k"), b("old"), None).unwrap();
 
-        let result = db.set(
-            Bytes::from_static(b"k"),
-            Bytes::from_static(b"v"),
-            Some(Duration::from_millis(i64::MAX as u64)),
-        );
+        let result = db.set(b("k"), b("v"), Some(Duration::from_millis(i64::MAX as u64)));
 
         assert_eq!(result, Err(InvalidExpireTime));
-        assert_eq!(
-            db.get(b"k"),
-            Ok(Some(Bytes::from_static(b"old"))),
-            "existing value untouched"
-        );
+        assert_eq!(db.get(b"k"), Ok(Some(b("old"))), "existing value untouched");
     }
 
     #[test]
     fn px_just_under_the_boundary_still_lives() {
         // Just under i64::MAX minus the wall clock must still work.
-        let clock = Arc::new(TestClock::new());
-        let mut db = Db::with_clock(clock.clone());
+        let (clock, mut db) = db_and_clock();
         let just_under = i64::MAX as u64 - clock.now_ms() - 1;
 
-        db.set(
-            Bytes::from_static(b"k"),
-            Bytes::from_static(b"v"),
-            Some(Duration::from_millis(just_under)),
-        )
-        .unwrap();
+        db.set(b("k"), b("v"), Some(Duration::from_millis(just_under)))
+            .unwrap();
 
-        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"v"))));
+        assert_eq!(db.get(b"k"), Ok(Some(b("v"))));
     }
 
     fn set(db: &mut Db, key: &'static [u8], value: &'static [u8]) {
@@ -381,7 +331,7 @@ mod tests {
 
     #[test]
     fn get_returns_a_number_exactly_as_it_was_set() {
-        let (_clock, mut db) = fixture();
+        let (_clock, mut db) = db_and_clock();
         for value in [
             &b"5"[..],
             b"-7",
@@ -392,12 +342,7 @@ mod tests {
             b"-0",
             b"hello",
         ] {
-            db.set(
-                Bytes::from_static(b"k"),
-                Bytes::copy_from_slice(value),
-                None,
-            )
-            .unwrap();
+            db.set(b("k"), Bytes::copy_from_slice(value), None).unwrap();
             assert_eq!(
                 db.get(b"k"),
                 Ok(Some(Bytes::copy_from_slice(value))),
@@ -408,70 +353,49 @@ mod tests {
 
     #[test]
     fn incr_on_a_missing_key_gives_one() {
-        let (_clock, mut db) = fixture();
-        assert_eq!(db.incr(Bytes::from_static(b"k")), Ok(1));
-        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"1"))));
+        let (_clock, mut db) = db_and_clock();
+        assert_eq!(db.incr(b("k")), Ok(1));
+        assert_eq!(db.get(b"k"), Ok(Some(b("1"))));
     }
 
     #[test]
     fn incr_adds_to_a_number_written_by_set() {
-        let (_clock, mut db) = fixture();
+        let (_clock, mut db) = db_and_clock();
         set(&mut db, b"k", b"5");
-        assert_eq!(db.incr(Bytes::from_static(b"k")), Ok(6));
-        assert_eq!(db.get(b"k"), Ok(Some(Bytes::from_static(b"6"))));
+        assert_eq!(db.incr(b("k")), Ok(6));
+        assert_eq!(db.get(b"k"), Ok(Some(b("6"))));
     }
 
     #[test]
     fn incr_on_a_non_canonical_number_is_not_an_integer() {
-        let (_clock, mut db) = fixture();
+        let (_clock, mut db) = db_and_clock();
         for value in [&b"hello"[..], b"010", b"+5", b""] {
-            db.set(
-                Bytes::from_static(b"k"),
-                Bytes::copy_from_slice(value),
-                None,
-            )
-            .unwrap();
-            assert_eq!(
-                db.incr(Bytes::from_static(b"k")),
-                Err(IncrError::NotAnInteger),
-                "{value:?}"
-            );
+            db.set(b("k"), Bytes::copy_from_slice(value), None).unwrap();
+            assert_eq!(db.incr(b("k")), Err(IncrError::NotAnInteger), "{value:?}");
         }
     }
 
     #[test]
     fn incr_on_a_list_is_wrongtype() {
-        let (_clock, mut db) = fixture();
-        db.push(
-            Bytes::from_static(b"l"),
-            vec![Bytes::from_static(b"a")],
-            End::Right,
-        )
-        .unwrap();
-        assert_eq!(db.incr(Bytes::from_static(b"l")), Err(IncrError::WrongType));
+        let (_clock, mut db) = db_and_clock();
+        db.push(b("l"), vec![b("a")], End::Right).unwrap();
+        assert_eq!(db.incr(b("l")), Err(IncrError::WrongType));
     }
 
     #[test]
     fn incr_at_the_maximum_fails_and_leaves_the_value() {
-        let (_clock, mut db) = fixture();
+        let (_clock, mut db) = db_and_clock();
         set(&mut db, b"k", b"9223372036854775807");
-        assert_eq!(db.incr(Bytes::from_static(b"k")), Err(IncrError::Overflow));
-        assert_eq!(
-            db.get(b"k"),
-            Ok(Some(Bytes::from_static(b"9223372036854775807")))
-        );
+        assert_eq!(db.incr(b("k")), Err(IncrError::Overflow));
+        assert_eq!(db.get(b"k"), Ok(Some(b("9223372036854775807"))));
     }
 
     #[test]
     fn incr_keeps_the_ttl() {
-        let (clock, mut db) = fixture();
-        db.set(
-            Bytes::from_static(b"k"),
-            Bytes::from_static(b"5"),
-            Some(Duration::from_millis(100)),
-        )
-        .unwrap();
-        assert_eq!(db.incr(Bytes::from_static(b"k")), Ok(6));
+        let (clock, mut db) = db_and_clock();
+        db.set(b("k"), b("5"), Some(Duration::from_millis(100)))
+            .unwrap();
+        assert_eq!(db.incr(b("k")), Ok(6));
         clock.advance(Duration::from_millis(100));
         assert_eq!(
             db.get(b"k"),
@@ -484,26 +408,16 @@ mod tests {
 /// A write reports its key for WATCH only if it changed something.
 #[cfg(test)]
 mod modified_tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::Bytes;
 
-    use super::{Db, End, EntryId, IdSpec, Mode, RefPolicy, TestClock, Trim, TrimBy};
+    use super::{Db, End, EntryId, IdSpec, Mode, RefPolicy, Trim, TrimBy};
+    use crate::test_support::{b, db_and_clock};
 
-    fn fixture() -> (Arc<TestClock>, Db) {
-        let clock = Arc::new(TestClock::new());
-        let db = Db::with_clock(clock.clone());
-        (clock, db)
-    }
-
-    fn k(key: &'static [u8]) -> Bytes {
-        Bytes::from_static(key)
-    }
-
-    fn xadd(db: &mut Db, key: &'static [u8], ms: u64, nomkstream: bool) -> bool {
+    fn xadd(db: &mut Db, key: &'static str, ms: u64, nomkstream: bool) -> bool {
         let id = IdSpec::Explicit(EntryId { ms, seq: 0 });
-        db.xadd(k(key), id, vec![(k(b"f"), k(b"v"))], None, nomkstream)
+        db.xadd(b(key), id, vec![(b("f"), b("v"))], None, nomkstream)
             .is_ok_and(|added| added.is_some())
     }
 
@@ -517,94 +431,93 @@ mod modified_tests {
 
     #[test]
     fn writes_that_change_something_report_their_key() {
-        let (_clock, mut db) = fixture();
-        db.set(k(b"s"), k(b"v"), None).unwrap();
-        assert_eq!(db.take_modified(), vec![k(b"s")], "set");
+        let (_clock, mut db) = db_and_clock();
+        db.set(b("s"), b("v"), None).unwrap();
+        assert_eq!(db.take_modified(), vec![b("s")], "set");
 
-        db.incr(k(b"n")).unwrap();
-        db.incr(k(b"n")).unwrap();
+        db.incr(b("n")).unwrap();
+        db.incr(b("n")).unwrap();
         assert_eq!(
             db.take_modified(),
-            vec![k(b"n"), k(b"n")],
+            vec![b("n"), b("n")],
             "incr, new then existing"
         );
 
-        db.push(k(b"l"), vec![k(b"a"), k(b"b")], End::Right)
-            .unwrap();
-        db.pop(&k(b"l"), None, End::Left).unwrap();
-        assert_eq!(db.take_modified(), vec![k(b"l"), k(b"l")], "push then pop");
+        db.push(b("l"), vec![b("a"), b("b")], End::Right).unwrap();
+        db.pop(&b("l"), None, End::Left).unwrap();
+        assert_eq!(db.take_modified(), vec![b("l"), b("l")], "push then pop");
 
-        assert!(xadd(&mut db, b"x", 1, false));
-        assert!(xadd(&mut db, b"x", 2, false));
-        db.xdel(&k(b"x"), &[EntryId { ms: 1, seq: 0 }]).unwrap();
-        db.xtrim(&k(b"x"), &max_len(0)).unwrap();
+        assert!(xadd(&mut db, "x", 1, false));
+        assert!(xadd(&mut db, "x", 2, false));
+        db.xdel(&b("x"), &[EntryId { ms: 1, seq: 0 }]).unwrap();
+        db.xtrim(&b("x"), &max_len(0)).unwrap();
         assert_eq!(
             db.take_modified(),
-            vec![k(b"x"); 4],
+            vec![b("x"); 4],
             "xadd twice, xdel, xtrim"
         );
 
-        assert!(db.delete(&k(b"s")));
-        assert_eq!(db.take_modified(), vec![k(b"s")], "delete");
+        assert!(db.delete(&b("s")));
+        assert_eq!(db.take_modified(), vec![b("s")], "delete");
     }
 
     #[test]
     fn writes_that_change_nothing_report_nothing() {
-        let (_clock, mut db) = fixture();
-        db.set(k(b"s"), k(b"text"), None).unwrap();
-        db.push(k(b"l"), vec![k(b"a")], End::Right).unwrap();
-        assert!(xadd(&mut db, b"x", 5, false));
+        let (_clock, mut db) = db_and_clock();
+        db.set(b("s"), b("text"), None).unwrap();
+        db.push(b("l"), vec![b("a")], End::Right).unwrap();
+        assert!(xadd(&mut db, "x", 5, false));
         db.take_modified();
 
-        assert!(!db.delete(&k(b"missing")));
-        assert_eq!(db.pop(&k(b"missing"), None, End::Left), Ok(None));
-        assert_eq!(db.pop(&k(b"l"), Some(0), End::Left), Ok(Some(vec![])));
+        assert!(!db.delete(&b("missing")));
+        assert_eq!(db.pop(&b("missing"), None, End::Left), Ok(None));
+        assert_eq!(db.pop(&b("l"), Some(0), End::Left), Ok(Some(vec![])));
         assert_eq!(
-            db.lmove(&k(b"missing"), k(b"l"), End::Left, End::Right),
+            db.lmove(&b("missing"), b("l"), End::Left, End::Right),
             Ok(None)
         );
         assert!(
-            db.push(k(b"s"), vec![k(b"a")], End::Left).is_err(),
+            db.push(b("s"), vec![b("a")], End::Left).is_err(),
             "WRONGTYPE"
         );
-        assert!(db.incr(k(b"s")).is_err(), "not an integer");
+        assert!(db.incr(b("s")).is_err(), "not an integer");
         let overflowing = Some(Duration::from_millis(i64::MAX as u64));
-        assert!(db.set(k(b"s"), k(b"v"), overflowing).is_err());
-        assert!(!xadd(&mut db, b"missing", 1, true), "NOMKSTREAM");
-        assert!(!xadd(&mut db, b"x", 1, false), "id too small");
-        assert_eq!(db.xdel(&k(b"x"), &[EntryId { ms: 9, seq: 0 }]), Ok(0));
-        assert_eq!(db.xtrim(&k(b"x"), &max_len(5)), Ok(0));
+        assert!(db.set(b("s"), b("v"), overflowing).is_err());
+        assert!(!xadd(&mut db, "missing", 1, true), "NOMKSTREAM");
+        assert!(!xadd(&mut db, "x", 1, false), "id too small");
+        assert_eq!(db.xdel(&b("x"), &[EntryId { ms: 9, seq: 0 }]), Ok(0));
+        assert_eq!(db.xtrim(&b("x"), &max_len(5)), Ok(0));
 
         assert_eq!(db.take_modified(), Vec::<Bytes>::new());
     }
 
     #[test]
     fn lmove_reports_both_keys() {
-        let (_clock, mut db) = fixture();
-        db.push(k(b"src"), vec![k(b"a")], End::Right).unwrap();
+        let (_clock, mut db) = db_and_clock();
+        db.push(b("src"), vec![b("a")], End::Right).unwrap();
         db.take_modified();
-        db.lmove(&k(b"src"), k(b"dst"), End::Left, End::Right)
+        db.lmove(&b("src"), b("dst"), End::Left, End::Right)
             .unwrap();
-        assert_eq!(db.take_modified(), vec![k(b"dst"), k(b"src")]);
+        assert_eq!(db.take_modified(), vec![b("dst"), b("src")]);
     }
 
     #[test]
     fn lazy_expiry_reports_nothing() {
-        let (clock, mut db) = fixture();
-        db.set(k(b"k"), k(b"v"), Some(Duration::from_millis(10)))
+        let (clock, mut db) = db_and_clock();
+        db.set(b("k"), b("v"), Some(Duration::from_millis(10)))
             .unwrap();
         db.take_modified();
         clock.advance(Duration::from_millis(10));
         assert_eq!(db.get(b"k"), Ok(None), "reaped here");
-        assert!(!db.delete(&k(b"k")));
+        assert!(!db.delete(&b("k")));
         assert_eq!(db.take_modified(), Vec::<Bytes>::new());
     }
 
     #[test]
     fn take_modified_empties_the_list() {
-        let (_clock, mut db) = fixture();
-        db.set(k(b"k"), k(b"v"), None).unwrap();
-        assert_eq!(db.take_modified(), vec![k(b"k")]);
+        let (_clock, mut db) = db_and_clock();
+        db.set(b("k"), b("v"), None).unwrap();
+        assert_eq!(db.take_modified(), vec![b("k")]);
         assert_eq!(db.take_modified(), Vec::<Bytes>::new());
     }
 }

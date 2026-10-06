@@ -5,3 +5,5 @@ pub mod db;
 pub mod int;
 pub mod keyspace;
 pub mod resp;
+#[cfg(test)]
+mod test_support;

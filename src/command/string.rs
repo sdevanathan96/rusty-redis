@@ -89,16 +89,16 @@ pub(super) fn incr(key: &Bytes, db: &mut Db) -> Result<Value, CommandError> {
 
 #[cfg(test)]
 mod string_tests {
-    use super::super::test_support::{cmd, cmd_ok};
     use super::*;
+    use crate::test_support::{b, cmd, cmd_ok};
 
     #[test]
     fn option_keyword_is_case_insensitive() {
         assert_eq!(
-            cmd_ok(b"*5\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\npx\r\n$3\r\n100\r\n"),
+            cmd_ok(&["set", "k", "v", "px", "100"]),
             Command::Set {
-                key: Bytes::from_static(b"k"),
-                value: Bytes::from_static(b"v"),
+                key: b("k"),
+                value: b("v"),
                 expiry: Some(Duration::from_millis(100)),
             }
         );
@@ -106,8 +106,8 @@ mod string_tests {
 
     #[test]
     fn ex_is_seconds_px_is_millis() {
-        let ex = cmd_ok(b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$1\r\n1\r\n");
-        let px = cmd_ok(b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n$1\r\n1\r\n");
+        let ex = cmd_ok(&["SET", "k", "v", "EX", "1"]);
+        let px = cmd_ok(&["SET", "k", "v", "PX", "1"]);
         match (ex, px) {
             (
                 Command::Set {
@@ -127,10 +127,10 @@ mod string_tests {
     #[test]
     fn set_without_expiry_has_none() {
         assert_eq!(
-            cmd_ok(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"),
+            cmd_ok(&["SET", "k", "v"]),
             Command::Set {
-                key: Bytes::from_static(b"k"),
-                value: Bytes::from_static(b"v"),
+                key: b("k"),
+                value: b("v"),
                 expiry: None,
             }
         );
@@ -139,19 +139,19 @@ mod string_tests {
     #[test]
     fn expiry_errors_are_distinct() {
         assert!(matches!(
-            cmd(b"*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n"),
+            cmd(&["SET", "k", "v", "PX"]),
             Err(CommandError::Syntax)
         ));
         assert!(matches!(
-            cmd(b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n$3\r\nabc\r\n"),
+            cmd(&["SET", "k", "v", "PX", "abc"]),
             Err(CommandError::NotAnInteger)
         ));
         assert!(matches!(
-            cmd(b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n$1\r\n0\r\n"),
+            cmd(&["SET", "k", "v", "PX", "0"]),
             Err(CommandError::InvalidExpiry(_))
         ));
         assert!(matches!(
-            cmd(b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nZZ\r\n$1\r\n5\r\n"),
+            cmd(&["SET", "k", "v", "ZZ", "5"]),
             Err(CommandError::Syntax)
         ));
     }
@@ -159,7 +159,7 @@ mod string_tests {
     #[test]
     fn conflicting_expiry_options_are_rejected() {
         assert!(matches!(
-            cmd(b"*7\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n$3\r\n100\r\n$2\r\nEX\r\n$1\r\n5\r\n"),
+            cmd(&["SET", "k", "v", "PX", "100", "EX", "5"]),
             Err(CommandError::Syntax)
         ));
     }

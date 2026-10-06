@@ -266,6 +266,7 @@ src/
   db/            clocks, and each data type's storage (string, list, stream)
   keyspace.rs    single task owning the keyspace; blocking-command wakeups
   keyspace/      the WATCH table
+  test_support.rs  helpers shared by the unit tests
 test.sh          differential tests against redis-server
 bench/           benchmark against redis-server, and its reports
 fuzz/            cargo-fuzz targets

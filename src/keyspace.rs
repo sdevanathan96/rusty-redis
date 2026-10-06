@@ -197,8 +197,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::command::test_support::cmd_ok;
     use crate::db::TestClock;
+    use crate::test_support::{b, bulk, cmd_ok, db_and_clock};
 
     /// The task's state, fed through `process` as the task's loop does.
     struct Keyspace {
@@ -210,10 +210,10 @@ mod tests {
 
     impl Keyspace {
         fn new() -> Self {
-            let clock = Arc::new(TestClock::new());
+            let (clock, db) = db_and_clock();
             Keyspace {
-                db: Db::with_clock(clock.clone()),
                 clock,
+                db,
                 waiters: VecDeque::new(),
                 watches: Watches::default(),
             }
@@ -226,7 +226,7 @@ mod tests {
         fn run(&mut self, conn: u64, parts: &[&str]) -> Value {
             let (reply, mut rx) = mpsc::unbounded_channel();
             self.send(Request::Run {
-                cmd: cmd(parts),
+                cmd: cmd_ok(parts),
                 reply,
                 conn,
             });
@@ -245,21 +245,12 @@ mod tests {
         fn exec(&mut self, conn: u64, cmds: &[&[&str]]) -> Value {
             let (reply, mut rx) = mpsc::unbounded_channel();
             self.send(Request::Exec {
-                cmds: cmds.iter().map(|parts| Ok(cmd(parts))).collect(),
+                cmds: cmds.iter().map(|parts| Ok(cmd_ok(parts))).collect(),
                 reply,
                 conn,
             });
             rx.try_recv().expect("EXEC always replies at once")
         }
-    }
-
-    fn blpop_forever(key: &str) -> Command {
-        let raw = format!(
-            "*3\r\n$5\r\nBLPOP\r\n${}\r\n{}\r\n$1\r\n0\r\n",
-            key.len(),
-            key
-        );
-        cmd_ok(raw.as_bytes())
     }
 
     #[test]
@@ -268,7 +259,7 @@ mod tests {
         let (reply, _rx) = mpsc::unbounded_channel();
 
         ks.send(Request::Run {
-            cmd: blpop_forever("k"),
+            cmd: cmd_ok(&["BLPOP", "k", "0"]),
             reply,
             conn: 7,
         });
@@ -284,24 +275,12 @@ mod tests {
         let (reply, _rx) = mpsc::unbounded_channel();
 
         ks.send(Request::Run {
-            cmd: blpop_forever("k"),
+            cmd: cmd_ok(&["BLPOP", "k", "0"]),
             reply,
             conn: 7,
         });
         ks.send(Request::Gone { conn: 8 });
         assert_eq!(ks.waiters.len(), 1, "a stale or duplicate Gone is harmless");
-    }
-
-    fn cmd(parts: &[&str]) -> Command {
-        let mut raw = format!("*{}\r\n", parts.len());
-        for p in parts {
-            raw += &format!("${}\r\n{}\r\n", p.len(), p);
-        }
-        cmd_ok(raw.as_bytes())
-    }
-
-    fn bulk(s: &'static str) -> Value {
-        Value::BulkString(Bytes::from_static(s.as_bytes()))
     }
 
     #[test]
@@ -310,7 +289,7 @@ mod tests {
         let (reply, mut rx) = mpsc::unbounded_channel();
 
         ks.send(Request::Exec {
-            cmds: vec![Ok(blpop_forever("k"))],
+            cmds: vec![Ok(cmd_ok(&["BLPOP", "k", "0"]))],
             reply,
             conn: 1,
         });
@@ -325,8 +304,8 @@ mod tests {
         let (reply, mut rx) = mpsc::unbounded_channel();
         let cmds = vec![
             Err(CommandError::Syntax),
-            Ok(cmd(&["SET", "k", "1"])),
-            Ok(cmd(&["GET", "k"])),
+            Ok(cmd_ok(&["SET", "k", "1"])),
+            Ok(cmd_ok(&["GET", "k"])),
         ];
 
         ks.send(Request::Exec {
@@ -348,14 +327,17 @@ mod tests {
         let mut ks = Keyspace::new();
         let (waiter_reply, mut waiter_rx) = mpsc::unbounded_channel();
         ks.send(Request::Run {
-            cmd: blpop_forever("k"),
+            cmd: cmd_ok(&["BLPOP", "k", "0"]),
             reply: waiter_reply,
             conn: 1,
         });
         assert_eq!(ks.waiters.len(), 1);
 
         let (reply, mut rx) = mpsc::unbounded_channel();
-        let cmds = vec![Ok(cmd(&["RPUSH", "k", "x", "y"])), Ok(cmd(&["LLEN", "k"]))];
+        let cmds = vec![
+            Ok(cmd_ok(&["RPUSH", "k", "x", "y"])),
+            Ok(cmd_ok(&["LLEN", "k"])),
+        ];
         ks.send(Request::Exec {
             cmds,
             reply,
@@ -377,7 +359,7 @@ mod tests {
     // WATCH
 
     fn pong() -> Value {
-        Value::SimpleString(Bytes::from_static(b"PONG"))
+        Value::SimpleString(b("PONG"))
     }
 
     fn ran(replies: Vec<Value>) -> Value {
@@ -452,7 +434,7 @@ mod tests {
         let mut ks = Keyspace::new();
         let (reply, _rx) = mpsc::unbounded_channel();
         ks.send(Request::Run {
-            cmd: cmd(&["BLMOVE", "src", "dst", "LEFT", "RIGHT", "0"]),
+            cmd: cmd_ok(&["BLMOVE", "src", "dst", "LEFT", "RIGHT", "0"]),
             reply,
             conn: 3,
         });

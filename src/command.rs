@@ -22,11 +22,11 @@ pub enum Outcome {
     Block { keys: Vec<Bytes>, retry: Command },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Blocking {
-    No,
+/// How long a blocking command waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Timeout {
     Forever,
-    For(Duration),
+    After(Duration),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -76,7 +76,7 @@ pub enum Command {
     },
     BPop {
         keys: Vec<Bytes>,
-        timeout: Option<Duration>,
+        timeout: Timeout,
         from: End,
     },
     BLMove {
@@ -84,7 +84,7 @@ pub enum Command {
         dst: Bytes,
         from: End,
         to: End,
-        timeout: Option<Duration>,
+        timeout: Timeout,
     },
     XAdd {
         key: Bytes,
@@ -104,7 +104,8 @@ pub enum Command {
     },
     XRead {
         count: Option<i64>,
-        timeout: Blocking,
+        /// `None` without BLOCK.
+        block: Option<Timeout>,
         streams: Vec<(Bytes, ReadFrom)>,
     },
     XDel {
@@ -132,7 +133,7 @@ pub enum Command {
 }
 
 pub struct BlockSpec {
-    pub timeout: Option<Duration>, // None means forever
+    pub timeout: Timeout,
     pub on_timeout: Value,
 }
 
@@ -166,19 +167,12 @@ impl Command {
                 feeds: vec![key.clone()],
                 blocks: None,
             },
-            Command::XRead { timeout, .. } => Meta {
+            Command::XRead { block, .. } => Meta {
                 feeds: vec![],
-                blocks: match timeout {
-                    Blocking::No => None,
-                    Blocking::Forever => Some(BlockSpec {
-                        timeout: None,
-                        on_timeout: Value::NullArray,
-                    }),
-                    Blocking::For(d) => Some(BlockSpec {
-                        timeout: Some(*d),
-                        on_timeout: Value::NullArray,
-                    }),
-                },
+                blocks: block.map(|timeout| BlockSpec {
+                    timeout,
+                    on_timeout: Value::NullArray,
+                }),
             },
             Command::Ping(_)
             | Command::Echo(_)
@@ -300,9 +294,9 @@ pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError> {
         } => stream::xrange(&key, start, stop, count, db),
         Command::XRead {
             count,
-            timeout,
+            block,
             streams,
-        } => stream::xread(count, timeout, streams, db),
+        } => stream::xread(count, block, streams, db),
         Command::XDel { key, ids } => stream::xdel(&key, &ids, db),
         Command::XTrim { key, trim } => stream::xtrim(&key, &trim, db),
         Command::Incr { key } => Ok(Outcome::Reply(string::incr(&key, db)?)),
@@ -318,43 +312,26 @@ pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError> {
 }
 
 #[cfg(test)]
-pub(super) mod test_support {
-    use super::*;
-    use crate::db::{Db, TestClock};
-    use crate::resp::parse;
-    use std::sync::Arc;
-
-    pub(crate) fn cmd(bytes: &[u8]) -> Result<Option<Command>, CommandError> {
-        let (n, frame) = parse(bytes).unwrap().unwrap();
-        let owned = Bytes::copy_from_slice(&bytes[..n]);
-        to_command(frame.into_value(&owned))
-    }
-    pub(crate) fn cmd_ok(bytes: &[u8]) -> Command {
-        cmd(bytes).unwrap().expect("expected a command")
-    }
-    pub(crate) fn db() -> Db {
-        Db::with_clock(Arc::new(TestClock::new()))
-    }
-}
-
-#[cfg(test)]
 mod command_tests {
     use super::*;
-    use crate::command::test_support::{cmd, cmd_ok, db};
     use crate::resp::{encode, parse};
+    use crate::test_support::{b, cmd, cmd_ok, db, parse_raw};
 
     #[test]
     fn command_name_is_case_insensitive() {
-        assert_eq!(cmd_ok(b"*1\r\n$4\r\nPING\r\n"), Command::Ping(None));
-        assert_eq!(cmd_ok(b"*1\r\n$4\r\nping\r\n"), Command::Ping(None));
-        assert_eq!(cmd_ok(b"*1\r\n$4\r\nPiNg\r\n"), Command::Ping(None));
+        assert_eq!(cmd_ok(&["PING"]), Command::Ping(None));
+        assert_eq!(cmd_ok(&["ping"]), Command::Ping(None));
+        assert_eq!(cmd_ok(&["PiNg"]), Command::Ping(None));
     }
 
     #[test]
     fn request_must_be_an_array_of_bulk_strings() {
-        assert!(matches!(cmd(b":5\r\n"), Err(CommandError::NotAnArray)));
         assert!(matches!(
-            cmd(b"*1\r\n:5\r\n"),
+            parse_raw(b":5\r\n"),
+            Err(CommandError::NotAnArray)
+        ));
+        assert!(matches!(
+            parse_raw(b"*1\r\n:5\r\n"),
             Err(CommandError::NotBulkString)
         ));
     }
@@ -362,48 +339,30 @@ mod command_tests {
     /// `*0\r\n` is a valid frame that Redis consumes without replying.
     #[test]
     fn empty_array_produces_no_command_and_no_error() {
-        assert_eq!(cmd(b"*0\r\n"), Ok(None));
+        assert_eq!(cmd(&[]), Ok(None));
     }
 
     #[test]
     fn arity_errors() {
-        for frame in [
-            &b"*1\r\n$4\r\nECHO\r\n"[..],
-            &b"*3\r\n$4\r\nECHO\r\n$1\r\na\r\n$1\r\nb\r\n"[..],
-            &b"*2\r\n$3\r\nSET\r\n$1\r\nk\r\n"[..],
-            &b"*1\r\n$5\r\nRPUSH\r\n"[..],
-            &b"*2\r\n$5\r\nRPUSH\r\n$1\r\nk\r\n"[..],
-            &b"*4\r\n$5\r\nLMOVE\r\n$1\r\na\r\n$1\r\nb\r\n$4\r\nLEFT\r\n"[..],
+        for parts in [
+            &["ECHO"][..],
+            &["ECHO", "a", "b"],
+            &["SET", "k"],
+            &["RPUSH"],
+            &["RPUSH", "k"],
+            &["LMOVE", "a", "b", "LEFT"],
         ] {
             assert!(
-                matches!(cmd(frame), Err(CommandError::WrongArity(_))),
-                "expected WrongArity for {frame:?}"
+                matches!(cmd(parts), Err(CommandError::WrongArity(_))),
+                "expected WrongArity for {parts:?}"
             );
         }
     }
 
     #[test]
-    fn ping_and_echo_reply_with_different_types() {
-        let mut d = db();
-        // bare PING is a simple string, PING <msg> is a bulk string
-        assert_eq!(
-            execute(Command::Ping(None), &mut d).unwrap(),
-            Outcome::Reply(Value::SimpleString(Bytes::from_static(b"PONG")))
-        );
-        assert_eq!(
-            execute(Command::Ping(Some(Bytes::from_static(b"hi"))), &mut d).unwrap(),
-            Outcome::Reply(Value::BulkString(Bytes::from_static(b"hi")))
-        );
-        assert_eq!(
-            execute(Command::Echo(Bytes::from_static(b"hi")), &mut d).unwrap(),
-            Outcome::Reply(Value::BulkString(Bytes::from_static(b"hi")))
-        );
-    }
-
-    #[test]
     fn get_missing_key_is_null_bulk_string() {
         let mut d = db();
-        let c = cmd_ok(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
+        let c = cmd_ok(&["GET", "k"]);
         assert_eq!(
             execute(c, &mut d).unwrap(),
             Outcome::Reply(Value::NullBulkString)
@@ -413,17 +372,17 @@ mod command_tests {
     #[test]
     fn set_then_get_round_trip_through_the_command_layer() {
         let mut d = db();
-        execute(cmd_ok(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"), &mut d).unwrap();
+        execute(cmd_ok(&["SET", "k", "v"]), &mut d).unwrap();
         assert_eq!(
-            execute(cmd_ok(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"), &mut d).unwrap(),
-            Outcome::Reply(Value::BulkString(Bytes::from_static(b"v")))
+            execute(cmd_ok(&["GET", "k"]), &mut d).unwrap(),
+            Outcome::Reply(Value::BulkString(b("v")))
         );
     }
 
     #[test]
     fn unknown_command_carries_its_arguments() {
         let mut d = db();
-        let c = cmd_ok(b"*2\r\n$3\r\nFOO\r\n$3\r\nbar\r\n");
+        let c = cmd_ok(&["FOO", "bar"]);
         let msg = execute(c, &mut d).unwrap_err().to_resp();
         let text = String::from_utf8_lossy(&msg);
         assert!(text.starts_with("ERR unknown command 'FOO'"), "{text}");
@@ -436,7 +395,7 @@ mod command_tests {
         let mut d = db();
         let err = execute(
             Command::Unknown {
-                name: Bytes::from_static(b"FOO"),
+                name: b("FOO"),
                 args: vec![],
             },
             &mut d,
@@ -480,11 +439,11 @@ mod command_tests {
             CommandError::NotAnInteger,
             CommandError::OutOfRange,
             CommandError::WrongType,
-            CommandError::WrongArity(Bytes::from_static(b"SET")),
-            CommandError::InvalidExpiry(Bytes::from_static(b"SET")),
+            CommandError::WrongArity(b("SET")),
+            CommandError::InvalidExpiry(b("SET")),
             CommandError::UnknownCommand {
-                name: Bytes::from_static(b"FOO"),
-                args: vec![Bytes::from_static(b"a")],
+                name: b("FOO"),
+                args: vec![b("a")],
             },
         ] {
             let msg = e.to_resp();

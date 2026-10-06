@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use super::{Blocking, CommandError};
+use super::{CommandError, Timeout};
 use crate::db::End;
 use crate::int::strict_i64;
 
@@ -56,10 +56,9 @@ pub(super) fn parse_end(raw: &[u8]) -> Result<End, CommandError> {
     }
 }
 
-/// A BLPOP style timeout in seconds, where 0 means forever (`None`). The
-/// order of the checks decides Redis's message: `-inf` is "negative", not
-/// "out of range".
-pub(super) fn parse_timeout(raw: &[u8]) -> Result<Option<Duration>, CommandError> {
+/// A BLPOP style timeout in seconds, where 0 means forever. The order of the
+/// checks decides Redis's message: `-inf` is "negative", not "out of range".
+pub(super) fn parse_timeout(raw: &[u8]) -> Result<Timeout, CommandError> {
     let text = std::str::from_utf8(raw).map_err(|_| CommandError::TimeoutNotAFloat)?;
     let seconds: f64 = text.parse().map_err(|_| CommandError::TimeoutNotAFloat)?;
     if seconds.is_nan() {
@@ -69,16 +68,16 @@ pub(super) fn parse_timeout(raw: &[u8]) -> Result<Option<Duration>, CommandError
         return Err(CommandError::TimeoutNegative);
     }
     if seconds == 0.0 {
-        return Ok(None);
+        return Ok(Timeout::Forever);
     }
     // try_ because from_secs_f64 panics on infinity and huge values.
     Duration::try_from_secs_f64(seconds)
-        .map(Some)
+        .map(Timeout::After)
         .map_err(|_| CommandError::TimeoutOutOfRange)
 }
 
 /// An XREAD `BLOCK` in milliseconds, where 0 means forever.
-pub(super) fn parse_block(raw: &[u8]) -> Result<Blocking, CommandError> {
+pub(super) fn parse_block(raw: &[u8]) -> Result<Timeout, CommandError> {
     const MAX_BLOCK_MS: i64 = i64::MAX - (1 << 42);
     let millis = strict_i64(raw).ok_or(CommandError::TimeoutNotAnInteger)?;
     if millis < 0 {
@@ -88,7 +87,7 @@ pub(super) fn parse_block(raw: &[u8]) -> Result<Blocking, CommandError> {
         return Err(CommandError::TimeoutOutOfRange);
     }
     Ok(match millis {
-        0 => Blocking::Forever,
-        ms => Blocking::For(Duration::from_millis(ms as u64)),
+        0 => Timeout::Forever,
+        ms => Timeout::After(Duration::from_millis(ms as u64)),
     })
 }

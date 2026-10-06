@@ -5,7 +5,6 @@ mod pending;
 mod transaction;
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,11 +12,11 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-use crate::command::{BlockSpec, Command, CommandError};
+use crate::command::{BlockSpec, Command, CommandError, Timeout};
 use crate::keyspace::Request;
 use crate::resp::{self, Value};
 use pending::{Parsed, Pending, parse_into};
-use transaction::{Transaction, queue_in};
+use transaction::Transaction;
 
 /// Flush replies early once this many bytes are waiting.
 const OUTBUF_FLUSH_AT: usize = 64 * 1024;
@@ -43,6 +42,8 @@ fn next_id() -> u64 {
 
 struct Conn {
     id: u64,
+    /// Requests to the keyspace task.
+    tx: mpsc::Sender<Request>,
     stream: TcpStream,
     inbuf: BytesMut,
     outbuf: BytesMut,
@@ -56,11 +57,21 @@ struct Conn {
     watching: bool,
 }
 
+/// Serves one client until it disconnects, then drops its watches however
+/// `serve` returned.
+pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std::io::Result<()> {
+    let mut conn = Conn::new(stream, tx);
+    let result = conn.serve().await;
+    conn.unwatch().await;
+    result
+}
+
 impl Conn {
-    fn new(stream: TcpStream) -> Self {
+    fn new(stream: TcpStream, tx: mpsc::Sender<Request>) -> Self {
         let (reply_tx, reply_rx) = mpsc::unbounded_channel();
         Conn {
             id: next_id(),
+            tx,
             stream,
             inbuf: BytesMut::with_capacity(READ_CHUNK),
             outbuf: BytesMut::with_capacity(READ_CHUNK),
@@ -69,6 +80,54 @@ impl Conn {
             pending: Pending::new(),
             transaction: None,
             watching: false,
+        }
+    }
+
+    async fn serve(&mut self) -> std::io::Result<()> {
+        loop {
+            parse_into(&mut self.inbuf, &mut self.pending);
+            while let Some((item, size)) = self.pending.pop() {
+                let reply = match item {
+                    Parsed::ProtocolError(err) => {
+                        self.reply(&err);
+                        self.flush().await?;
+                        return Ok(());
+                    }
+                    // These act at once, inside MULTI or not.
+                    Parsed::Run(Command::Multi) => Some(self.multi()),
+                    Parsed::Run(Command::Exec) => self.exec().await,
+                    Parsed::Run(Command::Discard) => Some(self.discard().await),
+                    Parsed::Run(Command::Watch { keys }) => self.watch(keys).await,
+                    Parsed::Error(e @ CommandError::ExecAbortRejected(_)) => {
+                        Some(self.reject_exec(e).await)
+                    }
+                    // Inside MULTI, everything else is queued.
+                    item if self.transaction.is_some() => Some(self.queue(item, size)),
+                    Parsed::Run(Command::Unwatch) => {
+                        self.unwatch().await;
+                        Some(Value::ok())
+                    }
+                    Parsed::Run(cmd) => self.run(cmd).await?,
+                    Parsed::Error(err) => Some(Value::Error(err.to_resp())),
+                };
+                // The keyspace task is gone, or the client left while parked.
+                let Some(reply) = reply else {
+                    return Ok(());
+                };
+                self.reply(&reply);
+                if self.outbuf.len() >= OUTBUF_FLUSH_AT {
+                    self.flush().await?;
+                }
+            }
+
+            self.flush().await?;
+            self.inbuf.reserve(READ_CHUNK);
+            if self.stream.read_buf(&mut self.inbuf).await? == 0 {
+                return Ok(());
+            }
+            if self.held() > MAX_QUERY_BUF {
+                return Err(query_buf_limit());
+            }
         }
     }
 
@@ -91,216 +150,83 @@ impl Conn {
         self.inbuf.len() + self.pending.bytes() + in_multi
     }
 
-    /// A failed send needs no handling: the watches went with the keyspace
-    /// task.
-    async fn unwatch(&mut self, tx: &mpsc::Sender<Request>) {
-        if self.watching {
-            self.watching = false;
-            let _ = tx.send(Request::Unwatch { conn: self.id }).await;
+    async fn run(&mut self, cmd: Command) -> std::io::Result<Option<Value>> {
+        let blocks = cmd.meta().blocks;
+        // Earlier pipelined replies go out before parking, as in Redis.
+        if blocks.is_some() {
+            self.flush().await?;
+        }
+        let request = Request::Run {
+            cmd,
+            reply: self.reply_tx.clone(),
+            conn: self.id,
+        };
+        if self.tx.send(request).await.is_err() {
+            return Ok(None);
+        }
+        match blocks {
+            Some(BlockSpec {
+                timeout,
+                on_timeout,
+            }) => self.wait_parked(timeout, on_timeout).await,
+            None => Ok(self.reply_rx.recv().await),
         }
     }
-}
 
-/// Serves one client until it disconnects, then drops its watches however
-/// `serve` returned.
-pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std::io::Result<()> {
-    let mut conn = Conn::new(stream);
-    let result = serve(&mut conn, &tx).await;
-    conn.unwatch(&tx).await;
-    result
-}
-
-async fn serve(conn: &mut Conn, tx: &mpsc::Sender<Request>) -> std::io::Result<()> {
-    loop {
-        parse_into(&mut conn.inbuf, &mut conn.pending);
-        while let Some((item, size)) = conn.pending.pop() {
-            match item {
-                Parsed::ProtocolError(err) => {
-                    conn.reply(&err);
-                    conn.flush().await?;
-                    return Ok(());
-                }
-
-                Parsed::Run(Command::Multi) => {
-                    let reply = if conn.transaction.is_some() {
-                        Value::Error(CommandError::NestedMulti.to_resp())
-                    } else {
-                        conn.transaction = Some(Transaction::default());
-                        Value::ok()
-                    };
-                    conn.reply(&reply);
-                }
-
-                Parsed::Run(Command::Exec) => match conn.transaction.take() {
-                    None => conn.reply(&Value::Error(CommandError::ExecWithoutMulti.to_resp())),
-                    Some(t) if t.failed => {
-                        conn.unwatch(tx).await;
-                        let abort = CommandError::ExecAbortPreviousErrors;
-                        conn.reply(&Value::Error(abort.to_resp()));
-                    }
-                    Some(t) => {
-                        let request = Request::Exec {
-                            cmds: t.commands,
-                            reply: conn.reply_tx.clone(),
-                            conn: conn.id,
-                        };
-                        if tx.send(request).await.is_err() {
-                            return Ok(()); // keyspace task is gone
-                        }
-                        conn.watching = false; // Exec drops them
-                        match conn.reply_rx.recv().await {
-                            Some(v) => conn.reply(&v),
-                            None => return Ok(()),
-                        }
-                    }
-                },
-
-                Parsed::Run(Command::Discard) => {
-                    let reply = match conn.transaction.take() {
-                        Some(_) => {
-                            conn.unwatch(tx).await;
-                            Value::ok()
-                        }
-                        // Without MULTI the watches stay.
-                        None => Value::Error(CommandError::DiscardWithoutMulti.to_resp()),
-                    };
-                    conn.reply(&reply);
-                }
-
-                // Ends the transaction and the watches, inside MULTI or not.
-                Parsed::Error(e @ CommandError::ExecAbortRejected(_)) => {
-                    conn.unwatch(tx).await;
-                    conn.transaction = None;
-                    conn.reply(&Value::Error(e.to_resp()));
-                }
-
-                // Inside MULTI, refused without failing the transaction.
-                Parsed::Run(Command::Watch { keys }) => {
-                    if conn.transaction.is_some() {
-                        conn.reply(&Value::Error(CommandError::WatchInsideMulti.to_resp()));
-                    } else {
-                        let request = Request::Watch {
-                            conn: conn.id,
-                            keys,
-                        };
-                        if tx.send(request).await.is_err() {
-                            return Ok(()); // keyspace task is gone
-                        }
-                        conn.watching = true;
-                        conn.reply(&Value::ok());
-                    }
-                }
-
-                // Inside MULTI, everything else is queued.
-                item if conn.transaction.is_some() => {
-                    let reply = queue_in(conn.transaction.as_mut().unwrap(), item, size);
-                    conn.reply(&reply);
-                }
-
-                Parsed::Run(Command::Unwatch) => {
-                    conn.unwatch(tx).await;
-                    conn.reply(&Value::ok());
-                }
-
-                Parsed::Run(cmd) => {
-                    let deadline = cmd.meta().blocks;
-                    // Earlier pipelined replies go out before parking, as in Redis.
-                    if deadline.is_some() {
-                        conn.flush().await?;
-                    }
-
-                    let request = Request::Run {
-                        cmd,
-                        reply: conn.reply_tx.clone(),
-                        conn: conn.id,
-                    };
-                    if tx.send(request).await.is_err() {
-                        return Ok(()); // keyspace task is gone
-                    }
-
-                    let received = match deadline {
-                        Some(BlockSpec {
-                            timeout,
-                            on_timeout,
-                        }) => wait_parked(conn, tx, timeout, on_timeout).await?,
-                        None => conn.reply_rx.recv().await,
-                    };
-
-                    match received {
-                        Some(v) => conn.reply(&v),
-                        None => return Ok(()),
-                    }
-                }
-
-                Parsed::Error(err) => conn.reply(&Value::Error(err.to_resp())),
-            }
-
-            if conn.outbuf.len() >= OUTBUF_FLUSH_AT {
-                conn.flush().await?;
-            }
+    /// Any exit without a reply removes the waiter, so a `?` cannot leave it
+    /// behind.
+    async fn wait_parked(
+        &mut self,
+        timeout: Timeout,
+        on_timeout: Value,
+    ) -> std::io::Result<Option<Value>> {
+        let result = self.wait_for_reply(timeout, on_timeout).await;
+        if !matches!(result, Ok(Some(_))) {
+            let _ = self.tx.send(Request::Gone { conn: self.id }).await;
         }
-
-        conn.flush().await?;
-        conn.inbuf.reserve(READ_CHUNK);
-        if conn.stream.read_buf(&mut conn.inbuf).await? == 0 {
-            return Ok(());
-        }
-        if conn.held() > MAX_QUERY_BUF {
-            return Err(query_buf_limit());
-        }
+        result
     }
-}
 
-/// Waits for a parked command's reply. Any exit without one removes the
-/// waiter, so a `?` cannot leave it behind.
-async fn wait_parked(
-    conn: &mut Conn,
-    tx: &mpsc::Sender<Request>,
-    timeout: Option<Duration>,
-    on_timeout: Value,
-) -> std::io::Result<Option<Value>> {
-    let result = wait_for_reply(conn, tx, timeout, on_timeout).await;
-    if !matches!(result, Ok(Some(_))) {
-        let _ = tx.send(Request::Gone { conn: conn.id }).await;
-    }
-    result
-}
-
-/// Waits on the reply, the socket and the timer together. Input that arrives
-/// meanwhile is parsed but not run.
-async fn wait_for_reply(
-    conn: &mut Conn,
-    tx: &mpsc::Sender<Request>,
-    timeout: Option<Duration>,
-    on_timeout: Value,
-) -> std::io::Result<Option<Value>> {
-    let timer = sleep(timeout.unwrap_or_default());
-    tokio::pin!(timer);
-    let mut on_timeout = timeout.map(|_| on_timeout); // None: no timer, or it fired
-
-    loop {
-        conn.inbuf.reserve(READ_CHUNK);
-        tokio::select! {
-            reply = conn.reply_rx.recv() => return Ok(reply),
-            read = conn.stream.read_buf(&mut conn.inbuf) => {
-                if read? == 0 {
-                    return Ok(None);
-                }
-                if conn.held() > MAX_QUERY_BUF {
-                    return Err(query_buf_limit());
-                }
-                parse_into(&mut conn.inbuf, &mut conn.pending);
+    /// Waits on the reply, the socket and the timer together. Input that
+    /// arrives meanwhile is parsed but not run.
+    async fn wait_for_reply(
+        &mut self,
+        timeout: Timeout,
+        on_timeout: Value,
+    ) -> std::io::Result<Option<Value>> {
+        let timer = async move {
+            match timeout {
+                Timeout::After(d) => sleep(d).await,
+                Timeout::Forever => std::future::pending().await,
             }
-            () = &mut timer, if on_timeout.is_some() => {
-                // The keyspace task sends the reply: a push may have served
-                // the waiter already.
-                let on_timeout = on_timeout.take().expect("guarded by the branch condition");
-                let unpark = Request::Unpark {
-                    conn: conn.id,
-                    on_timeout,
-                };
-                if tx.send(unpark).await.is_err() {
-                    return Ok(None);
+        };
+        tokio::pin!(timer);
+        let mut on_timeout = Some(on_timeout); // taken when the timer fires
+
+        loop {
+            self.inbuf.reserve(READ_CHUNK);
+            tokio::select! {
+                reply = self.reply_rx.recv() => return Ok(reply),
+                read = self.stream.read_buf(&mut self.inbuf) => {
+                    if read? == 0 {
+                        return Ok(None);
+                    }
+                    if self.held() > MAX_QUERY_BUF {
+                        return Err(query_buf_limit());
+                    }
+                    parse_into(&mut self.inbuf, &mut self.pending);
+                }
+                () = &mut timer, if on_timeout.is_some() => {
+                    // The keyspace task sends the reply: a push may have
+                    // served the waiter already.
+                    let on_timeout = on_timeout.take().expect("guarded by the branch condition");
+                    let unpark = Request::Unpark {
+                        conn: self.id,
+                        on_timeout,
+                    };
+                    if self.tx.send(unpark).await.is_err() {
+                        return Ok(None);
+                    }
                 }
             }
         }
