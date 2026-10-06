@@ -126,6 +126,10 @@ pub enum Command {
         name: Bytes,
         args: Vec<Bytes>,
     },
+    Watch {
+        keys: Vec<Bytes>,
+    },
+    Unwatch,
 }
 
 pub struct BlockSpec {
@@ -196,6 +200,8 @@ impl Command {
             | Command::Unknown { .. }
             | Command::Exec
             | Command::Discard
+            | Command::Watch { .. }
+            | Command::Unwatch
             | Command::Multi => Meta {
                 feeds: vec![],
                 blocks: None,
@@ -311,7 +317,14 @@ pub fn execute(cmd: Command, db: &mut Db) -> Result<Outcome, CommandError> {
         // Never reached: the connection intercepts these before anything goes
         // to the keyspace task. An error rather than unreachable!(), because a
         // panic here would stop the whole server.
-        Command::Multi | Command::Exec | Command::Discard => Err(CommandError::HandledByConnection),
+        Command::Multi | Command::Exec | Command::Discard | Command::Watch { .. } => {
+            Err(CommandError::HandledByConnection)
+        }
+        // Reached only inside EXEC, which has already dropped the watches, so
+        // there is nothing left to do.
+        Command::Unwatch => Ok(Outcome::Reply(Value::SimpleString(Bytes::from_static(
+            b"OK",
+        )))),
     }
 }
 

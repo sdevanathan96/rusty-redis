@@ -20,6 +20,8 @@ pub(super) fn try_parse(
         b"EXEC" => no_args(rest, name, Command::Exec)
             .map_err(|e| CommandError::ExecAbortRejected(Box::new(e))),
         b"DISCARD" => no_args(rest, name, Command::Discard),
+        b"UNWATCH" => no_args(rest, name, Command::Unwatch),
+        b"WATCH" => watch_command(rest, name),
         _ => return None,
     })
 }
@@ -69,6 +71,15 @@ fn no_args(rest: &[Bytes], name: &Bytes, cmd: Command) -> Result<Command, Comman
         Ok(cmd)
     } else {
         Err(CommandError::WrongArity(name.clone()))
+    }
+}
+
+fn watch_command(rest: &[Bytes], name: &Bytes) -> Result<Command, CommandError> {
+    match rest {
+        [] => Err(CommandError::WrongArity(name.clone())),
+        keys => Ok(Command::Watch {
+            keys: keys.to_vec(),
+        }),
     }
 }
 

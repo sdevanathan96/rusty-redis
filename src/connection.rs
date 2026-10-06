@@ -66,6 +66,9 @@ struct Conn {
     reply_rx: mpsc::UnboundedReceiver<Value>,
     pending: Pending,
     transaction: Option<Transaction>,
+    /// The keyspace task holds watches for this connection. Lets UNWATCH,
+    /// DISCARD and disconnect skip the request when there are none.
+    watching: bool,
 }
 
 impl Conn {
@@ -80,6 +83,7 @@ impl Conn {
             reply_rx,
             pending: Pending::new(),
             transaction: None,
+            watching: false,
         }
     }
 
@@ -102,11 +106,29 @@ impl Conn {
         let in_multi = self.transaction.as_ref().map_or(0, |t| t.bytes);
         self.inbuf.len() + self.pending.bytes() + in_multi
     }
+
+    /// Drops this connection's watches, if it has any. If the keyspace task
+    /// is gone, the watches went with it, so a failed send needs no handling.
+    async fn unwatch(&mut self, tx: &mpsc::Sender<Request>) {
+        if self.watching {
+            self.watching = false;
+            let _ = tx.send(Request::Unwatch { conn: self.id }).await;
+        }
+    }
 }
 
 /// Serves one client until it disconnects. `tx` reaches the keyspace task.
+/// However the connection ends, its watches go with it. The cleanup lives
+/// here rather than at each exit so a `?` cannot skip it, as in `wait_parked`.
 pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std::io::Result<()> {
     let mut conn = Conn::new(stream);
+    let result = serve(&mut conn, &tx).await;
+    conn.unwatch(&tx).await;
+    result
+}
+
+/// Reads, parses, and acts on each request in the order it arrived.
+async fn serve(conn: &mut Conn, tx: &mpsc::Sender<Request>) -> std::io::Result<()> {
     loop {
         parse_into(&mut conn.inbuf, &mut conn.pending);
         while let Some((item, size)) = conn.pending.pop() {
@@ -129,9 +151,11 @@ pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std:
 
                 Parsed::Run(Command::Exec) => match conn.transaction.take() {
                     None => conn.reply(&Value::Error(CommandError::ExecWithoutMulti.to_resp())),
-                    Some(t) if t.failed => conn.reply(&Value::Error(
-                        CommandError::ExecAbortPreviousErrors.to_resp(),
-                    )),
+                    Some(t) if t.failed => {
+                        conn.unwatch(tx).await;
+                        let abort = CommandError::ExecAbortPreviousErrors;
+                        conn.reply(&Value::Error(abort.to_resp()));
+                    }
                     Some(t) => {
                         let request = Request::Exec {
                             cmds: t.commands,
@@ -141,6 +165,7 @@ pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std:
                         if tx.send(request).await.is_err() {
                             return Ok(()); // keyspace task is gone
                         }
+                        conn.watching = false; // the keyspace task drops them as it runs this
                         match conn.reply_rx.recv().await {
                             Some(v) => conn.reply(&v),
                             None => return Ok(()),
@@ -150,17 +175,41 @@ pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std:
 
                 Parsed::Run(Command::Discard) => {
                     let reply = match conn.transaction.take() {
-                        Some(_) => Value::SimpleString(Bytes::from_static(b"OK")),
+                        Some(_) => {
+                            conn.unwatch(tx).await;
+                            Value::SimpleString(Bytes::from_static(b"OK"))
+                        }
+                        // Without MULTI the watches stay, as in Redis.
                         None => Value::Error(CommandError::DiscardWithoutMulti.to_resp()),
                     };
                     conn.reply(&reply);
                 }
 
-                // A rejected EXEC ends any open transaction, as Redis's
-                // execCommandAbort does. Above the guard, so it is never queued.
+                // A rejected EXEC ends any open transaction and the watches,
+                // inside MULTI or not, as Redis's execCommandAbort does. Above
+                // the guard, so it is never queued.
                 Parsed::Error(e @ CommandError::ExecAbortRejected(_)) => {
+                    conn.unwatch(tx).await;
                     conn.transaction = None;
                     conn.reply(&Value::Error(e.to_resp()));
+                }
+
+                // Above the guard: inside MULTI, WATCH is refused rather than
+                // queued, and the transaction is not marked failed.
+                Parsed::Run(Command::Watch { keys }) => {
+                    if conn.transaction.is_some() {
+                        conn.reply(&Value::Error(CommandError::WatchInsideMulti.to_resp()));
+                    } else {
+                        let request = Request::Watch {
+                            conn: conn.id,
+                            keys,
+                        };
+                        if tx.send(request).await.is_err() {
+                            return Ok(()); // keyspace task is gone
+                        }
+                        conn.watching = true;
+                        conn.reply(&Value::SimpleString(Bytes::from_static(b"OK")));
+                    }
                 }
 
                 // Any other item while a transaction is open: queue it. The
@@ -168,6 +217,13 @@ pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std:
                 item if conn.transaction.is_some() => {
                     let reply = queue_in(conn.transaction.as_mut().unwrap(), item, size);
                     conn.reply(&reply);
+                }
+
+                // Below the guard, so only reached outside MULTI. Inside, it is
+                // queued, and EXEC has dropped the watches by the time it runs.
+                Parsed::Run(Command::Unwatch) => {
+                    conn.unwatch(tx).await;
+                    conn.reply(&Value::SimpleString(Bytes::from_static(b"OK")));
                 }
 
                 Parsed::Run(cmd) => {
@@ -197,7 +253,7 @@ pub async fn handle_client(stream: TcpStream, tx: mpsc::Sender<Request>) -> std:
                         Some(BlockSpec {
                             timeout,
                             on_timeout,
-                        }) => wait_parked(&mut conn, &tx, timeout, on_timeout).await?,
+                        }) => wait_parked(conn, tx, timeout, on_timeout).await?,
                         None => conn.reply_rx.recv().await,
                     };
 

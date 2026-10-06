@@ -1006,6 +1006,119 @@ conn_scenario "another client runs between multi and exec" \
     "a send SET|{K}|1" "a read" "a send MULTI;INCR|{K}" "a read" \
     "b send SET|{K}|10" "b read" "a send EXEC" "a read"
 
+section "watch"
+# Each read before another client's write makes sure the server has handled
+# the WATCH first: two connections are not ordered otherwise.
+
+conn_scenario "a write by another client aborts exec" \
+    "a send WATCH|{K}" "a read" "b send SET|{K}|1" "b read" \
+    "a send MULTI;SET|{K}|2;EXEC;GET|{K}" "a read"
+
+conn_scenario "reads and writes to other keys do not abort" \
+    "a send WATCH|{K}" "a read" \
+    "b send GET|{K};TYPE|{K};EXISTS|{K};SET|{K2}|v" "b read" \
+    "a send MULTI;PING;EXEC" "a read"
+
+conn_scenario "the watcher's own write and a write during multi abort" \
+    "a send WATCH|{K};SET|{K}|1;MULTI;PING;EXEC" "a read" \
+    "a send WATCH|{K};MULTI;PING" "a read" "b send SET|{K}|2" "b read" \
+    "a send EXEC" "a read"
+
+conn_scenario "a write inside the watcher's own transaction does not abort it" \
+    "a send WATCH|{K};MULTI;SET|{K}|1;INCR|{K};EXEC" "a read"
+
+conn_scenario "another client's exec aborts" \
+    "a send WATCH|{K}" "a read" "b send MULTI;SET|{K}|1;EXEC" "b read" \
+    "a send MULTI;PING;EXEC" "a read"
+
+# SET to the same value, LMOVE (both ends), and an XTRIM that removes.
+conn_scenario "every write that changes a key aborts" \
+    "b send SET|{K}|v;RPUSH|{K2}|x;XADD|{K3}|1-1|f|v;XADD|{K3}|2-1|f|v" "b read" \
+    "a send WATCH|{K}" "a read" "c send WATCH|{K2}" "c read" \
+    "d send WATCH|{K3}" "d read" "e send WATCH|{K}d" "e read" \
+    "b send SET|{K}|v;LMOVE|{K2}|{K}d|LEFT|RIGHT;XTRIM|{K3}|MAXLEN|1" "b read" \
+    "a send MULTI;PING;EXEC" "a read" "c send MULTI;PING;EXEC" "c read" \
+    "d send MULTI;PING;EXEC" "d read" "e send MULTI;PING;EXEC" "e read"
+
+conn_scenario "creating then deleting, incr, xadd and push abort" \
+    "a send WATCH|{K}" "a read" "c send WATCH|{K2}" "c read" \
+    "d send WATCH|{K3}" "d read" "e send WATCH|{K}p" "e read" \
+    "b send SET|{K}|1;DEL|{K};INCR|{K2};XADD|{K3}|1-1|f|v;RPUSH|{K}p|x" "b read" \
+    "a send MULTI;PING;EXEC" "a read" "c send MULTI;PING;EXEC" "c read" \
+    "d send MULTI;PING;EXEC" "d read" "e send MULTI;PING;EXEC" "e read"
+
+# Writes that fail or find nothing to do, including LPOP with a count of 0.
+conn_scenario "writes that change nothing do not abort" \
+    "b send SET|{K}|text;RPUSH|{K2}|x;XADD|{K3}|5-1|f|v" "b read" \
+    "a send WATCH|{K}|{K2}|{K3}|{K}m" "a read" \
+    "b send DEL|{K}m;LPOP|{K}m;LMOVE|{K}m|{K2}|LEFT|RIGHT;LPOP|{K2}|0" "b read" \
+    "b send LPUSH|{K}|x;INCR|{K};SET|{K}|v|EX|0" "b read" \
+    "b send XADD|{K3}|1-1|f|v;XDEL|{K3}|9-9;XTRIM|{K3}|MAXLEN|5" "b read" \
+    "b send XADD|{K}m|NOMKSTREAM|*|f|v" "b read" \
+    "a send MULTI;PING;EXEC" "a read"
+
+conn_scenario "a key that expires after watch aborts, even during multi" \
+    "b send SET|{K}|v|PX|100;SET|{K2}|v|PX|100" "b read" \
+    "a send WATCH|{K}" "a read" "sleep 0.3" "a send MULTI;PING;EXEC" "a read" \
+    "a send WATCH|{K2};MULTI;PING" "a read" "sleep 0.3" "a send EXEC" "a read"
+
+# Already gone at WATCH: reading it is not a change, recreating it is.
+conn_scenario "a key already expired at watch counts as absent" \
+    "b send SET|{K}|v|PX|50;SET|{K2}|v|PX|50" "b read" "sleep 0.2" \
+    "a send WATCH|{K}" "a read" "b send GET|{K}" "b read" \
+    "a send MULTI;PING;EXEC" "a read" \
+    "a send WATCH|{K2}" "a read" "b send SET|{K2}|new" "b read" \
+    "a send MULTI;PING;EXEC" "a read"
+
+conn_scenario "a waiter served by a push changes its destination" \
+    "c send BLMOVE|{K}|{K2}|LEFT|RIGHT|0" "sleep 0.2" \
+    "a send WATCH|{K2}" "a read" "b send RPUSH|{K}|x" "b read" "c read" \
+    "a send MULTI;PING;EXEC" "a read"
+
+# WATCH inside MULTI is refused without failing the transaction; a wrong
+# argument count inside MULTI does fail it.
+conn_scenario "watch and unwatch arity, and watch inside multi" \
+    "a send WATCH;UNWATCH|x;MULTI;WATCH|{K};PING;EXEC" "a read" \
+    "a send MULTI;WATCH;EXEC" "a read"
+
+conn_scenario "watches accumulate, and one write aborts every watcher" \
+    "a send WATCH|{K}|{K};WATCH|{K};WATCH|{K2}" "a read" \
+    "c send WATCH|{K2}" "c read" "b send SET|{K2}|1" "b read" \
+    "a send MULTI;PING;EXEC" "a read" "c send MULTI;PING;EXEC" "c read"
+
+conn_scenario "unwatch forgets earlier writes" \
+    "a send UNWATCH;WATCH|{K}" "a read" "b send SET|{K}|1" "b read" \
+    "a send UNWATCH;MULTI;PING;EXEC" "a read"
+
+conn_scenario "unwatch inside multi is queued and does not stop the abort" \
+    "a send WATCH|{K};MULTI;UNWATCH" "a read" "b send SET|{K}|1" "b read" \
+    "a send EXEC" "a read"
+
+conn_scenario "exec ends the watch whether it commits or aborts" \
+    "a send WATCH|{K};MULTI;EXEC" "a read" "b send SET|{K}|1" "b read" \
+    "a send MULTI;PING;EXEC" "a read" \
+    "a send WATCH|{K}" "a read" "b send SET|{K}|2" "b read" \
+    "a send MULTI;EXEC" "a read" "b send SET|{K}|3" "b read" \
+    "a send MULTI;PING;EXEC" "a read"
+
+conn_scenario "discard, execabort and a rejected exec end the watch" \
+    "a send WATCH|{K};MULTI;DISCARD" "a read" "b send SET|{K}|1" "b read" \
+    "a send MULTI;PING;EXEC" "a read" \
+    "a send WATCH|{K};MULTI;NOSUCH;EXEC" "a read" "b send SET|{K}|2" "b read" \
+    "a send MULTI;PING;EXEC" "a read" \
+    "a send WATCH|{K};MULTI;EXEC|x" "a read" "b send SET|{K}|3" "b read" \
+    "a send MULTI;PING;EXEC" "a read" \
+    "a send WATCH|{K};EXEC|x" "a read" "b send SET|{K}|4" "b read" \
+    "a send MULTI;PING;EXEC" "a read"
+
+conn_scenario "exec and discard without multi keep the watch" \
+    "a send WATCH|{K};EXEC;DISCARD" "a read" "b send SET|{K}|1" "b read" \
+    "a send MULTI;PING;EXEC" "a read"
+
+conn_scenario "execabort wins over a changed watched key" \
+    "a send WATCH|{K}" "a read" "b send SET|{K}|1" "b read" \
+    "a send MULTI;NOSUCH;EXEC" "a read"
+
 # Deliberate divergences from real Redis, documented rather than fixed:
 #   - no inline command support: Redis parses input not starting with '*' as a
 #     space-separated inline command, and skips 2 bytes after a bulk payload

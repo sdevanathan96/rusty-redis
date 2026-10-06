@@ -37,6 +37,8 @@ pub enum CommandError {
     LimitNegative,
     LimitWithoutStrategy,
     NestedMulti,
+    /// Refused without marking the transaction, unlike an arity error.
+    WatchInsideMulti,
     ExecAbortPreviousErrors,
     ExecWithoutMulti,
     DiscardWithoutMulti,
@@ -152,6 +154,9 @@ impl CommandError {
                 b"ERR syntax error, LIMIT cannot be used without specifying a trimming strategy",
             ),
             CommandError::NestedMulti => Bytes::from_static(b"ERR MULTI calls can not be nested"),
+            CommandError::WatchInsideMulti => {
+                Bytes::from_static(b"ERR WATCH inside MULTI is not allowed")
+            }
             CommandError::ExecAbortPreviousErrors => Bytes::from_static(
                 b"EXECABORT Transaction discarded because of previous errors.",
             ),

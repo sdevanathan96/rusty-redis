@@ -3,7 +3,7 @@
 A Redis-compatible server written in Rust on top of Tokio. It speaks RESP, so
 `redis-cli` and ordinary Redis client libraries can talk to it. It covers
 strings, lists including blocking pops, streams including blocking reads and
-trimming, and transactions, and it is tested by comparing every reply with a
+trimming, and transactions with `WATCH`, and it is tested by comparing every reply with a
 real Redis.
 
 ## Supported commands
@@ -14,7 +14,7 @@ real Redis.
 | Strings | `GET`, `SET` (with `EX` / `PX` expiry), `INCR`                  |
 | Lists   | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LMOVE`, `BLPOP`, `BRPOP`, `BLMOVE` |
 | Streams | `XADD` (with `NOMKSTREAM` and `MAXLEN` / `MINID` trimming), `XRANGE`, `XREAD` (with `COUNT` / `BLOCK`), `XLEN`, `XDEL`, `XTRIM` |
-| Transactions | `MULTI`, `EXEC`, `DISCARD` |
+| Transactions | `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` |
 
 Any other command gets Redis's `ERR unknown command` error.
 
@@ -41,10 +41,10 @@ quirks, except for these:
 
 ### Not implemented
 
-Other data types (hashes, sets, sorted sets), `WATCH`, pub/sub, persistence
-(RDB, AOF), replication, `AUTH` and ACLs, more
-than one database (`SELECT`), keyspace commands such as `KEYS`, `DBSIZE` and
-`FLUSHALL`, and `--bind`: the server listens on `127.0.0.1` only.
+Other data types (hashes, sets, sorted sets), pub/sub, persistence (RDB,
+AOF), replication, `AUTH` and ACLs, more than one database (`SELECT`),
+keyspace commands such as `KEYS`, `DBSIZE` and `FLUSHALL`, and `--bind`: the
+server listens on `127.0.0.1` only.
 
 ## Running
 
@@ -75,7 +75,7 @@ reply is written down anywhere. Start this server first, with `./run.sh` or,
 if 6379 is taken, `./target/release/rusty-redis --port 6400` plus
 `MINE=6400`. If nothing answers on port 6380 (`REAL`), the script starts a
 throwaway `redis-server` there and stops it afterwards. A full run takes about
-two minutes.
+three minutes.
 
 It needs `redis-cli`, `redis-server`, `nc`, `xxd`, `python3`, and a `timeout`
 binary (`brew install coreutils` on macOS). Because error replies are compared
@@ -265,6 +265,7 @@ src/
   db.rs          in-memory data store and expiry
   db/            clocks, and each data type's storage (string, list, stream)
   keyspace.rs    single task owning the keyspace; blocking-command wakeups
+  keyspace/      the WATCH table
 test.sh          differential tests against redis-server
 bench/           benchmark against redis-server, and its reports
 fuzz/            cargo-fuzz targets
